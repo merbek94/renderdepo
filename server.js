@@ -9,16 +9,25 @@ app.use(express.json());
 const server = http.createServer(app);
 
 const allowedOrigin = process.env.CLIENT_ORIGIN || "*";
+
 const io = new Server(server, {
   cors: {
     origin: allowedOrigin,
     methods: ["GET", "POST"],
+    credentials: false,
   },
-  // Android tarafında da doğrudan websocket kullanılmalı.
-  // Bu ayar "xhr poll error" hatasını engellemek için eklendi.
-  transports: ["websocket"],
-  pingInterval: 25_000,
-  pingTimeout: 20_000,
+
+  // ÖNEMLİ:
+  // Sadece websocket yapmak bazı Android cihazlarda "websocket error" verebilir.
+  // Bu yüzden polling + websocket birlikte açık kalmalı.
+  transports: ["polling", "websocket"],
+
+  // Android socket.io-client eski sürümse Socket.IO v4 sunucuya bağlanamayabilir.
+  // Bu ayar eski Engine.IO v3 istemcileri de kabul eder.
+  allowEIO3: true,
+
+  pingInterval: 25000,
+  pingTimeout: 20000,
 });
 
 const waitingQueues = new Map(); // key -> [{ socketId, player, puzzle, joinedAt }]
@@ -36,7 +45,10 @@ function safePlayer(rawPlayer) {
 
 function safePuzzle(rawPuzzle, difficulty) {
   const numbers = Array.isArray(rawPuzzle?.numbers)
-    ? rawPuzzle.numbers.map((n) => Number(n)).filter((n) => Number.isFinite(n)).slice(0, 8)
+    ? rawPuzzle.numbers
+        .map((n) => Number(n))
+        .filter((n) => Number.isFinite(n))
+        .slice(0, 8)
     : [];
 
   const target = Number(rawPuzzle?.target);
@@ -55,6 +67,7 @@ function safePuzzle(rawPuzzle, difficulty) {
 function removeFromAllQueues(socketId) {
   for (const [key, queue] of waitingQueues.entries()) {
     const filtered = queue.filter((item) => item.socketId !== socketId);
+
     if (filtered.length === 0) {
       waitingQueues.delete(key);
     } else {
@@ -86,6 +99,8 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "target-number-matchmaking",
+    socket: "socket.io",
+    transports: ["polling", "websocket"],
     waitingQueues: Array.from(waitingQueues.entries()).map(([key, queue]) => ({
       key,
       count: queue.length,
@@ -99,6 +114,8 @@ app.get("/health", (req, res) => {
 });
 
 io.on("connection", (socket) => {
+  console.log("Socket connected:", socket.id);
+
   socket.on("join_match", (payload = {}) => {
     const gameKey = String(payload.gameKey || "target_number");
     const difficulty = String(payload.difficulty || "Medium");
@@ -119,6 +136,7 @@ io.on("connection", (socket) => {
     while (queue.length > 0) {
       const opponent = queue.shift();
       const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+
       if (!opponentSocket || opponentSocket.id === socket.id) {
         continue;
       }
@@ -161,6 +179,8 @@ io.on("connection", (socket) => {
         puzzle: selectedPuzzle,
       });
 
+      console.log("Match found:", roomId);
+
       return;
     }
 
@@ -172,7 +192,13 @@ io.on("connection", (socket) => {
     });
 
     waitingQueues.set(key, queue);
-    socket.emit("waiting", { gameKey, difficulty });
+
+    socket.emit("waiting", {
+      gameKey,
+      difficulty,
+    });
+
+    console.log("Player waiting:", socket.id, key);
   });
 
   socket.on("player_finished", (payload = {}) => {
@@ -192,7 +218,8 @@ io.on("connection", (socket) => {
     leaveRoomAsCancel(socket);
   });
 
-  socket.on("disconnect", () => {
+  socket.on("disconnect", (reason) => {
+    console.log("Socket disconnected:", socket.id, reason);
     removeFromAllQueues(socket.id);
     leaveRoomAsCancel(socket);
   });
