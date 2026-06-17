@@ -17,13 +17,11 @@ const io = new Server(server, {
     credentials: false,
   },
 
-  // ÖNEMLİ:
-  // Sadece websocket yapmak bazı Android cihazlarda "websocket error" verebilir.
-  // Bu yüzden polling + websocket birlikte açık kalmalı.
+  // Sadece websocket'e zorlamıyoruz.
+  // Android tarafında polling + websocket daha stabil çalışır.
   transports: ["polling", "websocket"],
 
-  // Android socket.io-client eski sürümse Socket.IO v4 sunucuya bağlanamayabilir.
-  // Bu ayar eski Engine.IO v3 istemcileri de kabul eder.
+  // Eski Android socket.io-client sürümleri için uyumluluk sağlar.
   allowEIO3: true,
 
   pingInterval: 25000,
@@ -114,7 +112,11 @@ app.get("/health", (req, res) => {
 });
 
 io.on("connection", (socket) => {
-  console.log("Socket connected:", socket.id);
+  console.log("Socket connected:", socket.id, "transport:", socket.conn.transport.name);
+
+  socket.conn.on("upgrade", (transport) => {
+    console.log("Socket upgraded:", socket.id, "transport:", transport.name);
+  });
 
   socket.on("join_match", (payload = {}) => {
     const gameKey = String(payload.gameKey || "target_number");
@@ -179,8 +181,7 @@ io.on("connection", (socket) => {
         puzzle: selectedPuzzle,
       });
 
-      console.log("Match found:", roomId);
-
+      console.log("Match found:", roomId, key);
       return;
     }
 
@@ -192,11 +193,7 @@ io.on("connection", (socket) => {
     });
 
     waitingQueues.set(key, queue);
-
-    socket.emit("waiting", {
-      gameKey,
-      difficulty,
-    });
+    socket.emit("waiting", { gameKey, difficulty });
 
     console.log("Player waiting:", socket.id, key);
   });
