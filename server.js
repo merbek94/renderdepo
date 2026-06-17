@@ -4,6 +4,12 @@ const { Server } = require("socket.io");
 const crypto = require("crypto");
 
 const app = express();
+
+app.use((req, res, next) => {
+  console.log("HTTP request:", req.method, req.url, "ua:", req.headers["user-agent"] || "-");
+  next();
+});
+
 app.use(express.json());
 
 const server = http.createServer(app);
@@ -17,19 +23,16 @@ const io = new Server(server, {
     credentials: false,
   },
 
-  // Sadece websocket'e zorlamıyoruz.
-  // Android tarafında polling + websocket daha stabil çalışır.
   transports: ["polling", "websocket"],
 
-  // Eski Android socket.io-client sürümleri için uyumluluk sağlar.
   allowEIO3: true,
 
   pingInterval: 25000,
   pingTimeout: 20000,
 });
 
-const waitingQueues = new Map(); // key -> [{ socketId, player, puzzle, joinedAt }]
-const activeRooms = new Map(); // socketId -> { roomId, opponentId, gameKey, difficulty }
+const waitingQueues = new Map();
+const activeRooms = new Map();
 
 function queueKey(gameKey, difficulty) {
   return `${String(gameKey || "default")}::${String(difficulty || "default")}`;
@@ -109,6 +112,21 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+io.engine.on("connection_error", (err) => {
+  console.log("Engine.IO connection_error:", {
+    code: err.code,
+    message: err.message,
+    context: err.context,
+    url: err.req && err.req.url,
+    userAgent: err.req && err.req.headers && err.req.headers["user-agent"],
+    origin: err.req && err.req.headers && err.req.headers.origin,
+  });
+});
+
+io.engine.on("connection", (rawSocket) => {
+  console.log("Engine.IO connected:", rawSocket.id, "transport:", rawSocket.transport.name);
 });
 
 io.on("connection", (socket) => {
