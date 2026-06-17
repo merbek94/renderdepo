@@ -14,7 +14,11 @@ const io = new Server(server, {
     origin: allowedOrigin,
     methods: ["GET", "POST"],
   },
-  transports: ["websocket", "polling"],
+  // Android tarafında da doğrudan websocket kullanılmalı.
+  // Bu ayar "xhr poll error" hatasını engellemek için eklendi.
+  transports: ["websocket"],
+  pingInterval: 25_000,
+  pingTimeout: 20_000,
 });
 
 const waitingQueues = new Map(); // key -> [{ socketId, player, puzzle, joinedAt }]
@@ -90,6 +94,10 @@ app.get("/", (req, res) => {
   });
 });
 
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
 io.on("connection", (socket) => {
   socket.on("join_match", (payload = {}) => {
     const gameKey = String(payload.gameKey || "target_number");
@@ -133,6 +141,7 @@ io.on("connection", (socket) => {
         gameKey,
         difficulty,
       });
+
       activeRooms.set(opponentSocket.id, {
         roomId,
         opponentId: socket.id,
@@ -161,6 +170,7 @@ io.on("connection", (socket) => {
       puzzle,
       joinedAt: Date.now(),
     });
+
     waitingQueues.set(key, queue);
     socket.emit("waiting", { gameKey, difficulty });
   });
@@ -189,6 +199,7 @@ io.on("connection", (socket) => {
 });
 
 const PORT = Number(process.env.PORT || 10000);
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Target number matchmaking server running on port ${PORT}`);
 });
