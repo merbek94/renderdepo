@@ -14,40 +14,29 @@ app.use(express.json());
 
 const server = http.createServer(app);
 
-const allowedOrigin = process.env.CLIENT_ORIGIN || "*";
-const allowedOrigins = allowedOrigin
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
-function isOriginAllowed(origin) {
-  // Android / native Socket.IO istemcileri çoğu zaman Origin göndermeyebilir.
-  // Bu durumda bağlantıyı reddetmek, tarayıcıda ana URL açık olsa bile mobilde
-  // "xhr poll error" / "websocket error" üretebilir.
-  if (!origin) return true;
-  if (allowedOrigin === "*" || allowedOrigins.includes("*")) return true;
-  return allowedOrigins.includes(origin);
-}
+const SOCKET_PATH = "/socket.io/";
 
 const io = new Server(server, {
+  // Android tarafıyla aynı path. Android URL'sine /socket.io yazma; sadece base URL kullan.
+  path: SOCKET_PATH,
+
+  // Mobil uygulama native client olduğu için Origin bazen boş gelebilir.
+  // Origin kısıtı yüzünden xhr poll/websocket hatası almamak için burada serbest bırakıyoruz.
   cors: {
-    origin: (origin, callback) => {
-      if (isOriginAllowed(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error(`Origin not allowed: ${origin}`));
-      }
-    },
+    origin: true,
     methods: ["GET", "POST"],
     credentials: false,
   },
 
-  transports: ["polling", "websocket"],
-
+  transports: ["websocket", "polling"],
   allowEIO3: true,
-
   pingInterval: 25000,
   pingTimeout: 20000,
+
+  allowRequest: (req, callback) => {
+    console.log("Socket.IO handshake request:", req.url, "origin:", req.headers.origin || "-");
+    callback(null, true);
+  },
 });
 
 const waitingQueues = new Map();
@@ -120,7 +109,8 @@ app.get("/", (req, res) => {
     ok: true,
     service: "target-number-matchmaking",
     socket: "socket.io",
-    transports: ["polling", "websocket"],
+    socketPath: SOCKET_PATH,
+    transports: ["websocket", "polling"],
     waitingQueues: Array.from(waitingQueues.entries()).map(([key, queue]) => ({
       key,
       count: queue.length,
@@ -136,9 +126,10 @@ app.get("/health", (req, res) => {
 app.get("/socket-check", (req, res) => {
   res.json({
     ok: true,
-    socketPath: "/socket.io/",
-    transports: ["polling", "websocket"],
-    engineIO: [3, 4],
+    socketPath: SOCKET_PATH,
+    androidUrlMustBe: "https://renderdepo-tpqh.onrender.com",
+    androidUrlMustNotInclude: "/socket.io",
+    transports: ["websocket", "polling"],
   });
 });
 
