@@ -15,10 +15,29 @@ app.use(express.json());
 const server = http.createServer(app);
 
 const allowedOrigin = process.env.CLIENT_ORIGIN || "*";
+const allowedOrigins = allowedOrigin
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+function isOriginAllowed(origin) {
+  // Android / native Socket.IO istemcileri çoğu zaman Origin göndermeyebilir.
+  // Bu durumda bağlantıyı reddetmek, tarayıcıda ana URL açık olsa bile mobilde
+  // "xhr poll error" / "websocket error" üretebilir.
+  if (!origin) return true;
+  if (allowedOrigin === "*" || allowedOrigins.includes("*")) return true;
+  return allowedOrigins.includes(origin);
+}
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigin,
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Origin not allowed: ${origin}`));
+      }
+    },
     methods: ["GET", "POST"],
     credentials: false,
   },
@@ -112,6 +131,15 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+app.get("/socket-check", (req, res) => {
+  res.json({
+    ok: true,
+    socketPath: "/socket.io/",
+    transports: ["polling", "websocket"],
+    engineIO: [3, 4],
+  });
 });
 
 io.engine.on("connection_error", (err) => {
