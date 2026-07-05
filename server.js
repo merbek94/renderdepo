@@ -62,19 +62,19 @@ async function initDatabase() {
       PRIMARY KEY (player_id, month_key)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_general 
+    CREATE INDEX IF NOT EXISTS idx_player_scores_general
       ON player_scores (general_score DESC);
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite 
+    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite
       ON player_scores (infinite_score DESC);
 
-    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_general 
+    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_general
       ON player_monthly_scores (month_key, general_score DESC);
 
-    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_infinite 
+    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_infinite
       ON player_monthly_scores (month_key, infinite_score DESC);
 
-    CREATE INDEX IF NOT EXISTS idx_players_country 
+    CREATE INDEX IF NOT EXISTS idx_players_country
       ON players (country);
   `);
 
@@ -112,16 +112,17 @@ function safeCountry(value) {
 
 function safeScore(value) {
   const number = Number(value || 0);
+
   if (!Number.isFinite(number)) return 0;
+
   return Math.max(0, Math.min(Math.floor(number), 2_000_000_000));
 }
 
 function safeDelta(value) {
   const number = Number(value || 0);
+
   if (!Number.isFinite(number)) return 0;
 
-  // Basit kötüye kullanım freni.
-  // Gerçek güvenlik için skoru sunucu tarafında doğrulamak gerekir.
   return Math.max(
     0,
     Math.min(Math.floor(number), Number(process.env.MAX_SCORE_DELTA || 100_000))
@@ -134,6 +135,7 @@ function requireDatabase(res) {
       ok: false,
       message: "DATABASE_URL tanımlı değil.",
     });
+
     return false;
   }
 
@@ -145,9 +147,9 @@ async function upsertPlayer(client, playerId, username, country) {
     `INSERT INTO players (player_id, username, country, updated_at)
      VALUES ($1, $2, $3, NOW())
      ON CONFLICT (player_id)
-     DO UPDATE SET 
-       username = EXCLUDED.username, 
-       country = EXCLUDED.country, 
+     DO UPDATE SET
+       username = EXCLUDED.username,
+       country = EXCLUDED.country,
        updated_at = NOW()`,
     [playerId, username, country]
   );
@@ -174,6 +176,7 @@ app.post("/leaderboard/scores/sync", async (req, res) => {
       ok: false,
       message: "playerId zorunlu.",
     });
+
     return;
   }
 
@@ -186,7 +189,7 @@ app.post("/leaderboard/scores/sync", async (req, res) => {
 
     await client.query(
       `UPDATE player_scores
-       SET 
+       SET
          general_score = GREATEST(general_score, $2),
          infinite_score = GREATEST(infinite_score, $3),
          updated_at = NOW()
@@ -202,7 +205,12 @@ app.post("/leaderboard/scores/sync", async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
 
-    console.error("leaderboard sync error:", error);
+    console.error("leaderboard sync error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
 
     res.status(500).json({
       ok: false,
@@ -228,6 +236,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
       ok: false,
       message: "playerId zorunlu.",
     });
+
     return;
   }
 
@@ -236,6 +245,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
       ok: true,
       skipped: true,
     });
+
     return;
   }
 
@@ -248,7 +258,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
 
     await client.query(
       `UPDATE player_scores
-       SET 
+       SET
          general_score = LEAST(general_score + $2, 2000000000),
          infinite_score = LEAST(infinite_score + $3, 2000000000),
          updated_at = NOW()
@@ -257,12 +267,12 @@ app.post("/leaderboard/scores/add", async (req, res) => {
     );
 
     await client.query(
-      `INSERT INTO player_monthly_scores 
+      `INSERT INTO player_monthly_scores
          (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES 
+       VALUES
          ($1, $2, $3, $4, NOW())
        ON CONFLICT (player_id, month_key)
-       DO UPDATE SET 
+       DO UPDATE SET
          general_score = LEAST(player_monthly_scores.general_score + EXCLUDED.general_score, 2000000000),
          infinite_score = LEAST(player_monthly_scores.infinite_score + EXCLUDED.infinite_score, 2000000000),
          updated_at = NOW()`,
@@ -277,7 +287,12 @@ app.post("/leaderboard/scores/add", async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
 
-    console.error("leaderboard add error:", error);
+    console.error("leaderboard add error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
 
     res.status(500).json({
       ok: false,
@@ -415,129 +430,13 @@ app.get("/leaderboard", async (req, res) => {
     res.status(500).json({
       ok: false,
       message: "Skor tablosu alınamadı.",
-      error: process.env.NODE_ENV === "production" ? undefined : error.message,
-    });
-  }
-});  if (!requireDatabase(res)) return;
-
-  const scoreType = req.query.scoreType === "infinite" ? "infinite" : "general";
-  const period = req.query.period === "month" ? "month" : "all";
-  const scope = req.query.scope === "country" ? "country" : "world";
-  const country = safeCountry(req.query.country);
-  const playerId = safePlayerId(req.query.playerId);
-  const monthKey = currentMonthKey();
-
-  const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
-  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
-  const monthWhere = period === "month" ? "AND s.month_key = $1" : "";
-  const params = period === "month" ? [monthKey] : [];
-
-  try {
-    const worldRankSql = `
-      WITH ranked AS (
-        SELECT 
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY s.${scoreColumn} DESC, p.updated_at ASC, p.username ASC
-          ) AS rank
-        FROM ${tableName} s
-        JOIN players p ON p.player_id = s.player_id
-        WHERE s.${scoreColumn} > 0 ${monthWhere}
-      )
-      SELECT * FROM ranked
-    `;
-
-    const countryRankSql = `
-      WITH ranked AS (
-        SELECT 
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY s.${scoreColumn} DESC, p.updated_at ASC, p.username ASC
-          ) AS rank
-        FROM ${tableName} s
-        JOIN players p ON p.player_id = s.player_id
-        WHERE s.${scoreColumn} > 0 ${monthWhere} 
-          AND p.country = $${params.length + 1}
-      )
-      SELECT * FROM ranked
-    `;
-
-    const listSql = `
-      WITH ranked AS (
-        SELECT 
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY s.${scoreColumn} DESC, p.updated_at ASC, p.username ASC
-          ) AS rank
-        FROM ${tableName} s
-        JOIN players p ON p.player_id = s.player_id
-        WHERE s.${scoreColumn} > 0 ${monthWhere}
-        ${scope === "country" ? `AND p.country = $${params.length + 1}` : ""}
-      )
-      SELECT rank, username, country, score
-      FROM ranked
-      ORDER BY rank ASC
-      LIMIT 50
-    `;
-
-    const worldResult = await pool.query(worldRankSql, params);
-    const countryResult = await pool.query(countryRankSql, [...params, country]);
-
-    const listResult = await pool.query(
-      listSql,
-      scope === "country" ? [...params, country] : params
-    );
-
-    const worldMe = playerId
-      ? worldResult.rows.find((row) => row.player_id === playerId)
-      : null;
-
-    const countryMe = playerId
-      ? countryResult.rows.find((row) => row.player_id === playerId)
-      : null;
-
-    res.json({
-      ok: true,
-      scoreType,
-      period,
-      scope,
-      country,
-      monthKey,
-      myWorldRank: worldMe ? Number(worldMe.rank) : null,
-      myCountryRank: countryMe ? Number(countryMe.rank) : null,
-      myScore: worldMe ? Number(worldMe.score) : 0,
-      rows: listResult.rows.map((row) => ({
-        rank: Number(row.rank),
-        username: row.username,
-        country: row.country,
-        score: Number(row.score),
-      })),
-    });
-  } catch (error) {
-    console.error("leaderboard get error:", error);
-
-    res.status(500).json({
-      ok: false,
-      message: "Skor tablosu alınamadı.",
     });
   }
 });
 
 const io = new Server(server, {
-  // Android tarafıyla aynı path. Android URL'sine /socket.io yazma; sadece base URL kullan.
   path: SOCKET_PATH,
 
-  // Mobil uygulama native client olduğu için Origin bazen boş gelebilir.
-  // Origin kısıtı yüzünden xhr poll/websocket hatası almamak için burada serbest bırakıyoruz.
   cors: {
     origin: true,
     methods: ["GET", "POST"],
@@ -649,11 +548,36 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    database: Boolean(pool),
-  });
+app.get("/health", async (req, res) => {
+  if (!pool) {
+    res.json({
+      ok: true,
+      database: false,
+    });
+
+    return;
+  }
+
+  try {
+    await pool.query("SELECT 1");
+
+    res.json({
+      ok: true,
+      database: true,
+    });
+  } catch (error) {
+    console.error("health database error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+    });
+
+    res.status(500).json({
+      ok: false,
+      database: false,
+      message: "Database bağlantısı başarısız.",
+    });
+  }
 });
 
 app.get("/socket-check", (req, res) => {
@@ -708,6 +632,7 @@ io.on("connection", (socket) => {
       socket.emit("match_error", {
         message: "Geçersiz puzzle verisi.",
       });
+
       return;
     }
 
@@ -813,7 +738,12 @@ const PORT = Number(process.env.PORT || 10000);
 
 initDatabase()
   .catch((error) => {
-    console.error("Database init failed:", error);
+    console.error("Database init failed:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
   })
   .finally(() => {
     server.listen(PORT, "0.0.0.0", () => {
