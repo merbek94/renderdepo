@@ -76,6 +76,9 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_players_country
       ON players (country);
+
+    CREATE INDEX IF NOT EXISTS idx_players_username_lower
+      ON players (LOWER(username));
   `);
 
   console.log("PostgreSQL leaderboard tabloları hazır.");
@@ -142,7 +145,53 @@ function requireDatabase(res) {
   return true;
 }
 
+function usernameTakenError() {
+  const error = new Error("Bu kullanıcı adı zaten alınmış.");
+  error.statusCode = 409;
+  error.publicCode = "USERNAME_TAKEN";
+  return error;
+}
+
+function sendLeaderboardError(res, error, fallbackMessage, logLabel) {
+  const statusCode = Number(error.statusCode || 500);
+  const isPublicError = statusCode >= 400 && statusCode < 500;
+
+  if (!isPublicError) {
+    console.error(logLabel, {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
+  }
+
+  res.status(isPublicError ? statusCode : 500).json({
+    ok: false,
+    code: error.publicCode,
+    message: isPublicError ? error.message : fallbackMessage,
+  });
+}
+
+async function ensureUsernameAvailable(client, playerId, username) {
+  await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER($1::text)))", [username]);
+
+  const result = await client.query(
+    `SELECT player_id
+     FROM players
+     WHERE LOWER(username) = LOWER($1)
+       AND player_id <> $2
+     LIMIT 1`,
+    [username, playerId]
+  );
+
+  if (result.rowCount > 0) {
+    throw usernameTakenError();
+  }
+}
+
 async function upsertPlayer(client, playerId, username, country) {
+  await ensureUsernameAvailable(client, playerId, username);
+
   await client.query(
     `INSERT INTO players (player_id, username, country, updated_at)
      VALUES ($1, $2, $3, NOW())
@@ -161,6 +210,46 @@ async function upsertPlayer(client, playerId, username, country) {
     [playerId]
   );
 }
+
+app.post("/leaderboard/username/claim", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+
+    return;
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await upsertPlayer(client, playerId, username, country);
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    sendLeaderboardError(
+      res,
+      error,
+      "Kullanıcı adı kaydedilemedi.",
+      "username claim error:"
+    );
+  } finally {
+    client.release();
+  }
+});
 
 app.post("/leaderboard/scores/sync", async (req, res) => {
   if (!requireDatabase(res)) return;
@@ -205,17 +294,12 @@ app.post("/leaderboard/scores/sync", async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
 
-    console.error("leaderboard sync error:", {
-      message: error.message,
-      code: error.code,
-      detail: error.detail,
-      stack: error.stack,
-    });
-
-    res.status(500).json({
-      ok: false,
-      message: "Skor senkronize edilemedi.",
-    });
+    sendLeaderboardError(
+      res,
+      error,
+      "Skor senkronize edilemedi.",
+      "leaderboard sync error:"
+    );
   } finally {
     client.release();
   }
@@ -287,17 +371,12 @@ app.post("/leaderboard/scores/add", async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
 
-    console.error("leaderboard add error:", {
-      message: error.message,
-      code: error.code,
-      detail: error.detail,
-      stack: error.stack,
-    });
-
-    res.status(500).json({
-      ok: false,
-      message: "Skor kaydedilemedi.",
-    });
+    sendLeaderboardError(
+      res,
+      error,
+      "Skor kaydedilemedi.",
+      "leaderboard add error:"
+    );
   } finally {
     client.release();
   }
