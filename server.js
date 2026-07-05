@@ -300,6 +300,135 @@ app.get("/leaderboard", async (req, res) => {
 
   const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
   const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
+
+  function buildWhere(includeCountry) {
+    const values = [];
+    const conditions = [`s.${scoreColumn} > 0`];
+
+    if (period === "month") {
+      values.push(monthKey);
+      conditions.push(`s.month_key = $${values.length}`);
+    }
+
+    if (includeCountry) {
+      values.push(country);
+      conditions.push(`p.country = $${values.length}`);
+    }
+
+    return {
+      values,
+      whereSql: conditions.join(" AND "),
+    };
+  }
+
+  async function getMyRank(includeCountry) {
+    if (!playerId) return null;
+
+    const built = buildWhere(includeCountry);
+    const values = [...built.values, playerId];
+    const playerParamIndex = values.length;
+
+    const sql = `
+      WITH ranked AS (
+        SELECT
+          p.player_id,
+          p.username,
+          p.country,
+          s.${scoreColumn} AS score,
+          ROW_NUMBER() OVER (
+            ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+          ) AS position
+        FROM ${tableName} s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE ${built.whereSql}
+      )
+      SELECT position, score
+      FROM ranked
+      WHERE player_id = $${playerParamIndex}
+      LIMIT 1
+    `;
+
+    const result = await pool.query(sql, values);
+    const row = result.rows[0];
+
+    if (!row) return null;
+
+    return {
+      rank: Number(row.position),
+      score: Number(row.score),
+    };
+  }
+
+  try {
+    const listBuilt = buildWhere(scope === "country");
+
+    const listSql = `
+      WITH ranked AS (
+        SELECT
+          p.player_id,
+          p.username,
+          p.country,
+          s.${scoreColumn} AS score,
+          ROW_NUMBER() OVER (
+            ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+          ) AS position
+        FROM ${tableName} s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE ${listBuilt.whereSql}
+      )
+      SELECT position, username, country, score
+      FROM ranked
+      ORDER BY position ASC
+      LIMIT 50
+    `;
+
+    const listResult = await pool.query(listSql, listBuilt.values);
+
+    const myWorld = await getMyRank(false);
+    const myCountry = await getMyRank(true);
+
+    res.json({
+      ok: true,
+      scoreType,
+      period,
+      scope,
+      country,
+      monthKey,
+      myWorldRank: myWorld ? myWorld.rank : null,
+      myCountryRank: myCountry ? myCountry.rank : null,
+      myScore: myWorld ? myWorld.score : 0,
+      rows: listResult.rows.map((row) => ({
+        rank: Number(row.position),
+        username: row.username,
+        country: row.country,
+        score: Number(row.score),
+      })),
+    });
+  } catch (error) {
+    console.error("leaderboard get error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
+
+    res.status(500).json({
+      ok: false,
+      message: "Skor tablosu alınamadı.",
+      error: process.env.NODE_ENV === "production" ? undefined : error.message,
+    });
+  }
+});  if (!requireDatabase(res)) return;
+
+  const scoreType = req.query.scoreType === "infinite" ? "infinite" : "general";
+  const period = req.query.period === "month" ? "month" : "all";
+  const scope = req.query.scope === "country" ? "country" : "world";
+  const country = safeCountry(req.query.country);
+  const playerId = safePlayerId(req.query.playerId);
+  const monthKey = currentMonthKey();
+
+  const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
+  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
   const monthWhere = period === "month" ? "AND s.month_key = $1" : "";
   const params = period === "month" ? [monthKey] : [];
 
