@@ -189,7 +189,9 @@ async function ensureUsernameAvailable(client, playerId, username) {
   }
 }
 
-async function writePlayerRow(client, playerId, username, country) {
+async function upsertPlayer(client, playerId, username, country) {
+  await ensureUsernameAvailable(client, playerId, username);
+
   await client.query(
     `INSERT INTO players (player_id, username, country, updated_at)
      VALUES ($1, $2, $3, NOW())
@@ -200,92 +202,13 @@ async function writePlayerRow(client, playerId, username, country) {
        updated_at = NOW()`,
     [playerId, username, country]
   );
-}
 
-async function ensurePlayerScoreRow(client, playerId) {
   await client.query(
     `INSERT INTO player_scores (player_id)
      VALUES ($1)
      ON CONFLICT (player_id) DO NOTHING`,
     [playerId]
   );
-}
-
-async function upsertPlayer(client, playerId, username, country) {
-  await ensureUsernameAvailable(client, playerId, username);
-  await writePlayerRow(client, playerId, username, country);
-  await ensurePlayerScoreRow(client, playerId);
-}
-
-async function mergePlayerIdentity(client, oldPlayerId, newPlayerId, username, country) {
-  if (!oldPlayerId || !newPlayerId || oldPlayerId === newPlayerId) return;
-
-  await writePlayerRow(client, newPlayerId, username, country);
-
-  await client.query(
-    `INSERT INTO player_scores (player_id, general_score, infinite_score, updated_at)
-     SELECT
-       $2,
-       COALESCE(MAX(general_score), 0),
-       COALESCE(MAX(infinite_score), 0),
-       NOW()
-     FROM player_scores
-     WHERE player_id IN ($1, $2)
-     ON CONFLICT (player_id)
-     DO UPDATE SET
-       general_score = GREATEST(player_scores.general_score, EXCLUDED.general_score),
-       infinite_score = GREATEST(player_scores.infinite_score, EXCLUDED.infinite_score),
-       updated_at = NOW()`,
-    [oldPlayerId, newPlayerId]
-  );
-
-  await client.query(
-    `INSERT INTO player_monthly_scores
-       (player_id, month_key, general_score, infinite_score, updated_at)
-     SELECT
-       $2,
-       month_key,
-       MAX(general_score),
-       MAX(infinite_score),
-       NOW()
-     FROM player_monthly_scores
-     WHERE player_id IN ($1, $2)
-     GROUP BY month_key
-     ON CONFLICT (player_id, month_key)
-     DO UPDATE SET
-       general_score = GREATEST(player_monthly_scores.general_score, EXCLUDED.general_score),
-       infinite_score = GREATEST(player_monthly_scores.infinite_score, EXCLUDED.infinite_score),
-       updated_at = NOW()`,
-    [oldPlayerId, newPlayerId]
-  );
-
-  await client.query("DELETE FROM player_monthly_scores WHERE player_id = $1", [oldPlayerId]);
-  await client.query("DELETE FROM player_scores WHERE player_id = $1", [oldPlayerId]);
-  await client.query("DELETE FROM players WHERE player_id = $1", [oldPlayerId]);
-}
-
-async function upsertPlayerForScore(client, playerId, username, country) {
-  await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER($1::text)))", [username]);
-
-  const existingUsername = await client.query(
-    `SELECT player_id
-     FROM players
-     WHERE LOWER(username) = LOWER($1)
-     ORDER BY updated_at DESC
-     LIMIT 1`,
-    [username]
-  );
-
-  const existingPlayerId = existingUsername.rows[0]?.player_id;
-
-  if (existingPlayerId && existingPlayerId !== playerId) {
-    await mergePlayerIdentity(client, existingPlayerId, playerId, username, country);
-    await ensurePlayerScoreRow(client, playerId);
-    return;
-  }
-
-  await writePlayerRow(client, playerId, username, country);
-  await ensurePlayerScoreRow(client, playerId);
 }
 
 app.post("/leaderboard/username/claim", async (req, res) => {
@@ -351,7 +274,7 @@ app.post("/leaderboard/scores/sync", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    await upsertPlayerForScore(client, playerId, username, country);
+    await upsertPlayer(client, playerId, username, country);
 
     await client.query(
       `UPDATE player_scores
@@ -415,7 +338,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    await upsertPlayerForScore(client, playerId, username, country);
+    await upsertPlayer(client, playerId, username, country);
 
     await client.query(
       `UPDATE player_scores
