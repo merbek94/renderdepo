@@ -541,6 +541,8 @@ const io = new Server(server, {
 
 const waitingQueues = new Map();
 const activeRooms = new Map();
+const privateRooms = new Map();
+const PRIVATE_ROOM_TTL_MS = Number(process.env.PRIVATE_ROOM_TTL_MS || 15 * 60 * 1000);
 
 function queueKey(gameKey, difficulty) {
   return `${String(gameKey || "default")}::${String(difficulty || "default")}`;
@@ -575,6 +577,97 @@ function safePuzzle(rawPuzzle, difficulty) {
     target: Math.floor(target),
     numbers: numbers.map((n) => Math.floor(n)),
   };
+}
+
+function normalizeRoomCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 6);
+}
+
+function generateRoomCode() {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "";
+
+  for (let i = 0; i < 6; i += 1) {
+    code += alphabet[crypto.randomInt(0, alphabet.length)];
+  }
+
+  return code;
+}
+
+function generateUniqueRoomCode() {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const code = generateRoomCode();
+
+    if (!privateRooms.has(code)) {
+      return code;
+    }
+  }
+
+  return crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6);
+}
+
+function createRealtimeRoom(socket, opponentSocket, gameKey, difficulty) {
+  const roomId =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex");
+
+  socket.join(roomId);
+  opponentSocket.join(roomId);
+
+  activeRooms.set(socket.id, {
+    roomId,
+    opponentId: opponentSocket.id,
+    gameKey,
+    difficulty,
+  });
+
+  activeRooms.set(opponentSocket.id, {
+    roomId,
+    opponentId: socket.id,
+    gameKey,
+    difficulty,
+  });
+
+  return roomId;
+}
+
+function removePrivateRoomsForSocket(socketId, notify = true) {
+  for (const [roomCode, room] of privateRooms.entries()) {
+    if (room.ownerSocketId !== socketId) continue;
+
+    privateRooms.delete(roomCode);
+
+    const ownerSocket = io.sockets.sockets.get(socketId);
+    if (notify && ownerSocket) {
+      ownerSocket.emit("friend_room_closed", {
+        roomCode,
+        reason: "cancelled",
+      });
+    }
+  }
+}
+
+function expireOldPrivateRooms() {
+  const now = Date.now();
+
+  for (const [roomCode, room] of privateRooms.entries()) {
+    if (now - room.createdAt <= PRIVATE_ROOM_TTL_MS) continue;
+
+    privateRooms.delete(roomCode);
+
+    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
+    if (ownerSocket) {
+      ownerSocket.emit("friend_room_closed", {
+        roomCode,
+        reason: "expired",
+      });
+    }
+  }
 }
 
 function removeFromAllQueues(socketId) {
@@ -624,6 +717,7 @@ app.get("/", (req, res) => {
       count: queue.length,
     })),
     activeRooms: activeRooms.size / 2,
+    privateRooms: privateRooms.size,
   });
 });
 
@@ -716,6 +810,7 @@ io.on("connection", (socket) => {
     }
 
     removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
 
     const key = queueKey(gameKey, difficulty);
@@ -731,29 +826,8 @@ io.on("connection", (socket) => {
 
       waitingQueues.set(key, queue);
 
-      const roomId =
-        typeof crypto.randomUUID === "function"
-          ? crypto.randomUUID()
-          : crypto.randomBytes(16).toString("hex");
-
       const selectedPuzzle = opponent.puzzle || puzzle;
-
-      socket.join(roomId);
-      opponentSocket.join(roomId);
-
-      activeRooms.set(socket.id, {
-        roomId,
-        opponentId: opponentSocket.id,
-        gameKey,
-        difficulty,
-      });
-
-      activeRooms.set(opponentSocket.id, {
-        roomId,
-        opponentId: socket.id,
-        gameKey,
-        difficulty,
-      });
+      const roomId = createRealtimeRoom(socket, opponentSocket, gameKey, difficulty);
 
       socket.emit("match_found", {
         roomId,
@@ -789,6 +863,116 @@ io.on("connection", (socket) => {
     console.log("Player waiting:", socket.id, key);
   });
 
+  socket.on("create_friend_room", (payload = {}) => {
+    expireOldPrivateRooms();
+
+    const gameKey = String(payload.gameKey || "target_number");
+    const difficulty = String(payload.difficulty || "Medium");
+    const player = safePlayer(payload.player);
+    const puzzle = safePuzzle(payload.puzzle, difficulty);
+
+    if (!puzzle) {
+      socket.emit("friend_room_error", {
+        message: "Geçersiz puzzle verisi.",
+      });
+
+      return;
+    }
+
+    removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id, false);
+    leaveRoomAsCancel(socket);
+
+    const roomCode = generateUniqueRoomCode();
+
+    privateRooms.set(roomCode, {
+      roomCode,
+      ownerSocketId: socket.id,
+      gameKey,
+      difficulty,
+      player,
+      puzzle,
+      createdAt: Date.now(),
+    });
+
+    socket.emit("friend_room_created", {
+      roomCode,
+      gameKey,
+      difficulty,
+    });
+
+    console.log("Friend room created:", roomCode, socket.id, queueKey(gameKey, difficulty));
+  });
+
+  socket.on("join_friend_room", (payload = {}) => {
+    expireOldPrivateRooms();
+
+    const roomCode = normalizeRoomCode(payload.roomCode);
+    const room = privateRooms.get(roomCode);
+
+    if (!roomCode || roomCode.length !== 6) {
+      socket.emit("friend_room_error", {
+        message: "Geçerli 6 haneli oda kodu gir.",
+      });
+
+      return;
+    }
+
+    if (!room) {
+      socket.emit("friend_room_error", {
+        message: "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
+      });
+
+      return;
+    }
+
+    if (room.ownerSocketId === socket.id) {
+      socket.emit("friend_room_error", {
+        message: "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
+      });
+
+      return;
+    }
+
+    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
+
+    if (!ownerSocket) {
+      privateRooms.delete(roomCode);
+
+      socket.emit("friend_room_error", {
+        message: "Oda sahibi bağlantıdan ayrılmış.",
+      });
+
+      return;
+    }
+
+    const player = safePlayer(payload.player);
+
+    removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id, false);
+    leaveRoomAsCancel(socket);
+
+    privateRooms.delete(roomCode);
+
+    const roomId = createRealtimeRoom(socket, ownerSocket, room.gameKey, room.difficulty);
+
+    socket.emit("match_found", {
+      roomId,
+      roomCode,
+      opponent: room.player,
+      puzzle: room.puzzle,
+    });
+
+    ownerSocket.emit("match_found", {
+      roomId,
+      roomCode,
+      opponent: player,
+      puzzle: room.puzzle,
+    });
+
+    console.log("Friend match found:", roomCode, roomId, queueKey(room.gameKey, room.difficulty));
+  });
+
   socket.on("player_finished", (payload = {}) => {
     const roomId = String(payload.roomId || "");
     const elapsedMs = Math.max(1, Number(payload.elapsedMs || 0));
@@ -803,15 +987,19 @@ io.on("connection", (socket) => {
 
   socket.on("cancel_match", () => {
     removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
   });
 
   socket.on("disconnect", (reason) => {
     console.log("Socket disconnected:", socket.id, reason);
     removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
   });
 });
+
+setInterval(expireOldPrivateRooms, 60_000).unref();
 
 const PORT = Number(process.env.PORT || 10000);
 
