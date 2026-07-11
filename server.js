@@ -544,6 +544,18 @@ const activeRooms = new Map();
 const privateRooms = new Map();
 const PRIVATE_ROOM_TTL_MS = Number(process.env.PRIVATE_ROOM_TTL_MS || 15 * 60 * 1000);
 
+function normalizeMatchGameKey(value) {
+  const gameKey = String(value || "target_number").trim().slice(0, 96);
+
+  // Turnuva oyuncuları aşamadan bağımsız olarak yalnızca zorluk seviyesine göre
+  // aynı kuyruğa alınır. Bu normalizasyon eski stage_* istemcilerini de destekler.
+  if (/^target_number_tournament(?:_stage_\d+)?$/i.test(gameKey)) {
+    return "target_number_tournament";
+  }
+
+  return gameKey || "target_number";
+}
+
 function queueKey(gameKey, difficulty) {
   return `${String(gameKey || "default")}::${String(difficulty || "default")}`;
 }
@@ -796,7 +808,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join_match", (payload = {}) => {
-    const gameKey = String(payload.gameKey || "target_number");
+    const gameKey = normalizeMatchGameKey(payload.gameKey);
     const difficulty = String(payload.difficulty || "Medium");
     const player = safePlayer(payload.player);
     const puzzle = safePuzzle(payload.puzzle, difficulty);
