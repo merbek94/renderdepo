@@ -540,15 +540,18 @@ const io = new Server(server, {
 });
 
 const waitingQueues = new Map();
-const activeRooms = new Map();
+const matchRooms = new Map();
+const resumeIndex = new Map();
+const socketMemberships = new Map();
 const privateRooms = new Map();
+
 const PRIVATE_ROOM_TTL_MS = Number(process.env.PRIVATE_ROOM_TTL_MS || 15 * 60 * 1000);
+const MATCH_RECONNECT_GRACE_MS = Number(process.env.MATCH_RECONNECT_GRACE_MS || 60_000);
+const MATCH_RETENTION_MS = Number(process.env.MATCH_RETENTION_MS || 5 * 60 * 1000);
 
 function normalizeMatchGameKey(value) {
   const gameKey = String(value || "target_number").trim().slice(0, 96);
 
-  // Turnuva oyuncuları aşamadan bağımsız olarak yalnızca zorluk seviyesine göre
-  // aynı kuyruğa alınır. Bu normalizasyon eski stage_* istemcilerini de destekler.
   if (/^target_number_tournament(?:_stage_\d+)?$/i.test(gameKey)) {
     return "target_number_tournament";
   }
@@ -564,10 +567,7 @@ function safePlayer(rawPlayer) {
   const name = String(rawPlayer?.name || "Oyuncu").trim().slice(0, 24) || "Oyuncu";
   const country = String(rawPlayer?.country || "").trim().toUpperCase().slice(0, 3);
 
-  return {
-    name,
-    country,
-  };
+  return { name, country };
 }
 
 function safePuzzle(rawPuzzle, difficulty) {
@@ -614,38 +614,23 @@ function generateUniqueRoomCode() {
   for (let attempt = 0; attempt < 32; attempt += 1) {
     const code = generateRoomCode();
 
-    if (!privateRooms.has(code)) {
-      return code;
-    }
+    if (!privateRooms.has(code)) return code;
   }
 
   return crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6);
 }
 
-function createRealtimeRoom(socket, opponentSocket, gameKey, difficulty) {
-  const roomId =
-    typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : crypto.randomBytes(16).toString("hex");
+function generateResumeToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
 
-  socket.join(roomId);
-  opponentSocket.join(roomId);
+function removeFromAllQueues(socketId) {
+  for (const [key, queue] of waitingQueues.entries()) {
+    const filtered = queue.filter((item) => item.socketId !== socketId);
 
-  activeRooms.set(socket.id, {
-    roomId,
-    opponentId: opponentSocket.id,
-    gameKey,
-    difficulty,
-  });
-
-  activeRooms.set(opponentSocket.id, {
-    roomId,
-    opponentId: socket.id,
-    gameKey,
-    difficulty,
-  });
-
-  return roomId;
+    if (filtered.length === 0) waitingQueues.delete(key);
+    else waitingQueues.set(key, filtered);
+  }
 }
 
 function removePrivateRoomsForSocket(socketId, notify = true) {
@@ -682,37 +667,211 @@ function expireOldPrivateRooms() {
   }
 }
 
-function removeFromAllQueues(socketId) {
-  for (const [key, queue] of waitingQueues.entries()) {
-    const filtered = queue.filter((item) => item.socketId !== socketId);
-
-    if (filtered.length === 0) {
-      waitingQueues.delete(key);
-    } else {
-      waitingQueues.set(key, filtered);
-    }
+function clearAwayTimer(player) {
+  if (player.awayTimer) {
+    clearTimeout(player.awayTimer);
+    player.awayTimer = null;
   }
 }
 
+function cleanupMatchRoom(roomId) {
+  const room = matchRooms.get(roomId);
+  if (!room) return;
+
+  for (const player of room.players) {
+    clearAwayTimer(player);
+    resumeIndex.delete(player.resumeToken);
+
+    if (player.socketId) {
+      socketMemberships.delete(player.socketId);
+      const playerSocket = io.sockets.sockets.get(player.socketId);
+      if (playerSocket) playerSocket.leave(roomId);
+    }
+  }
+
+  if (room.cleanupTimer) clearTimeout(room.cleanupTimer);
+  matchRooms.delete(roomId);
+}
+
+function scheduleMatchCleanup(room, delayMs = MATCH_RETENTION_MS) {
+  if (room.cleanupTimer) clearTimeout(room.cleanupTimer);
+  room.cleanupTimer = setTimeout(() => cleanupMatchRoom(room.roomId), delayMs);
+  room.cleanupTimer.unref?.();
+}
+
+function getOpponent(room, playerIndex) {
+  return room.players[playerIndex === 0 ? 1 : 0];
+}
+
+function buildMatchPayload(room, playerIndex, extra = {}) {
+  const player = room.players[playerIndex];
+  const opponent = getOpponent(room, playerIndex);
+
+  return {
+    roomId: room.roomId,
+    gameKey: room.gameKey,
+    difficulty: room.difficulty,
+    resumeToken: player.resumeToken,
+    matchStartedAtMillis: room.startedAt,
+    opponent: opponent.player,
+    puzzle: room.puzzle,
+    opponentFinishedMs: opponent.finishedMs || 0,
+    opponentForfeited: Boolean(opponent.forfeited),
+    ...extra,
+  };
+}
+
+function bindPlayerSocket(room, playerIndex, socket) {
+  const player = room.players[playerIndex];
+
+  if (player.socketId && player.socketId !== socket.id) {
+    socketMemberships.delete(player.socketId);
+    const oldSocket = io.sockets.sockets.get(player.socketId);
+    if (oldSocket) oldSocket.leave(room.roomId);
+  }
+
+  player.socketId = socket.id;
+  player.awaySince = null;
+  clearAwayTimer(player);
+  socket.join(room.roomId);
+  socketMemberships.set(socket.id, {
+    roomId: room.roomId,
+    playerIndex,
+  });
+}
+
+function createRealtimeRoom(
+  socket,
+  opponentSocket,
+  gameKey,
+  difficulty,
+  socketPlayer,
+  opponentPlayer,
+  puzzle
+) {
+  const roomId =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex");
+
+  const room = {
+    roomId,
+    gameKey,
+    difficulty,
+    puzzle,
+    startedAt: Date.now(),
+    cleanupTimer: null,
+    players: [
+      {
+        socketId: socket.id,
+        resumeToken: generateResumeToken(),
+        player: socketPlayer,
+        finishedMs: null,
+        forfeited: false,
+        awaySince: null,
+        awayTimer: null,
+      },
+      {
+        socketId: opponentSocket.id,
+        resumeToken: generateResumeToken(),
+        player: opponentPlayer,
+        finishedMs: null,
+        forfeited: false,
+        awaySince: null,
+        awayTimer: null,
+      },
+    ],
+  };
+
+  matchRooms.set(roomId, room);
+  room.players.forEach((player, playerIndex) => {
+    resumeIndex.set(player.resumeToken, { roomId, playerIndex });
+  });
+
+  bindPlayerSocket(room, 0, socket);
+  bindPlayerSocket(room, 1, opponentSocket);
+  scheduleMatchCleanup(room);
+
+  return room;
+}
+
+function notifyOpponentLeft(room, playerIndex, reason) {
+  const opponent = getOpponent(room, playerIndex);
+  if (!opponent.socketId) return;
+
+  const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+  if (!opponentSocket) return;
+
+  opponentSocket.emit("opponent_left", {
+    roomId: room.roomId,
+    reason,
+  });
+}
+
+function forfeitPlayer(room, playerIndex, reason, notifySelf = true) {
+  const player = room.players[playerIndex];
+  if (player.forfeited || player.finishedMs) return;
+
+  player.forfeited = true;
+  player.awaySince = player.awaySince || Date.now();
+  clearAwayTimer(player);
+
+  if (notifySelf && player.socketId) {
+    const playerSocket = io.sockets.sockets.get(player.socketId);
+    if (playerSocket) {
+      playerSocket.emit("match_forfeited", {
+        roomId: room.roomId,
+        reason,
+        message: "Oyuna 1 dakika içinde dönmediğiniz için yenildiniz.",
+      });
+    }
+  }
+
+  notifyOpponentLeft(room, playerIndex, reason);
+  scheduleMatchCleanup(room);
+}
+
+function markPlayerAway(room, playerIndex, awayAt = Date.now()) {
+  const player = room.players[playerIndex];
+  if (player.finishedMs || player.forfeited) return;
+
+  if (!player.awaySince) player.awaySince = awayAt;
+  clearAwayTimer(player);
+
+  const elapsed = Date.now() - player.awaySince;
+  const remaining = Math.max(0, MATCH_RECONNECT_GRACE_MS - elapsed);
+
+  if (remaining <= 0) {
+    forfeitPlayer(room, playerIndex, "timeout");
+    return;
+  }
+
+  player.awayTimer = setTimeout(() => {
+    const currentRoom = matchRooms.get(room.roomId);
+    if (!currentRoom) return;
+    const currentPlayer = currentRoom.players[playerIndex];
+    if (!currentPlayer.awaySince || currentPlayer.finishedMs || currentPlayer.forfeited) return;
+
+    if (Date.now() - currentPlayer.awaySince >= MATCH_RECONNECT_GRACE_MS) {
+      forfeitPlayer(currentRoom, playerIndex, "timeout");
+    }
+  }, remaining + 25);
+  player.awayTimer.unref?.();
+}
+
 function leaveRoomAsCancel(socket) {
-  const room = activeRooms.get(socket.id);
+  const membership = socketMemberships.get(socket.id);
+  if (!membership) return;
+
+  const room = matchRooms.get(membership.roomId);
+  socketMemberships.delete(socket.id);
 
   if (!room) return;
 
-  socket.to(room.roomId).emit("opponent_left", {
-    roomId: room.roomId,
-    reason: "cancelled",
-  });
-
-  const opponentSocket = io.sockets.sockets.get(room.opponentId);
-
-  if (opponentSocket) {
-    activeRooms.delete(opponentSocket.id);
-    opponentSocket.leave(room.roomId);
-  }
-
-  activeRooms.delete(socket.id);
+  const player = room.players[membership.playerIndex];
+  if (player.socketId === socket.id) player.socketId = null;
   socket.leave(room.roomId);
+  forfeitPlayer(room, membership.playerIndex, "cancelled", false);
 }
 
 app.get("/", (req, res) => {
@@ -724,32 +883,25 @@ app.get("/", (req, res) => {
     database: Boolean(pool),
     leaderboard: Boolean(pool),
     transports: ["websocket", "polling"],
+    reconnectGraceMs: MATCH_RECONNECT_GRACE_MS,
     waitingQueues: Array.from(waitingQueues.entries()).map(([key, queue]) => ({
       key,
       count: queue.length,
     })),
-    activeRooms: activeRooms.size / 2,
+    activeRooms: matchRooms.size,
     privateRooms: privateRooms.size,
   });
 });
 
 app.get("/health", async (req, res) => {
   if (!pool) {
-    res.json({
-      ok: true,
-      database: false,
-    });
-
+    res.json({ ok: true, database: false });
     return;
   }
 
   try {
     await pool.query("SELECT 1");
-
-    res.json({
-      ok: true,
-      database: true,
-    });
+    res.json({ ok: true, database: true });
   } catch (error) {
     console.error("health database error:", {
       message: error.message,
@@ -772,6 +924,7 @@ app.get("/socket-check", (req, res) => {
     androidUrlMustBe: "https://renderdepo-tpqh.onrender.com",
     androidUrlMustNotInclude: "/socket.io",
     transports: ["websocket", "polling"],
+    reconnectGraceMs: MATCH_RECONNECT_GRACE_MS,
   });
 });
 
@@ -814,10 +967,7 @@ io.on("connection", (socket) => {
     const puzzle = safePuzzle(payload.puzzle, difficulty);
 
     if (!puzzle) {
-      socket.emit("match_error", {
-        message: "Geçersiz puzzle verisi.",
-      });
-
+      socket.emit("match_error", { message: "Geçersiz puzzle verisi." });
       return;
     }
 
@@ -832,29 +982,24 @@ io.on("connection", (socket) => {
       const opponent = queue.shift();
       const opponentSocket = io.sockets.sockets.get(opponent.socketId);
 
-      if (!opponentSocket || opponentSocket.id === socket.id) {
-        continue;
-      }
+      if (!opponentSocket || opponentSocket.id === socket.id) continue;
 
       waitingQueues.set(key, queue);
-
       const selectedPuzzle = opponent.puzzle || puzzle;
-      const roomId = createRealtimeRoom(socket, opponentSocket, gameKey, difficulty);
+      const room = createRealtimeRoom(
+        socket,
+        opponentSocket,
+        gameKey,
+        difficulty,
+        player,
+        opponent.player,
+        selectedPuzzle
+      );
 
-      socket.emit("match_found", {
-        roomId,
-        opponent: opponent.player,
-        puzzle: selectedPuzzle,
-      });
+      socket.emit("match_found", buildMatchPayload(room, 0));
+      opponentSocket.emit("match_found", buildMatchPayload(room, 1));
 
-      opponentSocket.emit("match_found", {
-        roomId,
-        opponent: player,
-        puzzle: selectedPuzzle,
-      });
-
-      console.log("Match found:", roomId, key);
-
+      console.log("Match found:", room.roomId, key);
       return;
     }
 
@@ -866,12 +1011,7 @@ io.on("connection", (socket) => {
     });
 
     waitingQueues.set(key, queue);
-
-    socket.emit("waiting", {
-      gameKey,
-      difficulty,
-    });
-
+    socket.emit("waiting", { gameKey, difficulty });
     console.log("Player waiting:", socket.id, key);
   });
 
@@ -884,10 +1024,7 @@ io.on("connection", (socket) => {
     const puzzle = safePuzzle(payload.puzzle, difficulty);
 
     if (!puzzle) {
-      socket.emit("friend_room_error", {
-        message: "Geçersiz puzzle verisi.",
-      });
-
+      socket.emit("friend_room_error", { message: "Geçersiz puzzle verisi." });
       return;
     }
 
@@ -907,12 +1044,7 @@ io.on("connection", (socket) => {
       createdAt: Date.now(),
     });
 
-    socket.emit("friend_room_created", {
-      roomCode,
-      gameKey,
-      difficulty,
-    });
-
+    socket.emit("friend_room_created", { roomCode, gameKey, difficulty });
     console.log("Friend room created:", roomCode, socket.id, queueKey(gameKey, difficulty));
   });
 
@@ -920,41 +1052,32 @@ io.on("connection", (socket) => {
     expireOldPrivateRooms();
 
     const roomCode = normalizeRoomCode(payload.roomCode);
-    const room = privateRooms.get(roomCode);
+    const privateRoom = privateRooms.get(roomCode);
 
     if (!roomCode || roomCode.length !== 6) {
-      socket.emit("friend_room_error", {
-        message: "Geçerli 6 haneli oda kodu gir.",
-      });
-
+      socket.emit("friend_room_error", { message: "Geçerli 6 haneli oda kodu gir." });
       return;
     }
 
-    if (!room) {
+    if (!privateRoom) {
       socket.emit("friend_room_error", {
         message: "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
       });
-
       return;
     }
 
-    if (room.ownerSocketId === socket.id) {
+    if (privateRoom.ownerSocketId === socket.id) {
       socket.emit("friend_room_error", {
         message: "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
       });
-
       return;
     }
 
-    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
+    const ownerSocket = io.sockets.sockets.get(privateRoom.ownerSocketId);
 
     if (!ownerSocket) {
       privateRooms.delete(roomCode);
-
-      socket.emit("friend_room_error", {
-        message: "Oda sahibi bağlantıdan ayrılmış.",
-      });
-
+      socket.emit("friend_room_error", { message: "Oda sahibi bağlantıdan ayrılmış." });
       return;
     }
 
@@ -963,38 +1086,126 @@ io.on("connection", (socket) => {
     removeFromAllQueues(socket.id);
     removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
-
     privateRooms.delete(roomCode);
 
-    const roomId = createRealtimeRoom(socket, ownerSocket, room.gameKey, room.difficulty);
+    const room = createRealtimeRoom(
+      socket,
+      ownerSocket,
+      privateRoom.gameKey,
+      privateRoom.difficulty,
+      player,
+      privateRoom.player,
+      privateRoom.puzzle
+    );
 
-    socket.emit("match_found", {
-      roomId,
-      roomCode,
-      opponent: room.player,
-      puzzle: room.puzzle,
-    });
+    socket.emit("match_found", buildMatchPayload(room, 0, { roomCode }));
+    ownerSocket.emit("match_found", buildMatchPayload(room, 1, { roomCode }));
 
-    ownerSocket.emit("match_found", {
-      roomId,
-      roomCode,
-      opponent: player,
-      puzzle: room.puzzle,
-    });
-
-    console.log("Friend match found:", roomCode, roomId, queueKey(room.gameKey, room.difficulty));
+    console.log("Friend match found:", roomCode, room.roomId, queueKey(room.gameKey, room.difficulty));
   });
 
   socket.on("player_finished", (payload = {}) => {
-    const roomId = String(payload.roomId || "");
+    const membership = socketMemberships.get(socket.id);
+    if (!membership) return;
+
+    const room = matchRooms.get(membership.roomId);
+    if (!room || String(payload.roomId || "") !== room.roomId) return;
+
     const elapsedMs = Math.max(1, Number(payload.elapsedMs || 0));
+    if (!Number.isFinite(elapsedMs)) return;
 
-    if (!roomId || !Number.isFinite(elapsedMs)) return;
+    const player = room.players[membership.playerIndex];
+    if (player.forfeited || player.finishedMs) return;
 
-    socket.to(roomId).emit("opponent_finished", {
-      roomId,
-      elapsedMs: Math.floor(elapsedMs),
-    });
+    player.finishedMs = Math.floor(elapsedMs);
+    player.awaySince = null;
+    clearAwayTimer(player);
+
+    const opponent = getOpponent(room, membership.playerIndex);
+    if (opponent.socketId) {
+      const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+      if (opponentSocket) {
+        opponentSocket.emit("opponent_finished", {
+          roomId: room.roomId,
+          elapsedMs: player.finishedMs,
+        });
+      }
+    }
+
+    scheduleMatchCleanup(room);
+  });
+
+  socket.on("player_away", (payload = {}) => {
+    const token = String(payload.resumeToken || "");
+    const indexed = resumeIndex.get(token);
+    if (!indexed) return;
+
+    const room = matchRooms.get(indexed.roomId);
+    if (!room || room.roomId !== String(payload.roomId || "")) return;
+    markPlayerAway(room, indexed.playerIndex);
+  });
+
+  socket.on("player_returned", (payload = {}) => {
+    const token = String(payload.resumeToken || "");
+    const indexed = resumeIndex.get(token);
+    if (!indexed) return;
+
+    const room = matchRooms.get(indexed.roomId);
+    if (!room || room.roomId !== String(payload.roomId || "")) return;
+
+    const player = room.players[indexed.playerIndex];
+    if (player.awaySince && Date.now() - player.awaySince >= MATCH_RECONNECT_GRACE_MS) {
+      forfeitPlayer(room, indexed.playerIndex, "timeout", false);
+    }
+
+    if (player.forfeited) {
+      socket.emit("match_resume_failed", {
+        message: "1 dakikalık yeniden bağlanma süresi doldu.",
+      });
+      return;
+    }
+
+    bindPlayerSocket(room, indexed.playerIndex, socket);
+  });
+
+  socket.on("resume_match", (payload = {}) => {
+    const token = String(payload.resumeToken || "").trim();
+    const indexed = resumeIndex.get(token);
+
+    if (!indexed) {
+      socket.emit("match_resume_failed", {
+        message: "Kayıtlı oyun sunucuda bulunamadı.",
+      });
+      return;
+    }
+
+    const room = matchRooms.get(indexed.roomId);
+    if (!room) {
+      socket.emit("match_resume_failed", {
+        message: "Kayıtlı oyun artık aktif değil.",
+      });
+      return;
+    }
+
+    const player = room.players[indexed.playerIndex];
+
+    if (player.awaySince && Date.now() - player.awaySince >= MATCH_RECONNECT_GRACE_MS) {
+      forfeitPlayer(room, indexed.playerIndex, "timeout", false);
+    }
+
+    if (player.forfeited) {
+      socket.emit("match_resume_failed", {
+        message: "1 dakikalık yeniden bağlanma süresi dolduğu için yenildiniz.",
+      });
+      return;
+    }
+
+    removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id, false);
+    bindPlayerSocket(room, indexed.playerIndex, socket);
+    socket.emit("match_resumed", buildMatchPayload(room, indexed.playerIndex));
+
+    console.log("Match resumed:", room.roomId, socket.id);
   });
 
   socket.on("cancel_match", () => {
@@ -1007,7 +1218,17 @@ io.on("connection", (socket) => {
     console.log("Socket disconnected:", socket.id, reason);
     removeFromAllQueues(socket.id);
     removePrivateRoomsForSocket(socket.id, false);
-    leaveRoomAsCancel(socket);
+
+    const membership = socketMemberships.get(socket.id);
+    if (!membership) return;
+
+    socketMemberships.delete(socket.id);
+    const room = matchRooms.get(membership.roomId);
+    if (!room) return;
+
+    const player = room.players[membership.playerIndex];
+    if (player.socketId === socket.id) player.socketId = null;
+    markPlayerAway(room, membership.playerIndex);
   });
 });
 
