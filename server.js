@@ -389,169 +389,163 @@ app.get("/leaderboard", async (req, res) => {
   const period = req.query.period === "month" ? "month" : "all";
   const scope = req.query.scope === "country" ? "country" : "world";
   const country = safeCountry(req.query.country);
-  const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 100));
-  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const playerId = safePlayerId(req.query.playerId);
+  const monthKey = currentMonthKey();
 
   const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
-  const scoreAlias = scoreType === "infinite" ? "infiniteScore" : "generalScore";
+  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
 
-  const values = [];
-  const where = [];
-  let fromSql = "";
-  let scoreExpr = "";
+  function buildWhere(includeCountry) {
+    const values = [];
+    const conditions = [`s.${scoreColumn} > 0`];
 
-  if (period === "month") {
-    fromSql = `
-      FROM player_monthly_scores scores
-      JOIN players p ON p.player_id = scores.player_id
-    `;
-    values.push(currentMonthKey());
-    where.push(`scores.month_key = $${values.length}`);
-    scoreExpr = `scores.${scoreColumn}`;
-  } else {
-    fromSql = `
-      FROM player_scores scores
-      JOIN players p ON p.player_id = scores.player_id
-    `;
-    scoreExpr = `scores.${scoreColumn}`;
+    if (period === "month") {
+      values.push(monthKey);
+      conditions.push(`s.month_key = $${values.length}`);
+    }
+
+    if (includeCountry) {
+      values.push(country);
+      conditions.push(`p.country = $${values.length}`);
+    }
+
+    return {
+      values,
+      whereSql: conditions.join(" AND "),
+    };
   }
 
-  if (scope === "country") {
-    values.push(country);
-    where.push(`p.country = $${values.length}`);
+  async function getMyRank(includeCountry) {
+    if (!playerId) return null;
+
+    const built = buildWhere(includeCountry);
+    const values = [...built.values, playerId];
+    const playerParamIndex = values.length;
+
+    const sql = `
+      WITH ranked AS (
+        SELECT
+          p.player_id,
+          p.username,
+          p.country,
+          s.${scoreColumn} AS score,
+          ROW_NUMBER() OVER (
+            ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+          ) AS position
+        FROM ${tableName} s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE ${built.whereSql}
+      )
+      SELECT position, score
+      FROM ranked
+      WHERE player_id = $${playerParamIndex}
+      LIMIT 1
+    `;
+
+    const result = await pool.query(sql, values);
+    const row = result.rows[0];
+
+    if (!row) return null;
+
+    return {
+      rank: Number(row.position),
+      score: Number(row.score),
+    };
   }
-
-  values.push(limit);
-  const limitIndex = values.length;
-
-  values.push(offset);
-  const offsetIndex = values.length;
-
-  const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 
   try {
-    const { rows } = await pool.query(
-      `
+    const listBuilt = buildWhere(scope === "country");
+
+    const listSql = `
+      WITH ranked AS (
         SELECT
-          p.player_id AS "playerId",
-          p.username AS "username",
-          p.country AS "country",
-          ${scoreExpr} AS "${scoreAlias}",
+          p.player_id,
+          p.username,
+          p.country,
+          s.${scoreColumn} AS score,
           ROW_NUMBER() OVER (
-            ORDER BY ${scoreExpr} DESC, p.updated_at ASC, p.player_id ASC
-          ) AS "rank"
-        ${fromSql}
-        ${whereSql}
-        ORDER BY ${scoreExpr} DESC, p.updated_at ASC, p.player_id ASC
-        LIMIT $${limitIndex}
-        OFFSET $${offsetIndex}
-      `,
-      values
-    );
+            ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+          ) AS position
+        FROM ${tableName} s
+        JOIN players p ON p.player_id = s.player_id
+        WHERE ${listBuilt.whereSql}
+      )
+      SELECT position, username, country, score
+      FROM ranked
+      ORDER BY position ASC
+      LIMIT 50
+    `;
+
+    const listResult = await pool.query(listSql, listBuilt.values);
+
+    const myWorld = await getMyRank(false);
+    const myCountry = await getMyRank(true);
 
     res.json({
       ok: true,
       scoreType,
       period,
       scope,
-      items: rows.map((row) => ({
-        playerId: row.playerId,
+      country,
+      monthKey,
+      myWorldRank: myWorld ? myWorld.rank : null,
+      myCountryRank: myCountry ? myCountry.rank : null,
+      myScore: myWorld ? myWorld.score : 0,
+      rows: listResult.rows.map((row) => ({
+        rank: Number(row.position),
         username: row.username,
         country: row.country,
-        score:
-          scoreType === "infinite"
-            ? Number(row.infiniteScore || 0)
-            : Number(row.generalScore || 0),
-        rank: Number(row.rank || 0),
+        score: Number(row.score),
       })),
     });
   } catch (error) {
-    sendLeaderboardError(
-      res,
-      error,
-      "Liderlik tablosu yüklenemedi.",
-      "leaderboard get error:"
-    );
-  }
-});
+    console.error("leaderboard get error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
 
-app.get("/leaderboard/me", async (req, res) => {
-  if (!requireDatabase(res)) return;
-
-  const playerId = safePlayerId(req.query.playerId);
-
-  if (!playerId) {
-    res.status(400).json({
+    res.status(500).json({
       ok: false,
-      message: "playerId zorunlu.",
+      message: "Skor tablosu alınamadı.",
     });
-
-    return;
-  }
-
-  try {
-    const { rows } = await pool.query(
-      `
-        SELECT
-          p.player_id AS "playerId",
-          p.username AS "username",
-          p.country AS "country",
-          s.general_score AS "generalScore",
-          s.infinite_score AS "infiniteScore"
-        FROM players p
-        JOIN player_scores s ON s.player_id = p.player_id
-        WHERE p.player_id = $1
-        LIMIT 1
-      `,
-      [playerId]
-    );
-
-    const me = rows[0];
-
-    if (!me) {
-      res.status(404).json({
-        ok: false,
-        message: "Oyuncu bulunamadı.",
-      });
-      return;
-    }
-
-    res.json({
-      ok: true,
-      item: {
-        playerId: me.playerId,
-        username: me.username,
-        country: me.country,
-        generalScore: Number(me.generalScore || 0),
-        infiniteScore: Number(me.infiniteScore || 0),
-      },
-    });
-  } catch (error) {
-    sendLeaderboardError(
-      res,
-      error,
-      "Oyuncu bilgisi alınamadı.",
-      "leaderboard me error:"
-    );
   }
 });
 
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
   path: SOCKET_PATH,
+
+  cors: {
+    origin: true,
+    methods: ["GET", "POST"],
+    credentials: false,
+  },
+
   transports: ["websocket", "polling"],
+  allowEIO3: true,
+  pingInterval: 25000,
+  pingTimeout: 20000,
+
+  allowRequest: (req, callback) => {
+    console.log(
+      "Socket.IO handshake request:",
+      req.url,
+      "origin:",
+      req.headers.origin || "-"
+    );
+
+    callback(null, true);
+  },
 });
 
 const waitingQueues = new Map();
 const activeRooms = new Map();
+const realtimeRooms = new Map();
 const privateRooms = new Map();
-const roomStates = new Map();
-const backgroundTimers = new Map();
 const PRIVATE_ROOM_TTL_MS = Number(process.env.PRIVATE_ROOM_TTL_MS || 15 * 60 * 1000);
-const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS || 60 * 1000);
+const ROOM_RECONNECT_TIMEOUT_MS = Number(process.env.ROOM_RECONNECT_TIMEOUT_MS || 60 * 1000);
+const RESOLVED_ROOM_TTL_MS = Number(process.env.RESOLVED_ROOM_TTL_MS || 10 * 60 * 1000);
 
 function normalizeMatchGameKey(value) {
   const gameKey = String(value || "target_number").trim().slice(0, 96);
@@ -567,34 +561,45 @@ function queueKey(gameKey, difficulty) {
   return `${String(gameKey || "default")}::${String(difficulty || "default")}`;
 }
 
-function safePlayer(rawPlayer = {}, fallbackId = "") {
-  const playerId = safePlayerId(rawPlayer.id || rawPlayer.playerId || fallbackId);
+function safePlayerId(value, fallback = "") {
+  const cleaned = String(value || fallback || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_.:-]/g, "")
+    .slice(0, 96);
+
+  return cleaned || String(fallback || "").trim().slice(0, 96);
+}
+
+function safePlayer(rawPlayer, fallbackId = "") {
+  const id = safePlayerId(rawPlayer?.id, fallbackId);
+  const name = String(rawPlayer?.name || "Oyuncu").trim().slice(0, 24) || "Oyuncu";
+  const country = String(rawPlayer?.country || "").trim().toUpperCase().slice(0, 3);
 
   return {
-    id: playerId,
-    name: safeUsername(rawPlayer.name),
-    country: safeCountry(rawPlayer.country),
+    id,
+    name,
+    country,
   };
 }
 
-function safePuzzle(rawPuzzle = {}, fallbackDifficulty = "Medium") {
-  const difficulty = String(rawPuzzle.difficulty || fallbackDifficulty || "Medium").trim() || "Medium";
-  const target = Number(rawPuzzle.target);
-  const rawNumbers = Array.isArray(rawPuzzle.numbers) ? rawPuzzle.numbers : [];
+function safePuzzle(rawPuzzle, difficulty) {
+  const numbers = Array.isArray(rawPuzzle?.numbers)
+    ? rawPuzzle.numbers
+        .map((n) => Number(n))
+        .filter((n) => Number.isFinite(n))
+        .slice(0, 8)
+    : [];
 
-  if (!Number.isFinite(target) || rawNumbers.length === 0) return null;
+  const target = Number(rawPuzzle?.target);
 
-  const numbers = rawNumbers
-    .map((value) => Number(value))
-    .filter((value) => Number.isFinite(value))
-    .map((value) => Math.trunc(value));
-
-  if (numbers.length !== rawNumbers.length) return null;
+  if (!Number.isFinite(target) || target <= 0 || numbers.length < 3) {
+    return null;
+  }
 
   return {
-    difficulty,
-    target: Math.trunc(target),
-    numbers,
+    difficulty: String(rawPuzzle?.difficulty || difficulty || "Medium"),
+    target: Math.floor(target),
+    numbers: numbers.map((n) => Math.floor(n)),
   };
 }
 
@@ -606,234 +611,214 @@ function normalizeRoomCode(value) {
     .slice(0, 6);
 }
 
-function randomRoomCode() {
+function generateRoomCode() {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
 
   for (let i = 0; i < 6; i += 1) {
-    const index = crypto.randomInt(0, alphabet.length);
-    code += alphabet[index];
+    code += alphabet[crypto.randomInt(0, alphabet.length)];
   }
 
   return code;
 }
 
 function generateUniqueRoomCode() {
-  let attempts = 0;
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const code = generateRoomCode();
 
-  while (attempts < 20) {
-    const code = randomRoomCode();
-    if (!privateRooms.has(code)) return code;
-    attempts += 1;
+    if (!privateRooms.has(code)) {
+      return code;
+    }
   }
 
-  return crypto.randomBytes(4).toString("hex").slice(0, 6).toUpperCase();
+  return crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6);
 }
 
-function clearBackgroundTimer(playerId) {
-  const existing = backgroundTimers.get(playerId);
+function roomParticipants(room) {
+  return Object.values(room?.participants || {});
+}
 
-  if (existing) {
-    clearTimeout(existing);
-    backgroundTimers.delete(playerId);
+function getParticipant(room, playerId) {
+  if (!room || !playerId) return null;
+  return room.participants[playerId] || null;
+}
+
+function getOpponentParticipant(room, playerId) {
+  return roomParticipants(room).find((participant) => participant.playerId !== playerId) || null;
+}
+
+function clearParticipantTimeout(participant) {
+  if (participant?.timeoutHandle) {
+    clearTimeout(participant.timeoutHandle);
+    participant.timeoutHandle = null;
   }
 }
 
-function setActiveRoomMapping(socketId, roomId, opponentId, gameKey, difficulty, playerId) {
-  activeRooms.set(socketId, {
-    roomId,
-    opponentId,
-    gameKey,
-    difficulty,
+function clearRoomTimeouts(room) {
+  roomParticipants(room).forEach(clearParticipantTimeout);
+}
+
+function attachSocketToRoom(socket, room, playerId) {
+  const participant = getParticipant(room, playerId);
+  if (!participant) return;
+
+  participant.socketId = socket.id;
+  participant.connected = true;
+  socket.join(room.roomId);
+  activeRooms.set(socket.id, {
+    roomId: room.roomId,
     playerId,
   });
 }
 
-function getOpponentParticipant(room, playerId) {
-  for (const [id, participant] of room.participants.entries()) {
-    if (id !== playerId) return participant;
-  }
-  return null;
+function clearParticipantAwayState(room, playerId) {
+  const participant = getParticipant(room, playerId);
+  if (!participant) return;
+
+  clearParticipantTimeout(participant);
+  participant.connected = true;
+  participant.awaySince = null;
+  participant.backgrounded = false;
+  participant.reconnectDeadlineAt = null;
 }
 
-function buildPublicPlayer(player) {
-  return {
-    name: player.name,
-    country: player.country,
-  };
+function markRoomResolved(room, reason, winnerPlayerId, loserPlayerId) {
+  if (!room || room.resolved) return;
+
+  room.resolved = true;
+  room.resolvedReason = reason;
+  room.winnerPlayerId = winnerPlayerId || null;
+  room.loserPlayerId = loserPlayerId || null;
+  room.resolvedAt = Date.now();
+  clearRoomTimeouts(room);
 }
 
-function buildMatchPayload(room, forPlayerId, extra = {}) {
-  const selfParticipant = room.participants.get(forPlayerId);
-  const opponent = getOpponentParticipant(room, forPlayerId);
+function resolveRoomByAwayTimeout(roomId, loserPlayerId) {
+  const room = realtimeRooms.get(roomId);
+  if (!room || room.resolved) return;
 
-  if (!selfParticipant || !opponent) return null;
+  const loser = getParticipant(room, loserPlayerId);
+  const opponent = getOpponentParticipant(room, loserPlayerId);
 
-  return {
-    roomId: room.roomId,
-    isBot: false,
-    opponent: buildPublicPlayer(opponent),
-    puzzle: room.puzzle,
-    resumed: Boolean(extra.resumed),
-    opponentFinishedMs: Number(extra.opponentFinishedMs || 0),
-    ...(extra.roomCode ? { roomCode: extra.roomCode } : {}),
-  };
-}
+  if (!loser || loser.finishedAt) return;
 
-function removeRoomCompletely(roomId) {
-  const room = roomStates.get(roomId);
+  markRoomResolved(room, "timeout", opponent?.playerId, loserPlayerId);
 
-  if (!room) return;
+  const opponentSocket = opponent?.socketId
+    ? io.sockets.sockets.get(opponent.socketId)
+    : null;
 
-  for (const participant of room.participants.values()) {
-    clearBackgroundTimer(participant.playerId);
-
-    if (participant.socketId) {
-      activeRooms.delete(participant.socketId);
-      const socket = io.sockets.sockets.get(participant.socketId);
-
-      if (socket) {
-        try {
-          socket.leave(roomId);
-        } catch (_) {
-        }
-      }
-    }
+  if (opponentSocket && !opponent.finishedAt) {
+    opponentSocket.emit("opponent_left", {
+      roomId,
+      reason: "timeout",
+    });
   }
 
-  roomStates.delete(roomId);
+  const loserSocket = loser.socketId ? io.sockets.sockets.get(loser.socketId) : null;
+  if (loserSocket) {
+    loserSocket.emit("resume_error", {
+      code: "RECONNECT_EXPIRED",
+      message: "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
+      opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+    });
+  }
+
+  console.log("Reconnect timeout loss:", roomId, loserPlayerId);
 }
 
-function cleanupRoomIfSettled(roomId) {
-  const room = roomStates.get(roomId);
-  if (!room) return;
+function scheduleParticipantAwayTimeout(room, playerId) {
+  const participant = getParticipant(room, playerId);
 
-  const participants = Array.from(room.participants.values());
-  if (participants.length < 2) {
-    removeRoomCompletely(roomId);
+  if (!room || room.resolved || !participant || participant.finishedAt) {
     return;
   }
 
-  const everyoneFinished = participants.every((participant) => participant.finished || participant.forfeited);
-  if (everyoneFinished) {
-    removeRoomCompletely(roomId);
+  if (!participant.awaySince) {
+    participant.awaySince = Date.now();
+  }
+
+  participant.reconnectDeadlineAt = participant.awaySince + ROOM_RECONNECT_TIMEOUT_MS;
+
+  clearParticipantTimeout(participant);
+
+  const waitMs = Math.max(0, participant.reconnectDeadlineAt - Date.now());
+
+  participant.timeoutHandle = setTimeout(() => {
+    resolveRoomByAwayTimeout(room.roomId, playerId);
+  }, waitMs);
+
+  if (typeof participant.timeoutHandle.unref === "function") {
+    participant.timeoutHandle.unref();
   }
 }
 
-function scheduleBackgroundForfeit(roomId, playerId) {
-  clearBackgroundTimer(playerId);
-
-  const timer = setTimeout(() => {
-    const room = roomStates.get(roomId);
-    if (!room) {
-      backgroundTimers.delete(playerId);
-      return;
-    }
-
-    const participant = room.participants.get(playerId);
-    if (!participant || participant.socketId || participant.finished || participant.forfeited) {
-      backgroundTimers.delete(playerId);
-      return;
-    }
-
-    participant.forfeited = true;
-    participant.backgroundedAt = null;
-    backgroundTimers.delete(playerId);
-
-    const opponent = getOpponentParticipant(room, playerId);
-    if (opponent && opponent.socketId && !opponent.finished) {
-      io.to(opponent.socketId).emit("opponent_left", {
-        roomId,
-        reason: "timeout",
-      });
-    }
-
-    cleanupRoomIfSettled(roomId);
-  }, RECONNECT_GRACE_MS);
-
-  if (typeof timer.unref === "function") {
-    timer.unref();
-  }
-
-  backgroundTimers.set(playerId, timer);
-}
-
-function markParticipantBackgrounded(roomId, playerId) {
-  const room = roomStates.get(roomId);
-  if (!room) return;
-
-  const participant = room.participants.get(playerId);
-  if (!participant || participant.finished || participant.forfeited) return;
-
-  participant.backgroundedAt = Date.now();
-
-  if (participant.socketId) {
-    activeRooms.delete(participant.socketId);
-    participant.socketId = null;
-  }
-
-  scheduleBackgroundForfeit(roomId, playerId);
-}
-
-function createRealtimeRoom(socket, opponentSocket, gameKey, difficulty, puzzle, player, opponentPlayer) {
-  const roomId = `room_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
-
-  socket.join(roomId);
-  opponentSocket.join(roomId);
+function createRealtimeRoom(socket, player, opponentSocket, opponentPlayer, gameKey, difficulty, puzzle) {
+  const roomId =
+    typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex");
 
   const room = {
     roomId,
     gameKey,
     difficulty,
     puzzle,
-    participants: new Map([
-      [
-        player.id,
-        {
-          playerId: player.id,
-          socketId: socket.id,
-          name: player.name,
-          country: player.country,
-          finished: false,
-          finishedElapsedMs: null,
-          forfeited: false,
-          backgroundedAt: null,
-        },
-      ],
-      [
-        opponentPlayer.id,
-        {
-          playerId: opponentPlayer.id,
-          socketId: opponentSocket.id,
-          name: opponentPlayer.name,
-          country: opponentPlayer.country,
-          finished: false,
-          finishedElapsedMs: null,
-          forfeited: false,
-          backgroundedAt: null,
-        },
-      ],
-    ]),
+    createdAt: Date.now(),
+    resolved: false,
+    resolvedReason: null,
+    resolvedAt: null,
+    winnerPlayerId: null,
+    loserPlayerId: null,
+    participants: {
+      [player.id]: {
+        playerId: player.id,
+        socketId: socket.id,
+        name: player.name,
+        country: player.country,
+        connected: true,
+        awaySince: null,
+        backgrounded: false,
+        reconnectDeadlineAt: null,
+        timeoutHandle: null,
+        finishedAt: null,
+        elapsedMs: null,
+      },
+      [opponentPlayer.id]: {
+        playerId: opponentPlayer.id,
+        socketId: opponentSocket.id,
+        name: opponentPlayer.name,
+        country: opponentPlayer.country,
+        connected: true,
+        awaySince: null,
+        backgrounded: false,
+        reconnectDeadlineAt: null,
+        timeoutHandle: null,
+        finishedAt: null,
+        elapsedMs: null,
+      },
+    },
   };
 
-  roomStates.set(roomId, room);
+  realtimeRooms.set(roomId, room);
+  attachSocketToRoom(socket, room, player.id);
+  attachSocketToRoom(opponentSocket, room, opponentPlayer.id);
 
-  setActiveRoomMapping(socket.id, roomId, opponentSocket.id, gameKey, difficulty, player.id);
-  setActiveRoomMapping(opponentSocket.id, roomId, socket.id, gameKey, difficulty, opponentPlayer.id);
-
-  return roomId;
+  return room;
 }
 
-function removePrivateRoomsForSocket(socketId, notifyOwner = true) {
+function removePrivateRoomsForSocket(socketId, notify = true) {
   for (const [roomCode, room] of privateRooms.entries()) {
-    if (room.ownerSocketId === socketId) {
-      privateRooms.delete(roomCode);
+    if (room.ownerSocketId !== socketId) continue;
 
-      if (notifyOwner) {
-        io.to(socketId).emit("friend_room_closed", {
-          roomCode,
-        });
-      }
+    privateRooms.delete(roomCode);
+
+    const ownerSocket = io.sockets.sockets.get(socketId);
+    if (notify && ownerSocket) {
+      ownerSocket.emit("friend_room_closed", {
+        roomCode,
+        reason: "cancelled",
+      });
     }
   }
 }
@@ -842,81 +827,119 @@ function expireOldPrivateRooms() {
   const now = Date.now();
 
   for (const [roomCode, room] of privateRooms.entries()) {
-    if (now - room.createdAt > PRIVATE_ROOM_TTL_MS) {
-      privateRooms.delete(roomCode);
+    if (now - room.createdAt <= PRIVATE_ROOM_TTL_MS) continue;
 
-      io.to(room.ownerSocketId).emit("friend_room_closed", {
+    privateRooms.delete(roomCode);
+
+    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
+    if (ownerSocket) {
+      ownerSocket.emit("friend_room_closed", {
         roomCode,
+        reason: "expired",
       });
     }
   }
 }
 
-function removeFromAllQueues(socketId) {
-  for (const [key, queue] of waitingQueues.entries()) {
-    const filtered = queue.filter((entry) => entry.socketId !== socketId);
-    if (filtered.length > 0) waitingQueues.set(key, filtered);
-    else waitingQueues.delete(key);
+function expireResolvedRooms() {
+  const now = Date.now();
+
+  for (const [roomId, room] of realtimeRooms.entries()) {
+    if (!room.resolved || !room.resolvedAt) continue;
+    if (now - room.resolvedAt <= RESOLVED_ROOM_TTL_MS) continue;
+
+    clearRoomTimeouts(room);
+    realtimeRooms.delete(roomId);
   }
+}
+
+function removeFromAllQueues(socketId, playerId = "") {
+  for (const [key, queue] of waitingQueues.entries()) {
+    const filtered = queue.filter((item) => {
+      if (item.socketId === socketId) return false;
+      if (playerId && item.player?.id === playerId) return false;
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      waitingQueues.delete(key);
+    } else {
+      waitingQueues.set(key, filtered);
+    }
+  }
+}
+
+function getRoomContextBySocket(socket) {
+  const active = activeRooms.get(socket.id);
+  if (!active) return {};
+
+  const room = realtimeRooms.get(active.roomId);
+  if (!room) {
+    activeRooms.delete(socket.id);
+    return {};
+  }
+
+  const participant = getParticipant(room, active.playerId);
+  const opponent = getOpponentParticipant(room, active.playerId);
+
+  return {
+    active,
+    room,
+    participant,
+    opponent,
+  };
 }
 
 function leaveRoomAsCancel(socket) {
-  const active = activeRooms.get(socket.id);
+  const { active, room, participant, opponent } = getRoomContextBySocket(socket);
   if (!active) return;
 
-  const room = roomStates.get(active.roomId);
+  if (room && participant) {
+    if (!room.resolved && !participant.finishedAt && opponent && !opponent.finishedAt) {
+      markRoomResolved(room, "cancelled", opponent.playerId, participant.playerId);
+
+      const opponentSocket = opponent.socketId
+        ? io.sockets.sockets.get(opponent.socketId)
+        : null;
+
+      if (opponentSocket) {
+        opponentSocket.emit("opponent_left", {
+          roomId: room.roomId,
+          reason: "cancelled",
+        });
+      }
+    }
+
+    clearParticipantTimeout(participant);
+    participant.connected = false;
+    participant.awaySince = null;
+    participant.backgrounded = false;
+    participant.reconnectDeadlineAt = null;
+    participant.socketId = null;
+  }
 
   activeRooms.delete(socket.id);
-
-  if (!room) return;
-
-  const participant = room.participants.get(active.playerId);
-  if (participant) {
-    participant.forfeited = true;
-    participant.backgroundedAt = null;
-    participant.socketId = null;
-    clearBackgroundTimer(participant.playerId);
-  }
-
-  const opponent = getOpponentParticipant(room, active.playerId);
-  if (opponent && opponent.socketId && !opponent.finished) {
-    io.to(opponent.socketId).emit("opponent_left", {
-      roomId: active.roomId,
-      reason: "cancel",
-    });
-  }
-
-  cleanupRoomIfSettled(active.roomId);
+  socket.leave(active.roomId);
 }
 
-function handleSocketDisconnect(socket, reason) {
-  const active = activeRooms.get(socket.id);
-  if (!active) return;
-
-  const room = roomStates.get(active.roomId);
-  if (!room) {
-    activeRooms.delete(socket.id);
-    return;
-  }
-
-  const participant = room.participants.get(active.playerId);
-  if (!participant) {
-    activeRooms.delete(socket.id);
-    return;
-  }
+function markSocketDisconnected(socket) {
+  const { active, room, participant } = getRoomContextBySocket(socket);
+  if (!active || !room || !participant) return;
 
   activeRooms.delete(socket.id);
-  participant.socketId = null;
 
-  if (participant.finished || participant.forfeited) {
-    cleanupRoomIfSettled(active.roomId);
+  if (room.resolved || participant.finishedAt) {
+    participant.connected = false;
+    participant.socketId = null;
     return;
   }
 
-  participant.backgroundedAt = Date.now();
-  scheduleBackgroundForfeit(active.roomId, participant.playerId);
-
-  console.log("Socket background grace başladı:", socket.id, active.roomId, reason);
+  participant.connected = false;
+  participant.socketId = null;
+  if (!participant.awaySince) {
+    participant.awaySince = Date.now();
+  }
+  scheduleParticipantAwayTimeout(room, participant.playerId);
 }
 
 app.get("/", (req, res) => {
@@ -932,7 +955,7 @@ app.get("/", (req, res) => {
       key,
       count: queue.length,
     })),
-    activeRooms: roomStates.size,
+    activeRooms: Array.from(realtimeRooms.values()).filter((room) => !room.resolved).length,
     privateRooms: privateRooms.size,
   });
 });
@@ -955,32 +978,57 @@ app.get("/health", async (req, res) => {
       database: true,
     });
   } catch (error) {
-    console.error("Health check DB error:", {
+    console.error("health database error:", {
       message: error.message,
       code: error.code,
       detail: error.detail,
-      stack: error.stack,
     });
 
     res.status(500).json({
       ok: false,
       database: false,
-      message: "Veritabanına erişilemiyor.",
+      message: "Database bağlantısı başarısız.",
     });
   }
 });
 
+app.get("/socket-check", (req, res) => {
+  res.json({
+    ok: true,
+    socketPath: SOCKET_PATH,
+    androidUrlMustBe: "https://renderdepo-tpqh.onrender.com",
+    androidUrlMustNotInclude: "/socket.io",
+    transports: ["websocket", "polling"],
+  });
+});
+
+io.engine.on("connection_error", (err) => {
+  console.log("Engine.IO connection_error:", {
+    code: err.code,
+    message: err.message,
+    context: err.context,
+    url: err.req && err.req.url,
+    userAgent: err.req && err.req.headers && err.req.headers["user-agent"],
+    origin: err.req && err.req.headers && err.req.headers.origin,
+  });
+});
+
+io.engine.on("connection", (rawSocket) => {
+  console.log(
+    "Engine.IO connected:",
+    rawSocket.id,
+    "transport:",
+    rawSocket.transport.name
+  );
+});
+
 io.on("connection", (socket) => {
-  console.log("Socket connected:", socket.id);
-
-  socket.on("error", (error) => {
-    console.error("Socket error:", socket.id, error?.message || error);
-  });
-
-  socket.conn.on("packet", (packet) => {
-    if (packet.type === "ping" || packet.type === "pong") return;
-    console.log("Socket packet:", socket.id, packet.type, packet.data ? "with data" : "");
-  });
+  console.log(
+    "Socket connected:",
+    socket.id,
+    "transport:",
+    socket.conn.transport.name
+  );
 
   socket.conn.on("upgrade", (transport) => {
     console.log("Socket upgraded:", socket.id, "transport:", transport.name);
@@ -989,24 +1037,18 @@ io.on("connection", (socket) => {
   socket.on("join_match", (payload = {}) => {
     const gameKey = normalizeMatchGameKey(payload.gameKey);
     const difficulty = String(payload.difficulty || "Medium");
-    const player = safePlayer(payload.player, socket.id);
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
     const puzzle = safePuzzle(payload.puzzle, difficulty);
-
-    if (!player.id) {
-      socket.emit("match_error", {
-        message: "playerId zorunlu.",
-      });
-      return;
-    }
 
     if (!puzzle) {
       socket.emit("match_error", {
         message: "Geçersiz puzzle verisi.",
       });
+
       return;
     }
 
-    removeFromAllQueues(socket.id);
+    removeFromAllQueues(socket.id, player.id);
     removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
 
@@ -1021,24 +1063,42 @@ io.on("connection", (socket) => {
         continue;
       }
 
+      if (opponent.player?.id && opponent.player.id === player.id) {
+        continue;
+      }
+
       waitingQueues.set(key, queue);
 
       const selectedPuzzle = opponent.puzzle || puzzle;
-      const roomId = createRealtimeRoom(
+      const room = createRealtimeRoom(
         socket,
+        player,
         opponentSocket,
+        opponent.player,
         gameKey,
         difficulty,
-        selectedPuzzle,
-        player,
-        opponent.player
+        selectedPuzzle
       );
-      const room = roomStates.get(roomId);
 
-      socket.emit("match_found", buildMatchPayload(room, player.id));
-      opponentSocket.emit("match_found", buildMatchPayload(room, opponent.player.id));
+      socket.emit("match_found", {
+        roomId: room.roomId,
+        opponent: {
+          name: opponent.player.name,
+          country: opponent.player.country,
+        },
+        puzzle: selectedPuzzle,
+      });
 
-      console.log("Match found:", roomId, key);
+      opponentSocket.emit("match_found", {
+        roomId: room.roomId,
+        opponent: {
+          name: player.name,
+          country: player.country,
+        },
+        puzzle: selectedPuzzle,
+      });
+
+      console.log("Match found:", room.roomId, key);
 
       return;
     }
@@ -1057,7 +1117,114 @@ io.on("connection", (socket) => {
       difficulty,
     });
 
-    console.log("Player waiting:", socket.id, key);
+    console.log("Player waiting:", socket.id, key, player.id);
+  });
+
+  socket.on("resume_match", (payload = {}) => {
+    const roomId = String(payload.roomId || "").trim();
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
+    const room = realtimeRooms.get(roomId);
+
+    if (!roomId || !room) {
+      socket.emit("resume_error", {
+        code: "ROOM_NOT_FOUND",
+        message: "Yeniden bağlanılacak aktif oda bulunamadı.",
+      });
+      return;
+    }
+
+    const participant = getParticipant(room, player.id);
+    const opponent = getOpponentParticipant(room, player.id);
+
+    if (!participant) {
+      socket.emit("resume_error", {
+        code: "PLAYER_NOT_FOUND",
+        message: "Bu oyuncu için yeniden bağlanma bilgisi bulunamadı.",
+      });
+      return;
+    }
+
+    if (room.resolved) {
+      socket.emit("resume_error", {
+        code: "MATCH_RESOLVED",
+        message: "Bu maç zaten sona ermiş.",
+        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+      });
+      return;
+    }
+
+    if (participant.awaySince && Date.now() > participant.awaySince + ROOM_RECONNECT_TIMEOUT_MS) {
+      resolveRoomByAwayTimeout(room.roomId, participant.playerId);
+      socket.emit("resume_error", {
+        code: "RECONNECT_EXPIRED",
+        message: "1 dakikalık yeniden bağlanma süresi doldu.",
+        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+      });
+      return;
+    }
+
+    if (participant.socketId && participant.socketId !== socket.id) {
+      activeRooms.delete(participant.socketId);
+    }
+
+    attachSocketToRoom(socket, room, participant.playerId);
+    clearParticipantAwayState(room, participant.playerId);
+
+    socket.emit("resume_state", {
+      roomId: room.roomId,
+      opponent: {
+        name: opponent?.name || "Rakip",
+        country: opponent?.country || "",
+      },
+      puzzle: room.puzzle,
+      opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+    });
+
+    console.log("Match resumed:", room.roomId, participant.playerId, socket.id);
+  });
+
+  socket.on("player_backgrounded", (payload = {}) => {
+    const fallbackActive = activeRooms.get(socket.id);
+    const roomId = String(payload.roomId || fallbackActive?.roomId || "").trim();
+    const room = realtimeRooms.get(roomId);
+    const playerId =
+      fallbackActive?.playerId ||
+      roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
+    const participant = getParticipant(room, playerId);
+
+    if (!room || !participant || room.resolved || participant.finishedAt) return;
+
+    if (!participant.awaySince) {
+      participant.awaySince = Date.now();
+    }
+    participant.backgrounded = true;
+    scheduleParticipantAwayTimeout(room, participant.playerId);
+
+    console.log("Player backgrounded:", roomId, participant.playerId);
+  });
+
+  socket.on("player_foregrounded", (payload = {}) => {
+    const fallbackActive = activeRooms.get(socket.id);
+    const roomId = String(payload.roomId || fallbackActive?.roomId || "").trim();
+    const room = realtimeRooms.get(roomId);
+    const playerId =
+      fallbackActive?.playerId ||
+      roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
+    const participant = getParticipant(room, playerId);
+
+    if (!room || !participant) return;
+
+    if (room.resolved && room.loserPlayerId === participant.playerId) {
+      socket.emit("resume_error", {
+        code: "RECONNECT_EXPIRED",
+        message: "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
+        opponentFinishedMs: Number(getOpponentParticipant(room, participant.playerId)?.elapsedMs || 0),
+      });
+      return;
+    }
+
+    clearParticipantAwayState(room, participant.playerId);
+    console.log("Player foregrounded:", roomId, participant.playerId);
   });
 
   socket.on("create_friend_room", (payload = {}) => {
@@ -1065,24 +1232,18 @@ io.on("connection", (socket) => {
 
     const gameKey = String(payload.gameKey || "target_number");
     const difficulty = String(payload.difficulty || "Medium");
-    const player = safePlayer(payload.player, socket.id);
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
     const puzzle = safePuzzle(payload.puzzle, difficulty);
-
-    if (!player.id) {
-      socket.emit("friend_room_error", {
-        message: "playerId zorunlu.",
-      });
-      return;
-    }
 
     if (!puzzle) {
       socket.emit("friend_room_error", {
         message: "Geçersiz puzzle verisi.",
       });
+
       return;
     }
 
-    removeFromAllQueues(socket.id);
+    removeFromAllQueues(socket.id, player.id);
     removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
 
@@ -1117,6 +1278,7 @@ io.on("connection", (socket) => {
       socket.emit("friend_room_error", {
         message: "Geçerli 6 haneli oda kodu gir.",
       });
+
       return;
     }
 
@@ -1124,6 +1286,7 @@ io.on("connection", (socket) => {
       socket.emit("friend_room_error", {
         message: "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
       });
+
       return;
     }
 
@@ -1131,6 +1294,7 @@ io.on("connection", (socket) => {
       socket.emit("friend_room_error", {
         message: "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
       });
+
       return;
     }
 
@@ -1142,188 +1306,80 @@ io.on("connection", (socket) => {
       socket.emit("friend_room_error", {
         message: "Oda sahibi bağlantıdan ayrılmış.",
       });
+
       return;
     }
 
-    const player = safePlayer(payload.player, socket.id);
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
 
-    if (!player.id) {
-      socket.emit("friend_room_error", {
-        message: "playerId zorunlu.",
-      });
-      return;
-    }
-
-    removeFromAllQueues(socket.id);
+    removeFromAllQueues(socket.id, player.id);
     removePrivateRoomsForSocket(socket.id, false);
     leaveRoomAsCancel(socket);
 
     privateRooms.delete(roomCode);
 
-    const roomId = createRealtimeRoom(
+    const realtimeRoom = createRealtimeRoom(
       socket,
+      player,
       ownerSocket,
+      room.player,
       room.gameKey,
       room.difficulty,
-      room.puzzle,
-      player,
-      room.player
+      room.puzzle
     );
-    const activeRoom = roomStates.get(roomId);
 
-    socket.emit("match_found", buildMatchPayload(activeRoom, player.id, { roomCode }));
-    ownerSocket.emit("match_found", buildMatchPayload(activeRoom, room.player.id, { roomCode }));
+    socket.emit("match_found", {
+      roomId: realtimeRoom.roomId,
+      roomCode,
+      opponent: {
+        name: room.player.name,
+        country: room.player.country,
+      },
+      puzzle: room.puzzle,
+    });
 
-    console.log("Friend match found:", roomCode, roomId, queueKey(room.gameKey, room.difficulty));
+    ownerSocket.emit("match_found", {
+      roomId: realtimeRoom.roomId,
+      roomCode,
+      opponent: {
+        name: player.name,
+        country: player.country,
+      },
+      puzzle: room.puzzle,
+    });
+
+    console.log("Friend match found:", roomCode, realtimeRoom.roomId, queueKey(room.gameKey, room.difficulty));
   });
 
   socket.on("player_finished", (payload = {}) => {
-    const roomId = String(payload.roomId || "");
+    const roomId = String(payload.roomId || "").trim();
     const elapsedMs = Math.max(1, Number(payload.elapsedMs || 0));
-    const mapping = activeRooms.get(socket.id);
+    const room = realtimeRooms.get(roomId);
+    const active = activeRooms.get(socket.id);
+    const playerId =
+      active?.playerId ||
+      roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
+    const participant = getParticipant(room, playerId);
+    const opponent = getOpponentParticipant(room, playerId);
 
-    if (!roomId || !Number.isFinite(elapsedMs) || !mapping || mapping.roomId !== roomId) return;
+    if (!room || !participant || !Number.isFinite(elapsedMs) || room.resolved) return;
 
-    const room = roomStates.get(roomId);
-    if (!room) return;
+    participant.finishedAt = Date.now();
+    participant.elapsedMs = Math.floor(elapsedMs);
+    clearParticipantAwayState(room, participant.playerId);
 
-    const participant = room.participants.get(mapping.playerId);
-    if (!participant) return;
+    markRoomResolved(room, "finished", participant.playerId, opponent?.playerId);
 
-    participant.finished = true;
-    participant.finishedElapsedMs = Math.floor(elapsedMs);
-    participant.backgroundedAt = null;
-    clearBackgroundTimer(participant.playerId);
+    const opponentSocket = opponent?.socketId
+      ? io.sockets.sockets.get(opponent.socketId)
+      : null;
 
-    const opponent = getOpponentParticipant(room, participant.playerId);
-    if (opponent && opponent.socketId) {
-      io.to(opponent.socketId).emit("opponent_finished", {
+    if (opponentSocket) {
+      opponentSocket.emit("opponent_finished", {
         roomId,
-        elapsedMs: participant.finishedElapsedMs,
+        elapsedMs: participant.elapsedMs,
       });
     }
-
-    cleanupRoomIfSettled(roomId);
-  });
-
-  socket.on("player_backgrounded", (payload = {}) => {
-    const roomId = String(payload.roomId || "");
-    const playerId = safePlayerId(payload.playerId);
-    const mapping = activeRooms.get(socket.id);
-
-    const resolvedRoomId = roomId || mapping?.roomId || "";
-    const resolvedPlayerId = playerId || mapping?.playerId || "";
-
-    if (!resolvedRoomId || !resolvedPlayerId) return;
-
-    markParticipantBackgrounded(resolvedRoomId, resolvedPlayerId);
-  });
-
-  socket.on("resume_match", (payload = {}) => {
-    const roomId = String(payload.roomId || "");
-    const gameKey = normalizeMatchGameKey(payload.gameKey);
-    const playerId = safePlayerId(payload.playerId);
-
-    if (!roomId || !playerId) {
-      socket.emit("resume_error", {
-        message: "Tekrar bağlanmak için geçerli roomId ve playerId gerekli.",
-      });
-      return;
-    }
-
-    const room = roomStates.get(roomId);
-    if (!room) {
-      socket.emit("resume_error", {
-        message: "Maç bulunamadı veya zaten kapandı.",
-      });
-      return;
-    }
-
-    if (room.gameKey !== gameKey) {
-      socket.emit("resume_error", {
-        message: "Maç bilgisi eşleşmedi.",
-      });
-      return;
-    }
-
-    const participant = room.participants.get(playerId);
-    if (!participant) {
-      socket.emit("resume_error", {
-        message: "Bu oyuncu için aktif maç bulunamadı.",
-      });
-      return;
-    }
-
-    if (participant.forfeited) {
-      socket.emit("resume_error", {
-        message: "1 dakikalık süre dolduğu için maça tekrar bağlanılamadı.",
-      });
-      return;
-    }
-
-    if (participant.finished) {
-      socket.emit("resume_error", {
-        message: "Bu maç zaten tamamlandı.",
-      });
-      return;
-    }
-
-    if (
-      participant.backgroundedAt &&
-      Date.now() - participant.backgroundedAt > RECONNECT_GRACE_MS
-    ) {
-      participant.forfeited = true;
-      clearBackgroundTimer(participant.playerId);
-
-      const opponent = getOpponentParticipant(room, participant.playerId);
-      if (opponent && opponent.socketId && !opponent.finished) {
-        io.to(opponent.socketId).emit("opponent_left", {
-          roomId,
-          reason: "timeout",
-        });
-      }
-
-      removeRoomCompletely(roomId);
-
-      socket.emit("resume_error", {
-        message: "1 dakikalık süre dolduğu için maça tekrar bağlanılamadı.",
-      });
-      return;
-    }
-
-    clearBackgroundTimer(participant.playerId);
-    participant.socketId = socket.id;
-    participant.backgroundedAt = null;
-
-    socket.join(roomId);
-
-    const opponent = getOpponentParticipant(room, participant.playerId);
-    setActiveRoomMapping(
-      socket.id,
-      roomId,
-      opponent?.socketId || null,
-      room.gameKey,
-      room.difficulty,
-      participant.playerId
-    );
-
-    if (opponent && opponent.socketId) {
-      const opponentMapping = activeRooms.get(opponent.socketId);
-      if (opponentMapping) {
-        opponentMapping.opponentId = socket.id;
-        activeRooms.set(opponent.socketId, opponentMapping);
-      }
-    }
-
-    socket.emit(
-      "match_resumed",
-      buildMatchPayload(room, participant.playerId, {
-        resumed: true,
-        opponentFinishedMs: opponent?.finishedElapsedMs || 0,
-      })
-    );
-
-    console.log("Match resumed:", roomId, playerId, socket.id);
   });
 
   socket.on("cancel_match", () => {
@@ -1336,11 +1392,14 @@ io.on("connection", (socket) => {
     console.log("Socket disconnected:", socket.id, reason);
     removeFromAllQueues(socket.id);
     removePrivateRoomsForSocket(socket.id, false);
-    handleSocketDisconnect(socket, reason);
+    markSocketDisconnected(socket);
   });
 });
 
-setInterval(expireOldPrivateRooms, 60_000).unref();
+setInterval(() => {
+  expireOldPrivateRooms();
+  expireResolvedRooms();
+}, 60_000).unref();
 
 const PORT = Number(process.env.PORT || 10000);
 
