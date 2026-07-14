@@ -121,15 +121,27 @@ function safeScore(value) {
   return Math.max(0, Math.min(Math.floor(number), 2_000_000_000));
 }
 
-function safeSignedDelta(value) {
+function safeDelta(value) {
   const number = Number(value || 0);
 
   if (!Number.isFinite(number)) return 0;
 
-  const maxDelta = Number(process.env.MAX_SCORE_DELTA || 100_000);
-  const truncated = Math.trunc(number);
+  return Math.max(
+    0,
+    Math.min(Math.floor(number), Number(process.env.MAX_SCORE_DELTA || 100_000))
+  );
+}
 
-  return Math.max(-maxDelta, Math.min(truncated, maxDelta));
+function safeSignedDelta(value) {
+  const number = Number(value || 0);
+  const maxDelta = Number(process.env.MAX_SCORE_DELTA || 100_000);
+
+  if (!Number.isFinite(number)) return 0;
+
+  return Math.max(
+    -maxDelta,
+    Math.min(Math.trunc(number), maxDelta)
+  );
 }
 
 function requireDatabase(res) {
@@ -280,7 +292,7 @@ app.post("/leaderboard/scores/sync", async (req, res) => {
       `UPDATE player_scores
        SET
          general_score = $2,
-         infinite_score = $3,
+         infinite_score = GREATEST(infinite_score, $3),
          updated_at = NOW()
        WHERE player_id = $1`,
       [playerId, generalScore, infiniteScore]
@@ -312,7 +324,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
   const username = safeUsername(req.body.username);
   const country = safeCountry(req.body.country);
   const generalDelta = safeSignedDelta(req.body.generalScoreDelta);
-  const infiniteDelta = safeSignedDelta(req.body.infiniteScoreDelta);
+  const infiniteDelta = safeDelta(req.body.infiniteScoreDelta);
   const monthKey = currentMonthKey();
 
   if (!playerId) {
@@ -324,7 +336,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
     return;
   }
 
-  if (generalDelta === 0 && infiniteDelta === 0) {
+  if (generalDelta === 0 && infiniteDelta <= 0) {
     res.json({
       ok: true,
       skipped: true,
@@ -344,7 +356,7 @@ app.post("/leaderboard/scores/add", async (req, res) => {
       `UPDATE player_scores
        SET
          general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)),
-         infinite_score = GREATEST(0, LEAST(infinite_score + $3, 2000000000)),
+         infinite_score = LEAST(infinite_score + $3, 2000000000),
          updated_at = NOW()
        WHERE player_id = $1`,
       [playerId, generalDelta, infiniteDelta]
@@ -354,19 +366,18 @@ app.post("/leaderboard/scores/add", async (req, res) => {
       `INSERT INTO player_monthly_scores
          (player_id, month_key, general_score, infinite_score, updated_at)
        VALUES
-         ($1, $2, 0, 0, NOW())
-       ON CONFLICT (player_id, month_key) DO NOTHING`,
-      [playerId, monthKey]
-    );
-
-    await client.query(
-      `UPDATE player_monthly_scores
-       SET
-         general_score = GREATEST(0, LEAST(general_score + $3, 2000000000)),
-         infinite_score = GREATEST(0, LEAST(infinite_score + $4, 2000000000)),
-         updated_at = NOW()
-       WHERE player_id = $1
-         AND month_key = $2`,
+         ($1, $2, GREATEST($3, 0), $4, NOW())
+       ON CONFLICT (player_id, month_key)
+       DO UPDATE SET
+         general_score = GREATEST(
+           0,
+           LEAST(player_monthly_scores.general_score + $3, 2000000000)
+         ),
+         infinite_score = LEAST(
+           player_monthly_scores.infinite_score + EXCLUDED.infinite_score,
+           2000000000
+         ),
+         updated_at = NOW()`,
       [playerId, monthKey, generalDelta, infiniteDelta]
     );
 
