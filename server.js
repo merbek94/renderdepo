@@ -1489,3 +1489,406 @@ function createRealtimeRoom(
 
   return room;
 }
+function removePrivateRoomsForSocket(socketId, notify = true) {
+  for (const [roomCode, room] of privateRooms.entries()) {
+    if (room.ownerSocketId !== socketId) continue;
+
+    privateRooms.delete(roomCode);
+
+    const ownerSocket = io.sockets.sockets.get(socketId);
+    if (notify && ownerSocket) {
+      ownerSocket.emit("friend_room_closed", {
+        roomCode,
+        reason: "cancelled",
+      });
+    }
+  }
+}
+
+function expireOldPrivateRooms() {
+  const now = Date.now();
+
+  for (const [roomCode, room] of privateRooms.entries()) {
+    if (now - room.createdAt <= PRIVATE_ROOM_TTL_MS) continue;
+
+    privateRooms.delete(roomCode);
+
+    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
+    if (ownerSocket) {
+      ownerSocket.emit("friend_room_closed", {
+        roomCode,
+        reason: "expired",
+      });
+    }
+  }
+}
+
+function expireResolvedRooms() {
+  const now = Date.now();
+
+  for (const [roomId, room] of realtimeRooms.entries()) {
+    if (!room.resolved || !room.resolvedAt) continue;
+    if (now - room.resolvedAt <= RESOLVED_ROOM_TTL_MS) continue;
+
+    clearRoomTimeouts(room);
+    realtimeRooms.delete(roomId);
+  }
+}
+
+function removeFromAllQueues(socketId, playerId = "") {
+  for (const [key, queue] of waitingQueues.entries()) {
+    const filtered = queue.filter((item) => {
+      if (item.socketId === socketId) return false;
+      if (playerId && item.player?.id === playerId) return false;
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      waitingQueues.delete(key);
+    } else {
+      waitingQueues.set(key, filtered);
+    }
+  }
+}
+
+function getRoomContextBySocket(socket) {
+  const active = activeRooms.get(socket.id);
+  if (!active) return {};
+
+  const room = realtimeRooms.get(active.roomId);
+  if (!room) {
+    activeRooms.delete(socket.id);
+    return {};
+  }
+
+  const participant = getParticipant(room, active.playerId);
+  const opponent = getOpponentParticipant(room, active.playerId);
+
+  return {
+    active,
+    room,
+    participant,
+    opponent,
+  };
+}
+
+function leaveRoomAsCancel(socket) {
+  const { active, room, participant, opponent } =
+    getRoomContextBySocket(socket);
+
+  if (!active) return;
+
+  if (room && participant) {
+    if (
+      !room.resolved &&
+      !participant.finishedAt &&
+      opponent &&
+      !opponent.finishedAt
+    ) {
+      markRoomResolved(
+        room,
+        "cancelled",
+        opponent.playerId,
+        participant.playerId
+      );
+
+      const opponentSocket = opponent.socketId
+        ? io.sockets.sockets.get(opponent.socketId)
+        : null;
+
+      if (opponentSocket) {
+        opponentSocket.emit("opponent_left", {
+          roomId: room.roomId,
+          reason: "cancelled",
+        });
+      }
+    }
+
+    clearParticipantTimeout(participant);
+    participant.connected = false;
+    participant.awaySince = null;
+    participant.backgrounded = false;
+    participant.reconnectDeadlineAt = null;
+    participant.socketId = null;
+  }
+
+  activeRooms.delete(socket.id);
+  socket.leave(active.roomId);
+}
+
+function markSocketDisconnected(socket) {
+  const { active, room, participant } =
+    getRoomContextBySocket(socket);
+
+  if (!active || !room || !participant) return;
+
+  activeRooms.delete(socket.id);
+
+  if (room.resolved || participant.finishedAt) {
+    participant.connected = false;
+    participant.socketId = null;
+    return;
+  }
+
+  participant.connected = false;
+  participant.socketId = null;
+
+  if (!participant.awaySince) {
+    participant.awaySince = Date.now();
+  }
+
+  scheduleParticipantAwayTimeout(
+    room,
+    participant.playerId
+  );
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "target-number-matchmaking",
+    socket: "socket.io",
+    socketPath: SOCKET_PATH,
+    database: Boolean(pool),
+    leaderboard: Boolean(pool),
+    transports: ["websocket", "polling"],
+
+    waitingQueues: Array.from(
+      waitingQueues.entries()
+    ).map(([key, queue]) => ({
+      key,
+      count: queue.length,
+    })),
+
+    activeRooms: Array.from(
+      realtimeRooms.values()
+    ).filter((room) => !room.resolved).length,
+
+    privateRooms: privateRooms.size,
+  });
+});
+
+app.get("/health", async (req, res) => {
+  if (!pool) {
+    res.json({
+      ok: true,
+      database: false,
+    });
+
+    return;
+  }
+
+  try {
+    await pool.query("SELECT 1");
+
+    res.json({
+      ok: true,
+      database: true,
+    });
+  } catch (error) {
+    console.error("health database error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+    });
+
+    res.status(500).json({
+      ok: false,
+      database: false,
+      message: "Database bağlantısı başarısız.",
+    });
+  }
+});
+
+app.get("/socket-check", (req, res) => {
+  res.json({
+    ok: true,
+    socketPath: SOCKET_PATH,
+    androidUrlMustBe:
+      "https://renderdepo-tpqh.onrender.com",
+    androidUrlMustNotInclude: "/socket.io",
+    transports: ["websocket", "polling"],
+  });
+});
+
+io.engine.on("connection_error", (err) => {
+  console.log("Engine.IO connection_error:", {
+    code: err.code,
+    message: err.message,
+    context: err.context,
+    url: err.req && err.req.url,
+
+    userAgent:
+      err.req &&
+      err.req.headers &&
+      err.req.headers["user-agent"],
+
+    origin:
+      err.req &&
+      err.req.headers &&
+      err.req.headers.origin,
+  });
+});
+
+io.engine.on("connection", (rawSocket) => {
+  console.log(
+    "Engine.IO connected:",
+    rawSocket.id,
+    "transport:",
+    rawSocket.transport.name
+  );
+});
+
+io.on("connection", (socket) => {
+  console.log(
+    "Socket connected:",
+    socket.id,
+    "transport:",
+    socket.conn.transport.name
+  );
+
+  socket.conn.on("upgrade", (transport) => {
+    console.log(
+      "Socket upgraded:",
+      socket.id,
+      "transport:",
+      transport.name
+    );
+  });
+
+  socket.on("join_match", (payload = {}) => {
+    const gameKey = normalizeMatchGameKey(
+      payload.gameKey
+    );
+
+    const difficulty = String(
+      payload.difficulty || "Medium"
+    );
+
+    const player = safePlayer(
+      payload.player,
+      `guest:${socket.id}`
+    );
+
+    const puzzle = safePuzzle(
+      payload.puzzle,
+      difficulty
+    );
+
+    if (!puzzle) {
+      socket.emit("match_error", {
+        message: "Geçersiz puzzle verisi.",
+      });
+
+      return;
+    }
+
+    removeFromAllQueues(
+      socket.id,
+      player.id
+    );
+
+    removePrivateRoomsForSocket(
+      socket.id,
+      false
+    );
+
+    leaveRoomAsCancel(socket);
+
+    const key = queueKey(
+      gameKey,
+      difficulty
+    );
+
+    const queue =
+      waitingQueues.get(key) || [];
+
+    while (queue.length > 0) {
+      const opponent = queue.shift();
+
+      const opponentSocket =
+        io.sockets.sockets.get(
+          opponent.socketId
+        );
+
+      if (
+        !opponentSocket ||
+        opponentSocket.id === socket.id
+      ) {
+        continue;
+      }
+
+      if (
+        opponent.player?.id &&
+        opponent.player.id === player.id
+      ) {
+        continue;
+      }
+
+      waitingQueues.set(key, queue);
+
+      const selectedPuzzle =
+        opponent.puzzle || puzzle;
+
+      const room = createRealtimeRoom(
+        socket,
+        player,
+        opponentSocket,
+        opponent.player,
+        gameKey,
+        difficulty,
+        selectedPuzzle
+      );
+
+      socket.emit("match_found", {
+        roomId: room.roomId,
+
+        opponent: {
+          name: opponent.player.name,
+          country: opponent.player.country,
+        },
+
+        puzzle: selectedPuzzle,
+      });
+
+      opponentSocket.emit("match_found", {
+        roomId: room.roomId,
+
+        opponent: {
+          name: player.name,
+          country: player.country,
+        },
+
+        puzzle: selectedPuzzle,
+      });
+
+      console.log(
+        "Match found:",
+        room.roomId,
+        key
+      );
+
+      return;
+    }
+
+    queue.push({
+      socketId: socket.id,
+      player,
+      puzzle,
+      joinedAt: Date.now(),
+    });
+
+    waitingQueues.set(key, queue);
+
+    socket.emit("waiting", {
+      gameKey,
+      difficulty,
+    });
+
+    console.log(
+      "Player waiting:",
+      socket.id,
+      key,
+      player.id
+    );
+  });
