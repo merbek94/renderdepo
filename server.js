@@ -7,7 +7,13 @@ const { Pool } = require("pg");
 const app = express();
 
 app.use((req, res, next) => {
-  console.log("HTTP request:", req.method, req.url, "ua:", req.headers["user-agent"] || "-");
+  console.log(
+    "HTTP request:",
+    req.method,
+    req.url,
+    "ua:",
+    req.headers["user-agent"] || "-"
+  );
   next();
 });
 
@@ -22,7 +28,8 @@ const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
       ssl:
-        DATABASE_URL.includes("localhost") || DATABASE_URL.includes("127.0.0.1")
+        DATABASE_URL.includes("localhost") ||
+        DATABASE_URL.includes("127.0.0.1")
           ? false
           : { rejectUnauthorized: false },
       max: Number(process.env.PG_POOL_MAX || 10),
@@ -33,7 +40,9 @@ const pool = DATABASE_URL
 
 async function initDatabase() {
   if (!pool) {
-    console.warn("DATABASE_URL tanımlı değil. Skor tablosu endpointleri veritabanı olmadan çalışmaz.");
+    console.warn(
+      "DATABASE_URL tanımlı değil. Skor tablosu endpointleri veritabanı olmadan çalışmaz."
+    );
     return;
   }
 
@@ -93,7 +102,7 @@ function safeText(value, fallback, maxLength) {
   return (text || fallback || "").slice(0, maxLength);
 }
 
-function safePlayerId(value) {
+function safeLeaderboardPlayerId(value) {
   return safeText(value, "", 96)
     .replace(/[^a-zA-Z0-9_.:-]/g, "")
     .slice(0, 96);
@@ -118,7 +127,10 @@ function safeScore(value) {
 
   if (!Number.isFinite(number)) return 0;
 
-  return Math.max(0, Math.min(Math.floor(number), 2_000_000_000));
+  return Math.max(
+    0,
+    Math.min(Math.floor(number), 2_000_000_000)
+  );
 }
 
 function safeDelta(value) {
@@ -128,13 +140,18 @@ function safeDelta(value) {
 
   return Math.max(
     0,
-    Math.min(Math.floor(number), Number(process.env.MAX_SCORE_DELTA || 100_000))
+    Math.min(
+      Math.floor(number),
+      Number(process.env.MAX_SCORE_DELTA || 100_000)
+    )
   );
 }
 
 function safeSignedDelta(value) {
   const number = Number(value || 0);
-  const maxDelta = Number(process.env.MAX_SCORE_DELTA || 100_000);
+  const maxDelta = Number(
+    process.env.MAX_SCORE_DELTA || 100_000
+  );
 
   if (!Number.isFinite(number)) return 0;
 
@@ -164,9 +181,15 @@ function usernameTakenError() {
   return error;
 }
 
-function sendLeaderboardError(res, error, fallbackMessage, logLabel) {
+function sendLeaderboardError(
+  res,
+  error,
+  fallbackMessage,
+  logLabel
+) {
   const statusCode = Number(error.statusCode || 500);
-  const isPublicError = statusCode >= 400 && statusCode < 500;
+  const isPublicError =
+    statusCode >= 400 && statusCode < 500;
 
   if (!isPublicError) {
     console.error(logLabel, {
@@ -180,32 +203,221 @@ function sendLeaderboardError(res, error, fallbackMessage, logLabel) {
   res.status(isPublicError ? statusCode : 500).json({
     ok: false,
     code: error.publicCode,
-    message: isPublicError ? error.message : fallbackMessage,
+    message: isPublicError
+      ? error.message
+      : fallbackMessage,
   });
 }
 
-async function ensureUsernameAvailable(client, playerId, username) {
-  await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER($1::text)))", [username]);
+function isStablePlayGamesLeaderboardId(playerId) {
+  return String(playerId || "").startsWith("pg_");
+}
 
-  const result = await client.query(
+function isLegacyLocalLeaderboardId(playerId) {
+  return String(playerId || "").startsWith("local_");
+}
+
+async function ensurePlayerScoreRow(client, playerId) {
+  await client.query(
+    `INSERT INTO player_scores (player_id)
+     VALUES ($1)
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId]
+  );
+}
+
+/**
+ * Eski local_ kimliğine bağlı skorları kalıcı pg_ kimliğine taşır.
+ * Aynı hesabın iki farklı kurulumda iki satıra bölünmesini engeller.
+ */
+async function mergeLegacyPlayerIntoStablePlayer(
+  client,
+  legacyPlayerId,
+  stablePlayerId,
+  username,
+  country
+) {
+  if (legacyPlayerId === stablePlayerId) return;
+
+  const temporaryUsername =
+    `__migration_${crypto.randomBytes(12).toString("hex")}`;
+
+  // Hedef oyuncu satırı yoksa geçici, benzersiz bir adla oluşturulur.
+  await client.query(
+    `INSERT INTO players (
+       player_id,
+       username,
+       country,
+       created_at,
+       updated_at
+     )
+     VALUES ($1, $2, $3, NOW(), NOW())
+     ON CONFLICT (player_id)
+     DO UPDATE SET
+       country = EXCLUDED.country,
+       updated_at = NOW()`,
+    [stablePlayerId, temporaryUsername, country]
+  );
+
+  // Toplam skorlar aynı hesabın kopyaları kabul edildiği için toplanmaz;
+  // en yüksek olan korunur. Böylece çift sayım yapılmaz.
+  await client.query(
+    `INSERT INTO player_scores
+       (
+         player_id,
+         general_score,
+         infinite_score,
+         updated_at
+       )
+     SELECT
+       $2,
+       general_score,
+       infinite_score,
+       updated_at
+     FROM player_scores
+     WHERE player_id = $1
+     ON CONFLICT (player_id)
+     DO UPDATE SET
+       general_score = GREATEST(
+         player_scores.general_score,
+         EXCLUDED.general_score
+       ),
+       infinite_score = GREATEST(
+         player_scores.infinite_score,
+         EXCLUDED.infinite_score
+       ),
+       updated_at = GREATEST(
+         player_scores.updated_at,
+         EXCLUDED.updated_at
+       )`,
+    [legacyPlayerId, stablePlayerId]
+  );
+
+  await client.query(
+    `INSERT INTO player_monthly_scores
+       (
+         player_id,
+         month_key,
+         general_score,
+         infinite_score,
+         updated_at
+       )
+     SELECT
+       $2,
+       month_key,
+       general_score,
+       infinite_score,
+       updated_at
+     FROM player_monthly_scores
+     WHERE player_id = $1
+     ON CONFLICT (player_id, month_key)
+     DO UPDATE SET
+       general_score = GREATEST(
+         player_monthly_scores.general_score,
+         EXCLUDED.general_score
+       ),
+       infinite_score = GREATEST(
+         player_monthly_scores.infinite_score,
+         EXCLUDED.infinite_score
+       ),
+       updated_at = GREATEST(
+         player_monthly_scores.updated_at,
+         EXCLUDED.updated_at
+       )`,
+    [legacyPlayerId, stablePlayerId]
+  );
+
+  // Eski oyuncu silinince ona bağlı eski skor satırları
+  // CASCADE ile temizlenir.
+  await client.query(
+    `DELETE FROM players
+     WHERE player_id = $1`,
+    [legacyPlayerId]
+  );
+
+  await client.query(
+    `UPDATE players
+     SET
+       username = $2,
+       country = $3,
+       updated_at = NOW()
+     WHERE player_id = $1`,
+    [stablePlayerId, username, country]
+  );
+
+  await ensurePlayerScoreRow(client, stablePlayerId);
+
+  console.log("Leaderboard identity migrated:", {
+    legacyPlayerId,
+    stablePlayerId,
+    username,
+  });
+}
+
+/**
+ * Kullanıcı adı yalnızca kullanıcı adı kaydetme/değiştirme sırasında
+ * sahiplenilir.
+ *
+ * Yeni pg_ kimliğine geçişte aynı ada bağlı eski local_ satırı
+ * otomatik birleştirilir.
+ */
+async function claimOrCreatePlayer(
+  client,
+  playerId,
+  username,
+  country
+) {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtext(LOWER($1::text)))",
+    [username]
+  );
+
+  const ownersResult = await client.query(
     `SELECT player_id
      FROM players
      WHERE LOWER(username) = LOWER($1)
        AND player_id <> $2
-     LIMIT 1`,
+     ORDER BY created_at ASC
+     FOR UPDATE`,
     [username, playerId]
   );
 
-  if (result.rowCount > 0) {
+  const foreignOwners = ownersResult.rows.map(
+    (row) => String(row.player_id)
+  );
+
+  const migratableLegacyOwners = foreignOwners.filter(
+    (ownerPlayerId) =>
+      isStablePlayGamesLeaderboardId(playerId) &&
+      isLegacyLocalLeaderboardId(ownerPlayerId)
+  );
+
+  const blockingOwners = foreignOwners.filter(
+    (ownerPlayerId) =>
+      !migratableLegacyOwners.includes(ownerPlayerId)
+  );
+
+  if (blockingOwners.length > 0) {
     throw usernameTakenError();
   }
-}
 
-async function upsertPlayer(client, playerId, username, country) {
-  await ensureUsernameAvailable(client, playerId, username);
+  for (const legacyPlayerId of migratableLegacyOwners) {
+    await mergeLegacyPlayerIntoStablePlayer(
+      client,
+      legacyPlayerId,
+      playerId,
+      username,
+      country
+    );
+  }
 
   await client.query(
-    `INSERT INTO players (player_id, username, country, updated_at)
+    `INSERT INTO players (
+       player_id,
+       username,
+       country,
+       updated_at
+     )
      VALUES ($1, $2, $3, NOW())
      ON CONFLICT (player_id)
      DO UPDATE SET
@@ -215,216 +427,375 @@ async function upsertPlayer(client, playerId, username, country) {
     [playerId, username, country]
   );
 
-  await client.query(
-    `INSERT INTO player_scores (player_id)
-     VALUES ($1)
-     ON CONFLICT (player_id) DO NOTHING`,
+  await ensurePlayerScoreRow(client, playerId);
+}
+
+/**
+ * Skor isteği mevcut oyuncunun kullanıcı adını tekrar sahiplenmez.
+ *
+ * Böylece geçici/eski kullanıcı adı verisi skor güncellemesini
+ * 409 hatasıyla durduramaz.
+ *
+ * Oyuncu kimliği henüz sunucuda yoksa ilk kayıt veya
+ * legacy -> pg_ geçişi yapılır.
+ */
+async function ensurePlayerForScore(
+  client,
+  playerId,
+  username,
+  country
+) {
+  const existingResult = await client.query(
+    `SELECT player_id
+     FROM players
+     WHERE player_id = $1
+     FOR UPDATE`,
     [playerId]
+  );
+
+  if (existingResult.rowCount > 0) {
+    await client.query(
+      `UPDATE players
+       SET
+         country = $2,
+         updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, country]
+    );
+
+    await ensurePlayerScoreRow(client, playerId);
+    return;
+  }
+
+  await claimOrCreatePlayer(
+    client,
+    playerId,
+    username,
+    country
   );
 }
 
-app.post("/leaderboard/username/claim", async (req, res) => {
-  if (!requireDatabase(res)) return;
+app.post(
+  "/leaderboard/username/claim",
+  async (req, res) => {
+    if (!requireDatabase(res)) return;
 
-  const playerId = safePlayerId(req.body.playerId);
-  const username = safeUsername(req.body.username);
-  const country = safeCountry(req.body.country);
-
-  if (!playerId) {
-    res.status(400).json({
-      ok: false,
-      message: "playerId zorunlu.",
-    });
-
-    return;
-  }
-
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-    await upsertPlayer(client, playerId, username, country);
-    await client.query("COMMIT");
-
-    res.json({
-      ok: true,
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    sendLeaderboardError(
-      res,
-      error,
-      "Kullanıcı adı kaydedilemedi.",
-      "username claim error:"
+    const playerId = safeLeaderboardPlayerId(
+      req.body.playerId
     );
-  } finally {
-    client.release();
+    const username = safeUsername(req.body.username);
+    const country = safeCountry(req.body.country);
+
+    if (!playerId) {
+      res.status(400).json({
+        ok: false,
+        message: "playerId zorunlu.",
+      });
+
+      return;
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      await claimOrCreatePlayer(
+        client,
+        playerId,
+        username,
+        country
+      );
+
+      await client.query("COMMIT");
+
+      res.json({
+        ok: true,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+
+      sendLeaderboardError(
+        res,
+        error,
+        "Kullanıcı adı kaydedilemedi.",
+        "username claim error:"
+      );
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
-app.post("/leaderboard/scores/sync", async (req, res) => {
-  if (!requireDatabase(res)) return;
+app.post(
+  "/leaderboard/scores/sync",
+  async (req, res) => {
+    if (!requireDatabase(res)) return;
 
-  const playerId = safePlayerId(req.body.playerId);
-  const username = safeUsername(req.body.username);
-  const country = safeCountry(req.body.country);
-  const generalScore = safeScore(req.body.generalScore);
-  const infiniteScore = safeScore(req.body.infiniteScore);
-
-  if (!playerId) {
-    res.status(400).json({
-      ok: false,
-      message: "playerId zorunlu.",
-    });
-
-    return;
-  }
-
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    await upsertPlayer(client, playerId, username, country);
-
-    await client.query(
-      `UPDATE player_scores
-       SET
-         general_score = $2,
-         infinite_score = GREATEST(infinite_score, $3),
-         updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, generalScore, infiniteScore]
+    const playerId = safeLeaderboardPlayerId(
+      req.body.playerId
+    );
+    const username = safeUsername(req.body.username);
+    const country = safeCountry(req.body.country);
+    const generalScore = safeScore(
+      req.body.generalScore
+    );
+    const infiniteScore = safeScore(
+      req.body.infiniteScore
     );
 
-    await client.query("COMMIT");
+    if (!playerId) {
+      res.status(400).json({
+        ok: false,
+        message: "playerId zorunlu.",
+      });
 
-    res.json({
-      ok: true,
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
+      return;
+    }
 
-    sendLeaderboardError(
-      res,
-      error,
-      "Skor senkronize edilemedi.",
-      "leaderboard sync error:"
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      await ensurePlayerForScore(
+        client,
+        playerId,
+        username,
+        country
+      );
+
+      await client.query(
+        `UPDATE player_scores
+         SET
+           general_score = $2,
+           infinite_score = GREATEST(
+             infinite_score,
+             $3
+           ),
+           updated_at = NOW()
+         WHERE player_id = $1`,
+        [
+          playerId,
+          generalScore,
+          infiniteScore,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      res.json({
+        ok: true,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+
+      sendLeaderboardError(
+        res,
+        error,
+        "Skor senkronize edilemedi.",
+        "leaderboard sync error:"
+      );
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.post(
+  "/leaderboard/scores/add",
+  async (req, res) => {
+    if (!requireDatabase(res)) return;
+
+    const playerId = safeLeaderboardPlayerId(
+      req.body.playerId
     );
-  } finally {
-    client.release();
-  }
-});
+    const username = safeUsername(req.body.username);
+    const country = safeCountry(req.body.country);
 
-app.post("/leaderboard/scores/add", async (req, res) => {
-  if (!requireDatabase(res)) return;
-
-  const playerId = safePlayerId(req.body.playerId);
-  const username = safeUsername(req.body.username);
-  const country = safeCountry(req.body.country);
-  const generalDelta = safeSignedDelta(req.body.generalScoreDelta);
-  const infiniteDelta = safeDelta(req.body.infiniteScoreDelta);
-  const monthKey = currentMonthKey();
-
-  if (!playerId) {
-    res.status(400).json({
-      ok: false,
-      message: "playerId zorunlu.",
-    });
-
-    return;
-  }
-
-  if (generalDelta === 0 && infiniteDelta <= 0) {
-    res.json({
-      ok: true,
-      skipped: true,
-    });
-
-    return;
-  }
-
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    await upsertPlayer(client, playerId, username, country);
-
-    await client.query(
-      `UPDATE player_scores
-       SET
-         general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)),
-         infinite_score = LEAST(infinite_score + $3, 2000000000),
-         updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, generalDelta, infiniteDelta]
-    );
-
-    await client.query(
-      `INSERT INTO player_monthly_scores
-         (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES
-         ($1, $2, GREATEST($3, 0), $4, NOW())
-       ON CONFLICT (player_id, month_key)
-       DO UPDATE SET
-         general_score = GREATEST(
-           0,
-           LEAST(player_monthly_scores.general_score + $3, 2000000000)
-         ),
-         infinite_score = LEAST(
-           player_monthly_scores.infinite_score + EXCLUDED.infinite_score,
-           2000000000
-         ),
-         updated_at = NOW()`,
-      [playerId, monthKey, generalDelta, infiniteDelta]
+    const generalDelta = safeSignedDelta(
+      req.body.generalScoreDelta
     );
 
-    await client.query("COMMIT");
-
-    res.json({
-      ok: true,
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    sendLeaderboardError(
-      res,
-      error,
-      "Skor kaydedilemedi.",
-      "leaderboard add error:"
+    const infiniteDelta = safeDelta(
+      req.body.infiniteScoreDelta
     );
-  } finally {
-    client.release();
+
+    const monthKey = currentMonthKey();
+
+    if (!playerId) {
+      res.status(400).json({
+        ok: false,
+        message: "playerId zorunlu.",
+      });
+
+      return;
+    }
+
+    if (
+      generalDelta === 0 &&
+      infiniteDelta <= 0
+    ) {
+      res.json({
+        ok: true,
+        skipped: true,
+      });
+
+      return;
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      await ensurePlayerForScore(
+        client,
+        playerId,
+        username,
+        country
+      );
+
+      await client.query(
+        `UPDATE player_scores
+         SET
+           general_score = GREATEST(
+             0,
+             LEAST(
+               general_score + $2,
+               2000000000
+             )
+           ),
+           infinite_score = LEAST(
+             infinite_score + $3,
+             2000000000
+           ),
+           updated_at = NOW()
+         WHERE player_id = $1`,
+        [
+          playerId,
+          generalDelta,
+          infiniteDelta,
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO player_monthly_scores
+           (
+             player_id,
+             month_key,
+             general_score,
+             infinite_score,
+             updated_at
+           )
+         VALUES
+           (
+             $1,
+             $2,
+             GREATEST($3, 0),
+             $4,
+             NOW()
+           )
+         ON CONFLICT (player_id, month_key)
+         DO UPDATE SET
+           general_score = GREATEST(
+             0,
+             LEAST(
+               player_monthly_scores.general_score + $3,
+               2000000000
+             )
+           ),
+           infinite_score = LEAST(
+             player_monthly_scores.infinite_score +
+               EXCLUDED.infinite_score,
+             2000000000
+           ),
+           updated_at = NOW()`,
+        [
+          playerId,
+          monthKey,
+          generalDelta,
+          infiniteDelta,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      res.json({
+        ok: true,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+
+      sendLeaderboardError(
+        res,
+        error,
+        "Skor kaydedilemedi.",
+        "leaderboard add error:"
+      );
+    } finally {
+      client.release();
+    }
   }
-});
+);
 
 app.get("/leaderboard", async (req, res) => {
   if (!requireDatabase(res)) return;
 
-  const scoreType = req.query.scoreType === "infinite" ? "infinite" : "general";
-  const period = req.query.period === "month" ? "month" : "all";
-  const scope = req.query.scope === "country" ? "country" : "world";
+  const scoreType =
+    req.query.scoreType === "infinite"
+      ? "infinite"
+      : "general";
+
+  const period =
+    req.query.period === "month"
+      ? "month"
+      : "all";
+
+  const scope =
+    req.query.scope === "country"
+      ? "country"
+      : "world";
+
   const country = safeCountry(req.query.country);
-  const playerId = safePlayerId(req.query.playerId);
+
+  const playerId = safeLeaderboardPlayerId(
+    req.query.playerId
+  );
+
   const monthKey = currentMonthKey();
 
-  const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
-  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
+  const scoreColumn =
+    scoreType === "infinite"
+      ? "infinite_score"
+      : "general_score";
+
+  const tableName =
+    period === "month"
+      ? "player_monthly_scores"
+      : "player_scores";
 
   function buildWhere(includeCountry) {
     const values = [];
-    const conditions = [`s.${scoreColumn} > 0`];
+
+    const conditions = [
+      `s.${scoreColumn} > 0`,
+    ];
 
     if (period === "month") {
       values.push(monthKey);
-      conditions.push(`s.month_key = $${values.length}`);
+
+      conditions.push(
+        `s.month_key = $${values.length}`
+      );
     }
 
     if (includeCountry) {
       values.push(country);
-      conditions.push(`p.country = $${values.length}`);
+
+      conditions.push(
+        `p.country = $${values.length}`
+      );
     }
 
     return {
@@ -437,7 +808,12 @@ app.get("/leaderboard", async (req, res) => {
     if (!playerId) return null;
 
     const built = buildWhere(includeCountry);
-    const values = [...built.values, playerId];
+
+    const values = [
+      ...built.values,
+      playerId,
+    ];
+
     const playerParamIndex = values.length;
 
     const sql = `
@@ -448,19 +824,29 @@ app.get("/leaderboard", async (req, res) => {
           p.country,
           s.${scoreColumn} AS score,
           ROW_NUMBER() OVER (
-            ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+            ORDER BY
+              s.${scoreColumn} DESC,
+              s.updated_at ASC,
+              p.username ASC
           ) AS position
         FROM ${tableName} s
-        JOIN players p ON p.player_id = s.player_id
+        JOIN players p
+          ON p.player_id = s.player_id
         WHERE ${built.whereSql}
       )
-      SELECT position, score
+      SELECT
+        position,
+        score
       FROM ranked
       WHERE player_id = $${playerParamIndex}
       LIMIT 1
     `;
 
-    const result = await pool.query(sql, values);
+    const result = await pool.query(
+      sql,
+      values
+    );
+
     const row = result.rows[0];
 
     if (!row) return null;
@@ -472,7 +858,9 @@ app.get("/leaderboard", async (req, res) => {
   }
 
   try {
-    const listBuilt = buildWhere(scope === "country");
+    const listBuilt = buildWhere(
+      scope === "country"
+    );
 
     const listSql = `
       WITH ranked AS (
@@ -482,19 +870,30 @@ app.get("/leaderboard", async (req, res) => {
           p.country,
           s.${scoreColumn} AS score,
           ROW_NUMBER() OVER (
-            ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+            ORDER BY
+              s.${scoreColumn} DESC,
+              s.updated_at ASC,
+              p.username ASC
           ) AS position
         FROM ${tableName} s
-        JOIN players p ON p.player_id = s.player_id
+        JOIN players p
+          ON p.player_id = s.player_id
         WHERE ${listBuilt.whereSql}
       )
-      SELECT position, username, country, score
+      SELECT
+        position,
+        username,
+        country,
+        score
       FROM ranked
       ORDER BY position ASC
       LIMIT 50
     `;
 
-    const listResult = await pool.query(listSql, listBuilt.values);
+    const listResult = await pool.query(
+      listSql,
+      listBuilt.values
+    );
 
     const myWorld = await getMyRank(false);
     const myCountry = await getMyRank(true);
@@ -506,9 +905,15 @@ app.get("/leaderboard", async (req, res) => {
       scope,
       country,
       monthKey,
-      myWorldRank: myWorld ? myWorld.rank : null,
-      myCountryRank: myCountry ? myCountry.rank : null,
-      myScore: myWorld ? myWorld.score : 0,
+      myWorldRank: myWorld
+        ? myWorld.rank
+        : null,
+      myCountryRank: myCountry
+        ? myCountry.rank
+        : null,
+      myScore: myWorld
+        ? myWorld.score
+        : 0,
       rows: listResult.rows.map((row) => ({
         rank: Number(row.position),
         username: row.username,
@@ -540,10 +945,14 @@ const io = new Server(server, {
     credentials: false,
   },
 
-  transports: ["websocket", "polling"],
+  transports: [
+    "websocket",
+    "polling",
+  ],
+
   allowEIO3: true,
-  pingInterval: 25000,
-  pingTimeout: 20000,
+  pingInterval: 25_000,
+  pingTimeout: 20_000,
 
   allowRequest: (req, callback) => {
     console.log(
@@ -561,14 +970,34 @@ const waitingQueues = new Map();
 const activeRooms = new Map();
 const realtimeRooms = new Map();
 const privateRooms = new Map();
-const PRIVATE_ROOM_TTL_MS = Number(process.env.PRIVATE_ROOM_TTL_MS || 15 * 60 * 1000);
-const ROOM_RECONNECT_TIMEOUT_MS = Number(process.env.ROOM_RECONNECT_TIMEOUT_MS || 60 * 1000);
-const RESOLVED_ROOM_TTL_MS = Number(process.env.RESOLVED_ROOM_TTL_MS || 10 * 60 * 1000);
+
+const PRIVATE_ROOM_TTL_MS = Number(
+  process.env.PRIVATE_ROOM_TTL_MS ||
+    15 * 60 * 1000
+);
+
+const ROOM_RECONNECT_TIMEOUT_MS = Number(
+  process.env.ROOM_RECONNECT_TIMEOUT_MS ||
+    60 * 1000
+);
+
+const RESOLVED_ROOM_TTL_MS = Number(
+  process.env.RESOLVED_ROOM_TTL_MS ||
+    10 * 60 * 1000
+);
 
 function normalizeMatchGameKey(value) {
-  const gameKey = String(value || "target_number").trim().slice(0, 96);
+  const gameKey = String(
+    value || "target_number"
+  )
+    .trim()
+    .slice(0, 96);
 
-  if (/^target_number_tournament(?:_stage_\d+)?$/i.test(gameKey)) {
+  if (
+    /^target_number_tournament(?:_stage_\d+)?$/i.test(
+      gameKey
+    )
+  ) {
     return "target_number_tournament";
   }
 
@@ -576,22 +1005,49 @@ function normalizeMatchGameKey(value) {
 }
 
 function queueKey(gameKey, difficulty) {
-  return `${String(gameKey || "default")}::${String(difficulty || "default")}`;
+  return `${String(
+    gameKey || "default"
+  )}::${String(
+    difficulty || "default"
+  )}`;
 }
 
 function safePlayerId(value, fallback = "") {
-  const cleaned = String(value || fallback || "")
+  const cleaned = String(
+    value || fallback || ""
+  )
     .trim()
     .replace(/[^a-zA-Z0-9_.:-]/g, "")
     .slice(0, 96);
 
-  return cleaned || String(fallback || "").trim().slice(0, 96);
+  return (
+    cleaned ||
+    String(fallback || "")
+      .trim()
+      .slice(0, 96)
+  );
 }
 
-function safePlayer(rawPlayer, fallbackId = "") {
-  const id = safePlayerId(rawPlayer?.id, fallbackId);
-  const name = String(rawPlayer?.name || "Oyuncu").trim().slice(0, 24) || "Oyuncu";
-  const country = String(rawPlayer?.country || "").trim().toUpperCase().slice(0, 3);
+function safePlayer(
+  rawPlayer,
+  fallbackId = ""
+) {
+  const id = safePlayerId(
+    rawPlayer?.id,
+    fallbackId
+  );
+
+  const name =
+    String(rawPlayer?.name || "Oyuncu")
+      .trim()
+      .slice(0, 24) || "Oyuncu";
+
+  const country = String(
+    rawPlayer?.country || ""
+  )
+    .trim()
+    .toUpperCase()
+    .slice(0, 3);
 
   return {
     id,
@@ -600,8 +1056,13 @@ function safePlayer(rawPlayer, fallbackId = "") {
   };
 }
 
-function safePuzzle(rawPuzzle, difficulty) {
-  const numbers = Array.isArray(rawPuzzle?.numbers)
+function safePuzzle(
+  rawPuzzle,
+  difficulty
+) {
+  const numbers = Array.isArray(
+    rawPuzzle?.numbers
+  )
     ? rawPuzzle.numbers
         .map((n) => Number(n))
         .filter((n) => Number.isFinite(n))
@@ -610,14 +1071,24 @@ function safePuzzle(rawPuzzle, difficulty) {
 
   const target = Number(rawPuzzle?.target);
 
-  if (!Number.isFinite(target) || target <= 0 || numbers.length < 3) {
+  if (
+    !Number.isFinite(target) ||
+    target <= 0 ||
+    numbers.length < 3
+  ) {
     return null;
   }
 
   return {
-    difficulty: String(rawPuzzle?.difficulty || difficulty || "Medium"),
+    difficulty: String(
+      rawPuzzle?.difficulty ||
+        difficulty ||
+        "Medium"
+    ),
     target: Math.floor(target),
-    numbers: numbers.map((n) => Math.floor(n)),
+    numbers: numbers.map(
+      (n) => Math.floor(n)
+    ),
   };
 }
 
@@ -630,18 +1101,29 @@ function normalizeRoomCode(value) {
 }
 
 function generateRoomCode() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const alphabet =
+    "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
   let code = "";
 
   for (let i = 0; i < 6; i += 1) {
-    code += alphabet[crypto.randomInt(0, alphabet.length)];
+    code += alphabet[
+      crypto.randomInt(
+        0,
+        alphabet.length
+      )
+    ];
   }
 
   return code;
 }
 
 function generateUniqueRoomCode() {
-  for (let attempt = 0; attempt < 32; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < 32;
+    attempt += 1
+  ) {
     const code = generateRoomCode();
 
     if (!privateRooms.has(code)) {
@@ -649,106 +1131,214 @@ function generateUniqueRoomCode() {
     }
   }
 
-  return crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6);
+  return crypto
+    .randomBytes(4)
+    .toString("hex")
+    .toUpperCase()
+    .slice(0, 6);
 }
 
 function roomParticipants(room) {
-  return Object.values(room?.participants || {});
+  return Object.values(
+    room?.participants || {}
+  );
 }
 
 function getParticipant(room, playerId) {
-  if (!room || !playerId) return null;
-  return room.participants[playerId] || null;
+  if (!room || !playerId) {
+    return null;
+  }
+
+  return (
+    room.participants[playerId] ||
+    null
+  );
 }
 
-function getOpponentParticipant(room, playerId) {
-  return roomParticipants(room).find((participant) => participant.playerId !== playerId) || null;
+function getOpponentParticipant(
+  room,
+  playerId
+) {
+  return (
+    roomParticipants(room).find(
+      (participant) =>
+        participant.playerId !== playerId
+    ) || null
+  );
 }
 
-function clearParticipantTimeout(participant) {
+function clearParticipantTimeout(
+  participant
+) {
   if (participant?.timeoutHandle) {
-    clearTimeout(participant.timeoutHandle);
+    clearTimeout(
+      participant.timeoutHandle
+    );
+
     participant.timeoutHandle = null;
   }
 }
 
 function clearRoomTimeouts(room) {
-  roomParticipants(room).forEach(clearParticipantTimeout);
+  roomParticipants(room).forEach(
+    clearParticipantTimeout
+  );
 }
 
-function attachSocketToRoom(socket, room, playerId) {
-  const participant = getParticipant(room, playerId);
+function attachSocketToRoom(
+  socket,
+  room,
+  playerId
+) {
+  const participant = getParticipant(
+    room,
+    playerId
+  );
+
   if (!participant) return;
 
   participant.socketId = socket.id;
   participant.connected = true;
+
   socket.join(room.roomId);
+
   activeRooms.set(socket.id, {
     roomId: room.roomId,
     playerId,
   });
 }
 
-function clearParticipantAwayState(room, playerId) {
-  const participant = getParticipant(room, playerId);
+function clearParticipantAwayState(
+  room,
+  playerId
+) {
+  const participant = getParticipant(
+    room,
+    playerId
+  );
+
   if (!participant) return;
 
   clearParticipantTimeout(participant);
+
   participant.connected = true;
   participant.awaySince = null;
   participant.backgrounded = false;
   participant.reconnectDeadlineAt = null;
 }
 
-function markRoomResolved(room, reason, winnerPlayerId, loserPlayerId) {
+function markRoomResolved(
+  room,
+  reason,
+  winnerPlayerId,
+  loserPlayerId
+) {
   if (!room || room.resolved) return;
 
   room.resolved = true;
   room.resolvedReason = reason;
-  room.winnerPlayerId = winnerPlayerId || null;
-  room.loserPlayerId = loserPlayerId || null;
+
+  room.winnerPlayerId =
+    winnerPlayerId || null;
+
+  room.loserPlayerId =
+    loserPlayerId || null;
+
   room.resolvedAt = Date.now();
+
   clearRoomTimeouts(room);
 }
 
-function resolveRoomByAwayTimeout(roomId, loserPlayerId) {
+function resolveRoomByAwayTimeout(
+  roomId,
+  loserPlayerId
+) {
   const room = realtimeRooms.get(roomId);
+
   if (!room || room.resolved) return;
 
-  const loser = getParticipant(room, loserPlayerId);
-  const opponent = getOpponentParticipant(room, loserPlayerId);
+  const loser = getParticipant(
+    room,
+    loserPlayerId
+  );
+
+  const opponent =
+    getOpponentParticipant(
+      room,
+      loserPlayerId
+    );
 
   if (!loser || loser.finishedAt) return;
 
-  markRoomResolved(room, "timeout", opponent?.playerId, loserPlayerId);
+  markRoomResolved(
+    room,
+    "timeout",
+    opponent?.playerId,
+    loserPlayerId
+  );
 
-  const opponentSocket = opponent?.socketId
-    ? io.sockets.sockets.get(opponent.socketId)
+  const opponentSocket =
+    opponent?.socketId
+      ? io.sockets.sockets.get(
+          opponent.socketId
+        )
+      : null;
+
+  if (
+    opponentSocket &&
+    !opponent.finishedAt
+  ) {
+    opponentSocket.emit(
+      "opponent_left",
+      {
+        roomId,
+        reason: "timeout",
+      }
+    );
+  }
+
+  const loserSocket = loser.socketId
+    ? io.sockets.sockets.get(
+        loser.socketId
+      )
     : null;
 
-  if (opponentSocket && !opponent.finishedAt) {
-    opponentSocket.emit("opponent_left", {
-      roomId,
-      reason: "timeout",
-    });
-  }
-
-  const loserSocket = loser.socketId ? io.sockets.sockets.get(loser.socketId) : null;
   if (loserSocket) {
-    loserSocket.emit("resume_error", {
-      code: "RECONNECT_EXPIRED",
-      message: "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
-      opponentFinishedMs: Number(opponent?.elapsedMs || 0),
-    });
+    loserSocket.emit(
+      "resume_error",
+      {
+        code: "RECONNECT_EXPIRED",
+        message:
+          "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
+        opponentFinishedMs: Number(
+          opponent?.elapsedMs || 0
+        ),
+      }
+    );
   }
 
-  console.log("Reconnect timeout loss:", roomId, loserPlayerId);
+  console.log(
+    "Reconnect timeout loss:",
+    roomId,
+    loserPlayerId
+  );
 }
 
-function scheduleParticipantAwayTimeout(room, playerId) {
-  const participant = getParticipant(room, playerId);
+function scheduleParticipantAwayTimeout(
+  room,
+  playerId
+) {
+  const participant = getParticipant(
+    room,
+    playerId
+  );
 
-  if (!room || room.resolved || !participant || participant.finishedAt) {
+  if (
+    !room ||
+    room.resolved ||
+    !participant ||
+    participant.finishedAt
+  ) {
     return;
   }
 
@@ -756,26 +1346,50 @@ function scheduleParticipantAwayTimeout(room, playerId) {
     participant.awaySince = Date.now();
   }
 
-  participant.reconnectDeadlineAt = participant.awaySince + ROOM_RECONNECT_TIMEOUT_MS;
+  participant.reconnectDeadlineAt =
+    participant.awaySince +
+    ROOM_RECONNECT_TIMEOUT_MS;
 
   clearParticipantTimeout(participant);
 
-  const waitMs = Math.max(0, participant.reconnectDeadlineAt - Date.now());
+  const waitMs = Math.max(
+    0,
+    participant.reconnectDeadlineAt -
+      Date.now()
+  );
 
-  participant.timeoutHandle = setTimeout(() => {
-    resolveRoomByAwayTimeout(room.roomId, playerId);
-  }, waitMs);
+  participant.timeoutHandle =
+    setTimeout(() => {
+      resolveRoomByAwayTimeout(
+        room.roomId,
+        playerId
+      );
+    }, waitMs);
 
-  if (typeof participant.timeoutHandle.unref === "function") {
+  if (
+    typeof participant.timeoutHandle
+      .unref === "function"
+  ) {
     participant.timeoutHandle.unref();
   }
 }
 
-function createRealtimeRoom(socket, player, opponentSocket, opponentPlayer, gameKey, difficulty, puzzle) {
+function createRealtimeRoom(
+  socket,
+  player,
+  opponentSocket,
+  opponentPlayer,
+  gameKey,
+  difficulty,
+  puzzle
+) {
   const roomId =
-    typeof crypto.randomUUID === "function"
+    typeof crypto.randomUUID ===
+    "function"
       ? crypto.randomUUID()
-      : crypto.randomBytes(16).toString("hex");
+      : crypto
+          .randomBytes(16)
+          .toString("hex");
 
   const room = {
     roomId,
@@ -788,6 +1402,7 @@ function createRealtimeRoom(socket, player, opponentSocket, opponentPlayer, game
     resolvedAt: null,
     winnerPlayerId: null,
     loserPlayerId: null,
+
     participants: {
       [player.id]: {
         playerId: player.id,
@@ -802,6 +1417,7 @@ function createRealtimeRoom(socket, player, opponentSocket, opponentPlayer, game
         finishedAt: null,
         elapsedMs: null,
       },
+
       [opponentPlayer.id]: {
         playerId: opponentPlayer.id,
         socketId: opponentSocket.id,
@@ -819,24 +1435,49 @@ function createRealtimeRoom(socket, player, opponentSocket, opponentPlayer, game
   };
 
   realtimeRooms.set(roomId, room);
-  attachSocketToRoom(socket, room, player.id);
-  attachSocketToRoom(opponentSocket, room, opponentPlayer.id);
+
+  attachSocketToRoom(
+    socket,
+    room,
+    player.id
+  );
+
+  attachSocketToRoom(
+    opponentSocket,
+    room,
+    opponentPlayer.id
+  );
 
   return room;
 }
 
-function removePrivateRoomsForSocket(socketId, notify = true) {
-  for (const [roomCode, room] of privateRooms.entries()) {
-    if (room.ownerSocketId !== socketId) continue;
+function removePrivateRoomsForSocket(
+  socketId,
+  notify = true
+) {
+  for (
+    const [roomCode, room]
+    of privateRooms.entries()
+  ) {
+    if (
+      room.ownerSocketId !== socketId
+    ) {
+      continue;
+    }
 
     privateRooms.delete(roomCode);
 
-    const ownerSocket = io.sockets.sockets.get(socketId);
+    const ownerSocket =
+      io.sockets.sockets.get(socketId);
+
     if (notify && ownerSocket) {
-      ownerSocket.emit("friend_room_closed", {
-        roomCode,
-        reason: "cancelled",
-      });
+      ownerSocket.emit(
+        "friend_room_closed",
+        {
+          roomCode,
+          reason: "cancelled",
+        }
+      );
     }
   }
 }
@@ -844,17 +1485,32 @@ function removePrivateRoomsForSocket(socketId, notify = true) {
 function expireOldPrivateRooms() {
   const now = Date.now();
 
-  for (const [roomCode, room] of privateRooms.entries()) {
-    if (now - room.createdAt <= PRIVATE_ROOM_TTL_MS) continue;
+  for (
+    const [roomCode, room]
+    of privateRooms.entries()
+  ) {
+    if (
+      now - room.createdAt <=
+      PRIVATE_ROOM_TTL_MS
+    ) {
+      continue;
+    }
 
     privateRooms.delete(roomCode);
 
-    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
+    const ownerSocket =
+      io.sockets.sockets.get(
+        room.ownerSocketId
+      );
+
     if (ownerSocket) {
-      ownerSocket.emit("friend_room_closed", {
-        roomCode,
-        reason: "expired",
-      });
+      ownerSocket.emit(
+        "friend_room_closed",
+        {
+          roomCode,
+          reason: "expired",
+        }
+      );
     }
   }
 }
@@ -862,43 +1518,95 @@ function expireOldPrivateRooms() {
 function expireResolvedRooms() {
   const now = Date.now();
 
-  for (const [roomId, room] of realtimeRooms.entries()) {
-    if (!room.resolved || !room.resolvedAt) continue;
-    if (now - room.resolvedAt <= RESOLVED_ROOM_TTL_MS) continue;
+  for (
+    const [roomId, room]
+    of realtimeRooms.entries()
+  ) {
+    if (
+      !room.resolved ||
+      !room.resolvedAt
+    ) {
+      continue;
+    }
+
+    if (
+      now - room.resolvedAt <=
+      RESOLVED_ROOM_TTL_MS
+    ) {
+      continue;
+    }
 
     clearRoomTimeouts(room);
     realtimeRooms.delete(roomId);
   }
 }
 
-function removeFromAllQueues(socketId, playerId = "") {
-  for (const [key, queue] of waitingQueues.entries()) {
-    const filtered = queue.filter((item) => {
-      if (item.socketId === socketId) return false;
-      if (playerId && item.player?.id === playerId) return false;
-      return true;
-    });
+function removeFromAllQueues(
+  socketId,
+  playerId = ""
+) {
+  for (
+    const [key, queue]
+    of waitingQueues.entries()
+  ) {
+    const filtered = queue.filter(
+      (item) => {
+        if (
+          item.socketId === socketId
+        ) {
+          return false;
+        }
+
+        if (
+          playerId &&
+          item.player?.id === playerId
+        ) {
+          return false;
+        }
+
+        return true;
+      }
+    );
 
     if (filtered.length === 0) {
       waitingQueues.delete(key);
     } else {
-      waitingQueues.set(key, filtered);
+      waitingQueues.set(
+        key,
+        filtered
+      );
     }
   }
 }
 
 function getRoomContextBySocket(socket) {
-  const active = activeRooms.get(socket.id);
-  if (!active) return {};
+  const active = activeRooms.get(
+    socket.id
+  );
 
-  const room = realtimeRooms.get(active.roomId);
+  if (!active) {
+    return {};
+  }
+
+  const room = realtimeRooms.get(
+    active.roomId
+  );
+
   if (!room) {
     activeRooms.delete(socket.id);
     return {};
   }
 
-  const participant = getParticipant(room, active.playerId);
-  const opponent = getOpponentParticipant(room, active.playerId);
+  const participant = getParticipant(
+    room,
+    active.playerId
+  );
+
+  const opponent =
+    getOpponentParticipant(
+      room,
+      active.playerId
+    );
 
   return {
     active,
@@ -909,30 +1617,56 @@ function getRoomContextBySocket(socket) {
 }
 
 function leaveRoomAsCancel(socket) {
-  const { active, room, participant, opponent } = getRoomContextBySocket(socket);
+  const {
+    active,
+    room,
+    participant,
+    opponent,
+  } = getRoomContextBySocket(socket);
+
   if (!active) return;
 
   if (room && participant) {
-    if (!room.resolved && !participant.finishedAt && opponent && !opponent.finishedAt) {
-      markRoomResolved(room, "cancelled", opponent.playerId, participant.playerId);
+    if (
+      !room.resolved &&
+      !participant.finishedAt &&
+      opponent &&
+      !opponent.finishedAt
+    ) {
+      markRoomResolved(
+        room,
+        "cancelled",
+        opponent.playerId,
+        participant.playerId
+      );
 
-      const opponentSocket = opponent.socketId
-        ? io.sockets.sockets.get(opponent.socketId)
-        : null;
+      const opponentSocket =
+        opponent.socketId
+          ? io.sockets.sockets.get(
+              opponent.socketId
+            )
+          : null;
 
       if (opponentSocket) {
-        opponentSocket.emit("opponent_left", {
-          roomId: room.roomId,
-          reason: "cancelled",
-        });
+        opponentSocket.emit(
+          "opponent_left",
+          {
+            roomId: room.roomId,
+            reason: "cancelled",
+          }
+        );
       }
     }
 
-    clearParticipantTimeout(participant);
+    clearParticipantTimeout(
+      participant
+    );
+
     participant.connected = false;
     participant.awaySince = null;
     participant.backgrounded = false;
-    participant.reconnectDeadlineAt = null;
+    participant.reconnectDeadlineAt =
+      null;
     participant.socketId = null;
   }
 
@@ -941,12 +1675,26 @@ function leaveRoomAsCancel(socket) {
 }
 
 function markSocketDisconnected(socket) {
-  const { active, room, participant } = getRoomContextBySocket(socket);
-  if (!active || !room || !participant) return;
+  const {
+    active,
+    room,
+    participant,
+  } = getRoomContextBySocket(socket);
+
+  if (
+    !active ||
+    !room ||
+    !participant
+  ) {
+    return;
+  }
 
   activeRooms.delete(socket.id);
 
-  if (room.resolved || participant.finishedAt) {
+  if (
+    room.resolved ||
+    participant.finishedAt
+  ) {
     participant.connected = false;
     participant.socketId = null;
     return;
@@ -954,26 +1702,45 @@ function markSocketDisconnected(socket) {
 
   participant.connected = false;
   participant.socketId = null;
+
   if (!participant.awaySince) {
     participant.awaySince = Date.now();
   }
-  scheduleParticipantAwayTimeout(room, participant.playerId);
+
+  scheduleParticipantAwayTimeout(
+    room,
+    participant.playerId
+  );
 }
 
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    service: "target-number-matchmaking",
+    service:
+      "target-number-matchmaking",
     socket: "socket.io",
     socketPath: SOCKET_PATH,
     database: Boolean(pool),
     leaderboard: Boolean(pool),
-    transports: ["websocket", "polling"],
-    waitingQueues: Array.from(waitingQueues.entries()).map(([key, queue]) => ({
+
+    transports: [
+      "websocket",
+      "polling",
+    ],
+
+    waitingQueues: Array.from(
+      waitingQueues.entries()
+    ).map(([key, queue]) => ({
       key,
       count: queue.length,
     })),
-    activeRooms: Array.from(realtimeRooms.values()).filter((room) => !room.resolved).length,
+
+    activeRooms: Array.from(
+      realtimeRooms.values()
+    ).filter(
+      (room) => !room.resolved
+    ).length,
+
     privateRooms: privateRooms.size,
   });
 });
@@ -996,49 +1763,80 @@ app.get("/health", async (req, res) => {
       database: true,
     });
   } catch (error) {
-    console.error("health database error:", {
-      message: error.message,
-      code: error.code,
-      detail: error.detail,
-    });
+    console.error(
+      "health database error:",
+      {
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+      }
+    );
 
     res.status(500).json({
       ok: false,
       database: false,
-      message: "Database bağlantısı başarısız.",
+      message:
+        "Database bağlantısı başarısız.",
     });
   }
 });
 
-app.get("/socket-check", (req, res) => {
-  res.json({
-    ok: true,
-    socketPath: SOCKET_PATH,
-    androidUrlMustBe: "https://renderdepo-tpqh.onrender.com",
-    androidUrlMustNotInclude: "/socket.io",
-    transports: ["websocket", "polling"],
-  });
-});
+app.get(
+  "/socket-check",
+  (req, res) => {
+    res.json({
+      ok: true,
+      socketPath: SOCKET_PATH,
+      androidUrlMustBe:
+        "https://renderdepo-tpqh.onrender.com",
+      androidUrlMustNotInclude:
+        "/socket.io",
+      transports: [
+        "websocket",
+        "polling",
+      ],
+    });
+  }
+);
 
-io.engine.on("connection_error", (err) => {
-  console.log("Engine.IO connection_error:", {
-    code: err.code,
-    message: err.message,
-    context: err.context,
-    url: err.req && err.req.url,
-    userAgent: err.req && err.req.headers && err.req.headers["user-agent"],
-    origin: err.req && err.req.headers && err.req.headers.origin,
-  });
-});
+io.engine.on(
+  "connection_error",
+  (err) => {
+    console.log(
+      "Engine.IO connection_error:",
+      {
+        code: err.code,
+        message: err.message,
+        context: err.context,
+        url:
+          err.req &&
+          err.req.url,
+        userAgent:
+          err.req &&
+          err.req.headers &&
+          err.req.headers[
+            "user-agent"
+          ],
+        origin:
+          err.req &&
+          err.req.headers &&
+          err.req.headers.origin,
+      }
+    );
+  }
+);
 
-io.engine.on("connection", (rawSocket) => {
-  console.log(
-    "Engine.IO connected:",
-    rawSocket.id,
-    "transport:",
-    rawSocket.transport.name
-  );
-});
+io.engine.on(
+  "connection",
+  (rawSocket) => {
+    console.log(
+      "Engine.IO connected:",
+      rawSocket.id,
+      "transport:",
+      rawSocket.transport.name
+    );
+  }
+);
 
 io.on("connection", (socket) => {
   console.log(
@@ -1048,370 +1846,821 @@ io.on("connection", (socket) => {
     socket.conn.transport.name
   );
 
-  socket.conn.on("upgrade", (transport) => {
-    console.log("Socket upgraded:", socket.id, "transport:", transport.name);
-  });
-
-  socket.on("join_match", (payload = {}) => {
-    const gameKey = normalizeMatchGameKey(payload.gameKey);
-    const difficulty = String(payload.difficulty || "Medium");
-    const player = safePlayer(payload.player, `guest:${socket.id}`);
-    const puzzle = safePuzzle(payload.puzzle, difficulty);
-
-    if (!puzzle) {
-      socket.emit("match_error", {
-        message: "Geçersiz puzzle verisi.",
-      });
-
-      return;
+  socket.conn.on(
+    "upgrade",
+    (transport) => {
+      console.log(
+        "Socket upgraded:",
+        socket.id,
+        "transport:",
+        transport.name
+      );
     }
+  );
 
-    removeFromAllQueues(socket.id, player.id);
-    removePrivateRoomsForSocket(socket.id, false);
-    leaveRoomAsCancel(socket);
+  socket.on(
+    "join_match",
+    (payload = {}) => {
+      const gameKey =
+        normalizeMatchGameKey(
+          payload.gameKey
+        );
 
-    const key = queueKey(gameKey, difficulty);
-    const queue = waitingQueues.get(key) || [];
-
-    while (queue.length > 0) {
-      const opponent = queue.shift();
-      const opponentSocket = io.sockets.sockets.get(opponent.socketId);
-
-      if (!opponentSocket || opponentSocket.id === socket.id) {
-        continue;
-      }
-
-      if (opponent.player?.id && opponent.player.id === player.id) {
-        continue;
-      }
-
-      waitingQueues.set(key, queue);
-
-      const selectedPuzzle = opponent.puzzle || puzzle;
-      const room = createRealtimeRoom(
-        socket,
-        player,
-        opponentSocket,
-        opponent.player,
-        gameKey,
-        difficulty,
-        selectedPuzzle
+      const difficulty = String(
+        payload.difficulty ||
+          "Medium"
       );
 
-      socket.emit("match_found", {
-        roomId: room.roomId,
-        opponent: {
-          name: opponent.player.name,
-          country: opponent.player.country,
-        },
-        puzzle: selectedPuzzle,
+      const player = safePlayer(
+        payload.player,
+        `guest:${socket.id}`
+      );
+
+      const puzzle = safePuzzle(
+        payload.puzzle,
+        difficulty
+      );
+
+      if (!puzzle) {
+        socket.emit(
+          "match_error",
+          {
+            message:
+              "Geçersiz puzzle verisi.",
+          }
+        );
+
+        return;
+      }
+
+      removeFromAllQueues(
+        socket.id,
+        player.id
+      );
+
+      removePrivateRoomsForSocket(
+        socket.id,
+        false
+      );
+
+      leaveRoomAsCancel(socket);
+
+      const key = queueKey(
+        gameKey,
+        difficulty
+      );
+
+      const queue =
+        waitingQueues.get(key) || [];
+
+      while (queue.length > 0) {
+        const opponent =
+          queue.shift();
+
+        const opponentSocket =
+          io.sockets.sockets.get(
+            opponent.socketId
+          );
+
+        if (
+          !opponentSocket ||
+          opponentSocket.id === socket.id
+        ) {
+          continue;
+        }
+
+        if (
+          opponent.player?.id &&
+          opponent.player.id === player.id
+        ) {
+          continue;
+        }
+
+        waitingQueues.set(
+          key,
+          queue
+        );
+
+        const selectedPuzzle =
+          opponent.puzzle || puzzle;
+
+        const room =
+          createRealtimeRoom(
+            socket,
+            player,
+            opponentSocket,
+            opponent.player,
+            gameKey,
+            difficulty,
+            selectedPuzzle
+          );
+
+        socket.emit(
+          "match_found",
+          {
+            roomId: room.roomId,
+            opponent: {
+              name:
+                opponent.player.name,
+              country:
+                opponent.player.country,
+            },
+            puzzle: selectedPuzzle,
+          }
+        );
+
+        opponentSocket.emit(
+          "match_found",
+          {
+            roomId: room.roomId,
+            opponent: {
+              name: player.name,
+              country:
+                player.country,
+            },
+            puzzle: selectedPuzzle,
+          }
+        );
+
+        console.log(
+          "Match found:",
+          room.roomId,
+          key
+        );
+
+        return;
+      }
+
+      queue.push({
+        socketId: socket.id,
+        player,
+        puzzle,
+        joinedAt: Date.now(),
       });
 
-      opponentSocket.emit("match_found", {
-        roomId: room.roomId,
-        opponent: {
-          name: player.name,
-          country: player.country,
-        },
-        puzzle: selectedPuzzle,
+      waitingQueues.set(
+        key,
+        queue
+      );
+
+      socket.emit("waiting", {
+        gameKey,
+        difficulty,
       });
 
-      console.log("Match found:", room.roomId, key);
-
-      return;
+      console.log(
+        "Player waiting:",
+        socket.id,
+        key,
+        player.id
+      );
     }
+  );
 
-    queue.push({
-      socketId: socket.id,
-      player,
-      puzzle,
-      joinedAt: Date.now(),
-    });
+  socket.on(
+    "resume_match",
+    (payload = {}) => {
+      const roomId = String(
+        payload.roomId || ""
+      ).trim();
 
-    waitingQueues.set(key, queue);
+      const player = safePlayer(
+        payload.player,
+        `guest:${socket.id}`
+      );
 
-    socket.emit("waiting", {
-      gameKey,
-      difficulty,
-    });
+      const room =
+        realtimeRooms.get(roomId);
 
-    console.log("Player waiting:", socket.id, key, player.id);
-  });
+      if (!roomId || !room) {
+        socket.emit(
+          "resume_error",
+          {
+            code: "ROOM_NOT_FOUND",
+            message:
+              "Yeniden bağlanılacak aktif oda bulunamadı.",
+          }
+        );
 
-  socket.on("resume_match", (payload = {}) => {
-    const roomId = String(payload.roomId || "").trim();
-    const player = safePlayer(payload.player, `guest:${socket.id}`);
-    const room = realtimeRooms.get(roomId);
+        return;
+      }
 
-    if (!roomId || !room) {
-      socket.emit("resume_error", {
-        code: "ROOM_NOT_FOUND",
-        message: "Yeniden bağlanılacak aktif oda bulunamadı.",
-      });
-      return;
+      const participant =
+        getParticipant(
+          room,
+          player.id
+        );
+
+      const opponent =
+        getOpponentParticipant(
+          room,
+          player.id
+        );
+
+      if (!participant) {
+        socket.emit(
+          "resume_error",
+          {
+            code:
+              "PLAYER_NOT_FOUND",
+            message:
+              "Bu oyuncu için yeniden bağlanma bilgisi bulunamadı.",
+          }
+        );
+
+        return;
+      }
+
+      if (room.resolved) {
+        socket.emit(
+          "resume_error",
+          {
+            code:
+              "MATCH_RESOLVED",
+            message:
+              "Bu maç zaten sona ermiş.",
+            opponentFinishedMs:
+              Number(
+                opponent?.elapsedMs ||
+                  0
+              ),
+          }
+        );
+
+        return;
+      }
+
+      if (
+        participant.awaySince &&
+        Date.now() >
+          participant.awaySince +
+            ROOM_RECONNECT_TIMEOUT_MS
+      ) {
+        resolveRoomByAwayTimeout(
+          room.roomId,
+          participant.playerId
+        );
+
+        socket.emit(
+          "resume_error",
+          {
+            code:
+              "RECONNECT_EXPIRED",
+            message:
+              "1 dakikalık yeniden bağlanma süresi doldu.",
+            opponentFinishedMs:
+              Number(
+                opponent?.elapsedMs ||
+                  0
+              ),
+          }
+        );
+
+        return;
+      }
+
+      if (
+        participant.socketId &&
+        participant.socketId !==
+          socket.id
+      ) {
+        activeRooms.delete(
+          participant.socketId
+        );
+      }
+
+      attachSocketToRoom(
+        socket,
+        room,
+        participant.playerId
+      );
+
+      clearParticipantAwayState(
+        room,
+        participant.playerId
+      );
+
+      socket.emit(
+        "resume_state",
+        {
+          roomId: room.roomId,
+
+          opponent: {
+            name:
+              opponent?.name ||
+              "Rakip",
+            country:
+              opponent?.country ||
+              "",
+          },
+
+          puzzle: room.puzzle,
+
+          opponentFinishedMs:
+            Number(
+              opponent?.elapsedMs ||
+                0
+            ),
+        }
+      );
+
+      console.log(
+        "Match resumed:",
+        room.roomId,
+        participant.playerId,
+        socket.id
+      );
     }
+  );
 
-    const participant = getParticipant(room, player.id);
-    const opponent = getOpponentParticipant(room, player.id);
+  socket.on(
+    "player_backgrounded",
+    (payload = {}) => {
+      const fallbackActive =
+        activeRooms.get(socket.id);
 
-    if (!participant) {
-      socket.emit("resume_error", {
-        code: "PLAYER_NOT_FOUND",
-        message: "Bu oyuncu için yeniden bağlanma bilgisi bulunamadı.",
-      });
-      return;
+      const roomId = String(
+        payload.roomId ||
+          fallbackActive?.roomId ||
+          ""
+      ).trim();
+
+      const room =
+        realtimeRooms.get(roomId);
+
+      const playerId =
+        fallbackActive?.playerId ||
+        roomParticipants(room).find(
+          (item) =>
+            item.socketId ===
+            socket.id
+        )?.playerId;
+
+      const participant =
+        getParticipant(
+          room,
+          playerId
+        );
+
+      if (
+        !room ||
+        !participant ||
+        room.resolved ||
+        participant.finishedAt
+      ) {
+        return;
+      }
+
+      if (!participant.awaySince) {
+        participant.awaySince =
+          Date.now();
+      }
+
+      participant.backgrounded = true;
+
+      scheduleParticipantAwayTimeout(
+        room,
+        participant.playerId
+      );
+
+      console.log(
+        "Player backgrounded:",
+        roomId,
+        participant.playerId
+      );
     }
+  );
 
-    if (room.resolved) {
-      socket.emit("resume_error", {
-        code: "MATCH_RESOLVED",
-        message: "Bu maç zaten sona ermiş.",
-        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
-      });
-      return;
+  socket.on(
+    "player_foregrounded",
+    (payload = {}) => {
+      const fallbackActive =
+        activeRooms.get(socket.id);
+
+      const roomId = String(
+        payload.roomId ||
+          fallbackActive?.roomId ||
+          ""
+      ).trim();
+
+      const room =
+        realtimeRooms.get(roomId);
+
+      const playerId =
+        fallbackActive?.playerId ||
+        roomParticipants(room).find(
+          (item) =>
+            item.socketId ===
+            socket.id
+        )?.playerId;
+
+      const participant =
+        getParticipant(
+          room,
+          playerId
+        );
+
+      if (!room || !participant) {
+        return;
+      }
+
+      if (
+        room.resolved &&
+        room.loserPlayerId ===
+          participant.playerId
+      ) {
+        socket.emit(
+          "resume_error",
+          {
+            code:
+              "RECONNECT_EXPIRED",
+            message:
+              "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
+            opponentFinishedMs:
+              Number(
+                getOpponentParticipant(
+                  room,
+                  participant.playerId
+                )?.elapsedMs || 0
+              ),
+          }
+        );
+
+        return;
+      }
+
+      clearParticipantAwayState(
+        room,
+        participant.playerId
+      );
+
+      console.log(
+        "Player foregrounded:",
+        roomId,
+        participant.playerId
+      );
     }
+  );
 
-    if (participant.awaySince && Date.now() > participant.awaySince + ROOM_RECONNECT_TIMEOUT_MS) {
-      resolveRoomByAwayTimeout(room.roomId, participant.playerId);
-      socket.emit("resume_error", {
-        code: "RECONNECT_EXPIRED",
-        message: "1 dakikalık yeniden bağlanma süresi doldu.",
-        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
-      });
-      return;
+  socket.on(
+    "create_friend_room",
+    (payload = {}) => {
+      expireOldPrivateRooms();
+
+      const gameKey = String(
+        payload.gameKey ||
+          "target_number"
+      );
+
+      const difficulty = String(
+        payload.difficulty ||
+          "Medium"
+      );
+
+      const player = safePlayer(
+        payload.player,
+        `guest:${socket.id}`
+      );
+
+      const puzzle = safePuzzle(
+        payload.puzzle,
+        difficulty
+      );
+
+      if (!puzzle) {
+        socket.emit(
+          "friend_room_error",
+          {
+            message:
+              "Geçersiz puzzle verisi.",
+          }
+        );
+
+        return;
+      }
+
+      removeFromAllQueues(
+        socket.id,
+        player.id
+      );
+
+      removePrivateRoomsForSocket(
+        socket.id,
+        false
+      );
+
+      leaveRoomAsCancel(socket);
+
+      const roomCode =
+        generateUniqueRoomCode();
+
+      privateRooms.set(
+        roomCode,
+        {
+          roomCode,
+          ownerSocketId: socket.id,
+          gameKey,
+          difficulty,
+          player,
+          puzzle,
+          createdAt: Date.now(),
+        }
+      );
+
+      socket.emit(
+        "friend_room_created",
+        {
+          roomCode,
+          gameKey,
+          difficulty,
+        }
+      );
+
+      console.log(
+        "Friend room created:",
+        roomCode,
+        socket.id,
+        queueKey(
+          gameKey,
+          difficulty
+        )
+      );
     }
+  );
 
-    if (participant.socketId && participant.socketId !== socket.id) {
-      activeRooms.delete(participant.socketId);
-    }
+  socket.on(
+    "join_friend_room",
+    (payload = {}) => {
+      expireOldPrivateRooms();
 
-    attachSocketToRoom(socket, room, participant.playerId);
-    clearParticipantAwayState(room, participant.playerId);
+      const roomCode =
+        normalizeRoomCode(
+          payload.roomCode
+        );
 
-    socket.emit("resume_state", {
-      roomId: room.roomId,
-      opponent: {
-        name: opponent?.name || "Rakip",
-        country: opponent?.country || "",
-      },
-      puzzle: room.puzzle,
-      opponentFinishedMs: Number(opponent?.elapsedMs || 0),
-    });
+      const room =
+        privateRooms.get(roomCode);
 
-    console.log("Match resumed:", room.roomId, participant.playerId, socket.id);
-  });
+      if (
+        !roomCode ||
+        roomCode.length !== 6
+      ) {
+        socket.emit(
+          "friend_room_error",
+          {
+            message:
+              "Geçerli 6 haneli oda kodu gir.",
+          }
+        );
 
-  socket.on("player_backgrounded", (payload = {}) => {
-    const fallbackActive = activeRooms.get(socket.id);
-    const roomId = String(payload.roomId || fallbackActive?.roomId || "").trim();
-    const room = realtimeRooms.get(roomId);
-    const playerId =
-      fallbackActive?.playerId ||
-      roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
-    const participant = getParticipant(room, playerId);
+        return;
+      }
 
-    if (!room || !participant || room.resolved || participant.finishedAt) return;
+      if (!room) {
+        socket.emit(
+          "friend_room_error",
+          {
+            message:
+              "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
+          }
+        );
 
-    if (!participant.awaySince) {
-      participant.awaySince = Date.now();
-    }
-    participant.backgrounded = true;
-    scheduleParticipantAwayTimeout(room, participant.playerId);
+        return;
+      }
 
-    console.log("Player backgrounded:", roomId, participant.playerId);
-  });
+      if (
+        room.ownerSocketId ===
+        socket.id
+      ) {
+        socket.emit(
+          "friend_room_error",
+          {
+            message:
+              "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
+          }
+        );
 
-  socket.on("player_foregrounded", (payload = {}) => {
-    const fallbackActive = activeRooms.get(socket.id);
-    const roomId = String(payload.roomId || fallbackActive?.roomId || "").trim();
-    const room = realtimeRooms.get(roomId);
-    const playerId =
-      fallbackActive?.playerId ||
-      roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
-    const participant = getParticipant(room, playerId);
+        return;
+      }
 
-    if (!room || !participant) return;
+      const ownerSocket =
+        io.sockets.sockets.get(
+          room.ownerSocketId
+        );
 
-    if (room.resolved && room.loserPlayerId === participant.playerId) {
-      socket.emit("resume_error", {
-        code: "RECONNECT_EXPIRED",
-        message: "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
-        opponentFinishedMs: Number(getOpponentParticipant(room, participant.playerId)?.elapsedMs || 0),
-      });
-      return;
-    }
+      if (!ownerSocket) {
+        privateRooms.delete(
+          roomCode
+        );
 
-    clearParticipantAwayState(room, participant.playerId);
-    console.log("Player foregrounded:", roomId, participant.playerId);
-  });
+        socket.emit(
+          "friend_room_error",
+          {
+            message:
+              "Oda sahibi bağlantıdan ayrılmış.",
+          }
+        );
 
-  socket.on("create_friend_room", (payload = {}) => {
-    expireOldPrivateRooms();
+        return;
+      }
 
-    const gameKey = String(payload.gameKey || "target_number");
-    const difficulty = String(payload.difficulty || "Medium");
-    const player = safePlayer(payload.player, `guest:${socket.id}`);
-    const puzzle = safePuzzle(payload.puzzle, difficulty);
+      const player = safePlayer(
+        payload.player,
+        `guest:${socket.id}`
+      );
 
-    if (!puzzle) {
-      socket.emit("friend_room_error", {
-        message: "Geçersiz puzzle verisi.",
-      });
+      removeFromAllQueues(
+        socket.id,
+        player.id
+      );
 
-      return;
-    }
+      removePrivateRoomsForSocket(
+        socket.id,
+        false
+      );
 
-    removeFromAllQueues(socket.id, player.id);
-    removePrivateRoomsForSocket(socket.id, false);
-    leaveRoomAsCancel(socket);
+      leaveRoomAsCancel(socket);
 
-    const roomCode = generateUniqueRoomCode();
-
-    privateRooms.set(roomCode, {
-      roomCode,
-      ownerSocketId: socket.id,
-      gameKey,
-      difficulty,
-      player,
-      puzzle,
-      createdAt: Date.now(),
-    });
-
-    socket.emit("friend_room_created", {
-      roomCode,
-      gameKey,
-      difficulty,
-    });
-
-    console.log("Friend room created:", roomCode, socket.id, queueKey(gameKey, difficulty));
-  });
-
-  socket.on("join_friend_room", (payload = {}) => {
-    expireOldPrivateRooms();
-
-    const roomCode = normalizeRoomCode(payload.roomCode);
-    const room = privateRooms.get(roomCode);
-
-    if (!roomCode || roomCode.length !== 6) {
-      socket.emit("friend_room_error", {
-        message: "Geçerli 6 haneli oda kodu gir.",
-      });
-
-      return;
-    }
-
-    if (!room) {
-      socket.emit("friend_room_error", {
-        message: "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
-      });
-
-      return;
-    }
-
-    if (room.ownerSocketId === socket.id) {
-      socket.emit("friend_room_error", {
-        message: "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
-      });
-
-      return;
-    }
-
-    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
-
-    if (!ownerSocket) {
       privateRooms.delete(roomCode);
 
-      socket.emit("friend_room_error", {
-        message: "Oda sahibi bağlantıdan ayrılmış.",
-      });
+      const realtimeRoom =
+        createRealtimeRoom(
+          socket,
+          player,
+          ownerSocket,
+          room.player,
+          room.gameKey,
+          room.difficulty,
+          room.puzzle
+        );
 
-      return;
+      socket.emit(
+        "match_found",
+        {
+          roomId:
+            realtimeRoom.roomId,
+          roomCode,
+
+          opponent: {
+            name:
+              room.player.name,
+            country:
+              room.player.country,
+          },
+
+          puzzle: room.puzzle,
+        }
+      );
+
+      ownerSocket.emit(
+        "match_found",
+        {
+          roomId:
+            realtimeRoom.roomId,
+          roomCode,
+
+          opponent: {
+            name: player.name,
+            country:
+              player.country,
+          },
+
+          puzzle: room.puzzle,
+        }
+      );
+
+      console.log(
+        "Friend match found:",
+        roomCode,
+        realtimeRoom.roomId,
+        queueKey(
+          room.gameKey,
+          room.difficulty
+        )
+      );
     }
+  );
 
-    const player = safePlayer(payload.player, `guest:${socket.id}`);
+  socket.on(
+    "player_finished",
+    (payload = {}) => {
+      const roomId = String(
+        payload.roomId || ""
+      ).trim();
 
-    removeFromAllQueues(socket.id, player.id);
-    removePrivateRoomsForSocket(socket.id, false);
-    leaveRoomAsCancel(socket);
+      const elapsedMs = Math.max(
+        1,
+        Number(
+          payload.elapsedMs || 0
+        )
+      );
 
-    privateRooms.delete(roomCode);
+      const room =
+        realtimeRooms.get(roomId);
 
-    const realtimeRoom = createRealtimeRoom(
-      socket,
-      player,
-      ownerSocket,
-      room.player,
-      room.gameKey,
-      room.difficulty,
-      room.puzzle
-    );
+      const active =
+        activeRooms.get(socket.id);
 
-    socket.emit("match_found", {
-      roomId: realtimeRoom.roomId,
-      roomCode,
-      opponent: {
-        name: room.player.name,
-        country: room.player.country,
-      },
-      puzzle: room.puzzle,
-    });
+      const playerId =
+        active?.playerId ||
+        roomParticipants(room).find(
+          (item) =>
+            item.socketId ===
+            socket.id
+        )?.playerId;
 
-    ownerSocket.emit("match_found", {
-      roomId: realtimeRoom.roomId,
-      roomCode,
-      opponent: {
-        name: player.name,
-        country: player.country,
-      },
-      puzzle: room.puzzle,
-    });
+      const participant =
+        getParticipant(
+          room,
+          playerId
+        );
 
-    console.log("Friend match found:", roomCode, realtimeRoom.roomId, queueKey(room.gameKey, room.difficulty));
-  });
+      const opponent =
+        getOpponentParticipant(
+          room,
+          playerId
+        );
 
-  socket.on("player_finished", (payload = {}) => {
-    const roomId = String(payload.roomId || "").trim();
-    const elapsedMs = Math.max(1, Number(payload.elapsedMs || 0));
-    const room = realtimeRooms.get(roomId);
-    const active = activeRooms.get(socket.id);
-    const playerId =
-      active?.playerId ||
-      roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
-    const participant = getParticipant(room, playerId);
-    const opponent = getOpponentParticipant(room, playerId);
+      if (
+        !room ||
+        !participant ||
+        !Number.isFinite(elapsedMs) ||
+        room.resolved
+      ) {
+        return;
+      }
 
-    if (!room || !participant || !Number.isFinite(elapsedMs) || room.resolved) return;
+      participant.finishedAt =
+        Date.now();
 
-    participant.finishedAt = Date.now();
-    participant.elapsedMs = Math.floor(elapsedMs);
-    clearParticipantAwayState(room, participant.playerId);
+      participant.elapsedMs =
+        Math.floor(elapsedMs);
 
-    markRoomResolved(room, "finished", participant.playerId, opponent?.playerId);
+      clearParticipantAwayState(
+        room,
+        participant.playerId
+      );
 
-    const opponentSocket = opponent?.socketId
-      ? io.sockets.sockets.get(opponent.socketId)
-      : null;
+      markRoomResolved(
+        room,
+        "finished",
+        participant.playerId,
+        opponent?.playerId
+      );
 
-    if (opponentSocket) {
-      opponentSocket.emit("opponent_finished", {
-        roomId,
-        elapsedMs: participant.elapsedMs,
-      });
+      const opponentSocket =
+        opponent?.socketId
+          ? io.sockets.sockets.get(
+              opponent.socketId
+            )
+          : null;
+
+      if (opponentSocket) {
+        opponentSocket.emit(
+          "opponent_finished",
+          {
+            roomId,
+            elapsedMs:
+              participant.elapsedMs,
+          }
+        );
+      }
     }
-  });
+  );
 
-  socket.on("cancel_match", () => {
-    removeFromAllQueues(socket.id);
-    removePrivateRoomsForSocket(socket.id, false);
-    leaveRoomAsCancel(socket);
-  });
+  socket.on(
+    "cancel_match",
+    () => {
+      removeFromAllQueues(socket.id);
 
-  socket.on("disconnect", (reason) => {
-    console.log("Socket disconnected:", socket.id, reason);
-    removeFromAllQueues(socket.id);
-    removePrivateRoomsForSocket(socket.id, false);
-    markSocketDisconnected(socket);
-  });
+      removePrivateRoomsForSocket(
+        socket.id,
+        false
+      );
+
+      leaveRoomAsCancel(socket);
+    }
+  );
+
+  socket.on(
+    "disconnect",
+    (reason) => {
+      console.log(
+        "Socket disconnected:",
+        socket.id,
+        reason
+      );
+
+      removeFromAllQueues(socket.id);
+
+      removePrivateRoomsForSocket(
+        socket.id,
+        false
+      );
+
+      markSocketDisconnected(socket);
+    }
+  );
 });
 
 setInterval(() => {
@@ -1419,19 +2668,30 @@ setInterval(() => {
   expireResolvedRooms();
 }, 60_000).unref();
 
-const PORT = Number(process.env.PORT || 10000);
+const PORT = Number(
+  process.env.PORT || 10000
+);
 
 initDatabase()
   .catch((error) => {
-    console.error("Database init failed:", {
-      message: error.message,
-      code: error.code,
-      detail: error.detail,
-      stack: error.stack,
-    });
+    console.error(
+      "Database init failed:",
+      {
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+        stack: error.stack,
+      }
+    );
   })
   .finally(() => {
-    server.listen(PORT, "0.0.0.0", () => {
-      console.log(`Target number matchmaking server running on port ${PORT}`);
-    });
+    server.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `Target number matchmaking server running on port ${PORT}`
+        );
+      }
+    );
   });
