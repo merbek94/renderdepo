@@ -5,43 +5,67 @@ const crypto = require("crypto");
 const { Pool } = require("pg");
 
 const app = express();
+const server = http.createServer(app);
 
-app.use((req, res, next) => {
-  console.log(
-    "HTTP request:",
-    req.method,
-    req.url,
-    "ua:",
-    req.headers["user-agent"] || "-"
-  );
+const LOG_HTTP = process.env.LOG_HTTP === "1";
+const SOCKET_PATH = "/socket.io/";
+const DATABASE_URL = process.env.DATABASE_URL;
+
+const MAX_GLOBAL_GAME_RIGHTS = Number(process.env.MAX_GLOBAL_GAME_RIGHTS || 10);
+const GAME_RIGHT_REFILL_MS = Number(process.env.GAME_RIGHT_REFILL_MS || 10 * 60 * 1000);
+const USERNAME_CHANGE_COOLDOWN_MS = Number(
+  process.env.USERNAME_CHANGE_COOLDOWN_MS || 30 * 24 * 60 * 60 * 1000
+);
+const MAX_SCORE_DELTA = Number(process.env.MAX_SCORE_DELTA || 100_000);
+const MAX_XP_DELTA = Number(process.env.MAX_XP_DELTA || 100_000);
+const ROOM_RECONNECT_TIMEOUT_MS = Number(process.env.ROOM_RECONNECT_TIMEOUT_MS || 60_000);
+const PRIVATE_ROOM_TTL_MS = Number(process.env.PRIVATE_ROOM_TTL_MS || 5 * 60_000);
+const RESOLVED_ROOM_TTL_MS = Number(process.env.RESOLVED_ROOM_TTL_MS || 2 * 60_000);
+
+app.use((req, _res, next) => {
+  if (LOG_HTTP) {
+    console.log(
+      "HTTP request:",
+      req.method,
+      req.url,
+      "ua:",
+      req.headers["user-agent"] || "-"
+    );
+  }
   next();
 });
 
-app.use(express.json({ limit: "64kb" }));
-
-const server = http.createServer(app);
-
-const SOCKET_PATH = "/socket.io/";
-const DATABASE_URL = process.env.DATABASE_URL;
+app.use(express.json({ limit: "32kb" }));
 
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
       ssl:
-        DATABASE_URL.includes("localhost") ||
-        DATABASE_URL.includes("127.0.0.1")
+        DATABASE_URL.includes("localhost") || DATABASE_URL.includes("127.0.0.1")
           ? false
           : { rejectUnauthorized: false },
-      max: Number(process.env.PG_POOL_MAX || 10),
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 10_000,
+      max: Number(process.env.PG_POOL_MAX || 3),
+      idleTimeoutMillis: 10_000,
+      connectionTimeoutMillis: 5_000,
     })
   : null;
+
+const io = new Server(server, {
+  path: SOCKET_PATH,
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+  transports: ["websocket", "polling"],
+  pingInterval: 30_000,
+  pingTimeout: 15_000,
+  maxHttpBufferSize: 16_384,
+});
 
 async function initDatabase() {
   if (!pool) {
     console.warn(
-      "DATABASE_URL tanımlı değil. Skor tablosu endpointleri veritabanı olmadan çalışmaz."
+      "DATABASE_URL tanımlı değil. Skor tablosu ve oyuncu durumu endpointleri veritabanı olmadan çalışmaz."
     );
     return;
   }
@@ -71,6 +95,25 @@ async function initDatabase() {
       PRIMARY KEY (player_id, month_key)
     );
 
+    CREATE TABLE IF NOT EXISTS player_secure_state (
+      player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      total_xp INTEGER NOT NULL DEFAULT 0 CHECK (total_xp >= 0),
+      remaining_rights INTEGER NOT NULL DEFAULT 10 CHECK (remaining_rights >= 0),
+      rights_last_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      rights_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      username_change_count INTEGER NOT NULL DEFAULT 0 CHECK (username_change_count >= 0),
+      username_last_change_at TIMESTAMPTZ,
+      username_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS player_reward_events (
+      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+      event_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (player_id, event_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_player_scores_general
       ON player_scores (general_score DESC);
 
@@ -88,9 +131,12 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_players_username_lower
       ON players (LOWER(username));
+
+    CREATE INDEX IF NOT EXISTS idx_reward_events_created
+      ON player_reward_events (created_at);
   `);
 
-  console.log("PostgreSQL leaderboard tabloları hazır.");
+  console.log("PostgreSQL tabloları hazır.");
 }
 
 function currentMonthKey() {
@@ -102,7 +148,7 @@ function safeText(value, fallback, maxLength) {
   return (text || fallback || "").slice(0, maxLength);
 }
 
-function safeLeaderboardPlayerId(value) {
+function safePlayerId(value) {
   return safeText(value, "", 96)
     .replace(/[^a-zA-Z0-9_.:-]/g, "")
     .slice(0, 96);
@@ -124,72 +170,55 @@ function safeCountry(value) {
 
 function safeScore(value) {
   const number = Number(value || 0);
-
   if (!Number.isFinite(number)) return 0;
-
-  return Math.max(
-    0,
-    Math.min(Math.floor(number), 2_000_000_000)
-  );
-}
-
-function safeDelta(value) {
-  const number = Number(value || 0);
-
-  if (!Number.isFinite(number)) return 0;
-
-  return Math.max(
-    0,
-    Math.min(
-      Math.floor(number),
-      Number(process.env.MAX_SCORE_DELTA || 100_000)
-    )
-  );
+  return Math.max(0, Math.min(Math.floor(number), 2_000_000_000));
 }
 
 function safeSignedDelta(value) {
   const number = Number(value || 0);
-  const maxDelta = Number(
-    process.env.MAX_SCORE_DELTA || 100_000
-  );
-
   if (!Number.isFinite(number)) return 0;
+  return Math.max(-MAX_SCORE_DELTA, Math.min(Math.trunc(number), MAX_SCORE_DELTA));
+}
 
-  return Math.max(
-    -maxDelta,
-    Math.min(Math.trunc(number), maxDelta)
-  );
+function safePositiveDelta(value, maxValue = MAX_SCORE_DELTA) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(Math.floor(number), maxValue));
+}
+
+function safeEventId(value) {
+  return safeText(value, "", 96)
+    .replace(/[^a-zA-Z0-9_.:-]/g, "")
+    .slice(0, 96);
+}
+
+function dateToMillis(value, fallback = Date.now()) {
+  if (!value) return fallback;
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : fallback;
 }
 
 function requireDatabase(res) {
-  if (!pool) {
-    res.status(503).json({
-      ok: false,
-      message: "DATABASE_URL tanımlı değil.",
-    });
+  if (pool) return true;
 
-    return false;
-  }
+  res.status(503).json({
+    ok: false,
+    message: "DATABASE_URL tanımlı değil.",
+  });
 
-  return true;
+  return false;
 }
 
-function usernameTakenError() {
-  const error = new Error("Bu kullanıcı adı zaten alınmış.");
-  error.statusCode = 409;
-  error.publicCode = "USERNAME_TAKEN";
+function publicError(message, statusCode = 400, code) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.publicCode = code;
   return error;
 }
 
-function sendLeaderboardError(
-  res,
-  error,
-  fallbackMessage,
-  logLabel
-) {
+function sendError(res, error, fallbackMessage, logLabel) {
   const statusCode = Number(error.statusCode || 500);
-  const isPublicError =
-    statusCode >= 400 && statusCode < 500;
+  const isPublicError = statusCode >= 400 && statusCode < 500;
 
   if (!isPublicError) {
     console.error(logLabel, {
@@ -203,46 +232,31 @@ function sendLeaderboardError(
   res.status(isPublicError ? statusCode : 500).json({
     ok: false,
     code: error.publicCode,
-    message: isPublicError
-      ? error.message
-      : fallbackMessage,
+    message: isPublicError ? error.message : fallbackMessage,
   });
 }
 
-function isStablePlayGamesLeaderboardId(playerId) {
-  return String(playerId || "").startsWith("pg_");
+function levelStateForTotalXp(totalXp) {
+  let safeTotalXp = safeScore(totalXp);
+  let remainingXp = safeTotalXp;
+  let level = 1;
+
+  while (level < 1000) {
+    const required = level * 2;
+    if (remainingXp < required) break;
+    remainingXp -= required;
+    level += 1;
+  }
+
+  return {
+    totalXp: safeTotalXp,
+    level,
+    xpInCurrentLevel: level < 1000 ? remainingXp : 0,
+    xpRequiredForNextLevel: level < 1000 ? level * 2 : 0,
+  };
 }
 
-function isLegacyLocalLeaderboardId(playerId) {
-  return String(playerId || "").startsWith("local_");
-}
-
-async function ensurePlayerScoreRow(client, playerId) {
-  await client.query(
-    `INSERT INTO player_scores (player_id)
-     VALUES ($1)
-     ON CONFLICT (player_id) DO NOTHING`,
-    [playerId]
-  );
-}
-
-/**
- * Eski local_ kimliğine bağlı skorları kalıcı pg_ kimliğine taşır.
- * Aynı hesabın iki farklı kurulumda iki satıra bölünmesini engeller.
- */
-async function mergeLegacyPlayerIntoStablePlayer(
-  client,
-  legacyPlayerId,
-  stablePlayerId,
-  username,
-  country
-) {
-  if (legacyPlayerId === stablePlayerId) return;
-
-  const temporaryUsername =
-    `__migration_${crypto.randomBytes(12).toString("hex")}`;
-
-  // Hedef oyuncu satırı yoksa geçici, benzersiz bir adla oluşturulur.
+async function ensurePlayer(client, playerId, username, country) {
   await client.query(
     `INSERT INTO players (
        player_id,
@@ -256,647 +270,675 @@ async function mergeLegacyPlayerIntoStablePlayer(
      DO UPDATE SET
        country = EXCLUDED.country,
        updated_at = NOW()`,
-    [stablePlayerId, temporaryUsername, country]
+    [playerId, username, country]
   );
 
-  // Toplam skorlar aynı hesabın kopyaları kabul edildiği için toplanmaz;
-  // en yüksek olan korunur. Böylece çift sayım yapılmaz.
   await client.query(
-    `INSERT INTO player_scores
-       (
-         player_id,
-         general_score,
-         infinite_score,
-         updated_at
-       )
-     SELECT
-       $2,
-       general_score,
-       infinite_score,
+    `INSERT INTO player_scores (player_id)
+     VALUES ($1)
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId]
+  );
+
+  await client.query(
+    `INSERT INTO player_secure_state (
+       player_id,
+       remaining_rights,
+       rights_last_refill_at,
+       rights_updated_at,
        updated_at
-     FROM player_scores
-     WHERE player_id = $1
-     ON CONFLICT (player_id)
-     DO UPDATE SET
-       general_score = GREATEST(
-         player_scores.general_score,
-         EXCLUDED.general_score
-       ),
-       infinite_score = GREATEST(
-         player_scores.infinite_score,
-         EXCLUDED.infinite_score
-       ),
-       updated_at = GREATEST(
-         player_scores.updated_at,
-         EXCLUDED.updated_at
-       )`,
-    [legacyPlayerId, stablePlayerId]
+     )
+     VALUES ($1, $2, NOW(), NOW(), NOW())
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId, MAX_GLOBAL_GAME_RIGHTS]
+  );
+}
+
+async function usernameBelongsToAnother(client, username, playerId) {
+  const result = await client.query(
+    `SELECT player_id
+     FROM players
+     WHERE LOWER(username) = LOWER($1)
+       AND player_id <> $2
+     LIMIT 1`,
+    [username, playerId]
   );
 
-  await client.query(
-    `INSERT INTO player_monthly_scores
-       (
+  return result.rowCount > 0;
+}
+
+function calculateRights(row, nowMs = Date.now()) {
+  let remainingRights = Math.max(
+    0,
+    Math.min(Number(row.remaining_rights ?? MAX_GLOBAL_GAME_RIGHTS), MAX_GLOBAL_GAME_RIGHTS)
+  );
+
+  let lastRefillMs = dateToMillis(row.rights_last_refill_at, nowMs);
+
+  if (remainingRights < MAX_GLOBAL_GAME_RIGHTS) {
+    const refillCount = Math.floor(
+      Math.max(0, nowMs - lastRefillMs) / GAME_RIGHT_REFILL_MS
+    );
+
+    if (refillCount > 0) {
+      remainingRights = Math.min(MAX_GLOBAL_GAME_RIGHTS, remainingRights + refillCount);
+      lastRefillMs =
+        remainingRights >= MAX_GLOBAL_GAME_RIGHTS
+          ? nowMs
+          : lastRefillMs + refillCount * GAME_RIGHT_REFILL_MS;
+    }
+  }
+
+  return {
+    remainingRights,
+    maxRights: MAX_GLOBAL_GAME_RIGHTS,
+    lastRefillTimeMillis: lastRefillMs,
+    updatedAtMillis: dateToMillis(row.rights_updated_at, nowMs),
+    millisUntilNextRight:
+      remainingRights >= MAX_GLOBAL_GAME_RIGHTS
+        ? 0
+        : Math.max(0, lastRefillMs + GAME_RIGHT_REFILL_MS - nowMs),
+  };
+}
+
+async function refreshRightsLocked(client, playerId) {
+  const state = await client.query(
+    `SELECT *
+     FROM player_secure_state
+     WHERE player_id = $1
+     FOR UPDATE`,
+    [playerId]
+  );
+
+  const row = state.rows[0];
+  const nowMs = Date.now();
+  const rights = calculateRights(row, nowMs);
+
+  if (
+    rights.remainingRights !== row.remaining_rights ||
+    rights.lastRefillTimeMillis !== dateToMillis(row.rights_last_refill_at, nowMs)
+  ) {
+    await client.query(
+      `UPDATE player_secure_state
+       SET remaining_rights = $2,
+           rights_last_refill_at = to_timestamp($3 / 1000.0),
+           rights_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, rights.remainingRights, rights.lastRefillTimeMillis]
+    );
+
+    rights.updatedAtMillis = Date.now();
+  }
+
+  return rights;
+}
+
+async function buildPlayerState(client, playerId) {
+  const result = await client.query(
+    `SELECT
+       p.username,
+       p.country,
+       ps.general_score,
+       ps.infinite_score,
+       st.total_xp,
+       st.remaining_rights,
+       st.rights_last_refill_at,
+       st.rights_updated_at,
+       st.username_change_count,
+       st.username_last_change_at,
+       st.username_updated_at
+     FROM players p
+     JOIN player_scores ps ON ps.player_id = p.player_id
+     JOIN player_secure_state st ON st.player_id = p.player_id
+     WHERE p.player_id = $1`,
+    [playerId]
+  );
+
+  if (!result.rows[0]) {
+    throw publicError("Oyuncu bulunamadı.", 404, "PLAYER_NOT_FOUND");
+  }
+
+  const row = result.rows[0];
+  const rights = await refreshRightsLocked(client, playerId);
+
+  return {
+    username: row.username,
+    country: row.country,
+    totalScore: Number(row.general_score || 0),
+    infiniteScore: Number(row.infinite_score || 0),
+    totalXp: Number(row.total_xp || 0),
+    level: levelStateForTotalXp(row.total_xp),
+    rights,
+    profile: {
+      changeCountAfterInitial: Number(row.username_change_count || 0),
+      lastChangeTimeMillis: dateToMillis(row.username_last_change_at, 0),
+      updatedAtMillis: dateToMillis(row.username_updated_at, Date.now()),
+    },
+  };
+}
+
+app.post("/player/state/sync", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+    const state = await buildPlayerState(client, playerId);
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      state,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Oyuncu durumu alınamadı.", "player state sync error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/player/username/update", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+
+    if (await usernameBelongsToAnother(client, username, playerId)) {
+      throw publicError("Bu kullanıcı adı zaten alınmış.", 409, "USERNAME_TAKEN");
+    }
+
+    const locked = await client.query(
+      `SELECT *
+       FROM player_secure_state
+       WHERE player_id = $1
+       FOR UPDATE`,
+      [playerId]
+    );
+
+    const current = await client.query(
+      `SELECT username
+       FROM players
+       WHERE player_id = $1
+       FOR UPDATE`,
+      [playerId]
+    );
+
+    const oldUsername = current.rows[0]?.username || "";
+    const stateRow = locked.rows[0];
+    const alreadyHasName = oldUsername && oldUsername !== "Oyuncu";
+
+    if (alreadyHasName && oldUsername.toLowerCase() !== username.toLowerCase()) {
+      const lastChangeMs = dateToMillis(stateRow.username_last_change_at, 0);
+      const waitMs = Math.max(
+        0,
+        lastChangeMs + USERNAME_CHANGE_COOLDOWN_MS - Date.now()
+      );
+
+      if (waitMs > 0) {
+        throw publicError(
+          "Kullanıcı adını yeniden değiştirmek için süre dolmadı.",
+          429,
+          "USERNAME_COOLDOWN"
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE players
+       SET username = $2,
+           country = $3,
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, username, country]
+    );
+
+    await client.query(
+      `UPDATE player_secure_state
+       SET username_change_count =
+             CASE WHEN $2::boolean THEN username_change_count + 1 ELSE username_change_count END,
+           username_last_change_at = NOW(),
+           username_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, Boolean(alreadyHasName)]
+    );
+
+    const state = await buildPlayerState(client, playerId);
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      state,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Kullanıcı adı güncellenemedi.", "username update error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/player/right/consume", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+
+    const rights = await refreshRightsLocked(client, playerId);
+
+    if (rights.remainingRights <= 0) {
+      const state = await buildPlayerState(client, playerId);
+      await client.query("COMMIT");
+
+      return res.json({
+        ok: true,
+        consumed: false,
+        state,
+      });
+    }
+
+    await client.query(
+      `UPDATE player_secure_state
+       SET remaining_rights = remaining_rights - 1,
+           rights_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId]
+    );
+
+    const state = await buildPlayerState(client, playerId);
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      consumed: true,
+      state,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Oyun hakkı kullanılamadı.", "right consume error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/player/reward/add", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+  const eventId = safeEventId(req.body.eventId) || crypto.randomUUID();
+  const generalDelta = safeSignedDelta(req.body.generalScoreDelta);
+  const infiniteDelta = safePositiveDelta(req.body.infiniteScoreDelta);
+  const xpDelta = safePositiveDelta(req.body.xpDelta, MAX_XP_DELTA);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  if (generalDelta === 0 && infiniteDelta === 0 && xpDelta === 0) {
+    return res.status(400).json({
+      ok: false,
+      message: "Eklenecek ödül yok.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+
+    const inserted = await client.query(
+      `INSERT INTO player_reward_events (player_id, event_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [playerId, eventId]
+    );
+
+    if (inserted.rowCount > 0) {
+      await client.query(
+        `UPDATE player_scores
+         SET general_score = GREATEST(0, general_score + $2),
+             infinite_score = GREATEST(0, infinite_score + $3),
+             updated_at = NOW()
+         WHERE player_id = $1`,
+        [playerId, generalDelta, infiniteDelta]
+      );
+
+      await client.query(
+        `INSERT INTO player_monthly_scores (
+           player_id,
+           month_key,
+           general_score,
+           infinite_score,
+           updated_at
+         )
+         VALUES ($1, $2, GREATEST(0, $3), GREATEST(0, $4), NOW())
+         ON CONFLICT (player_id, month_key)
+         DO UPDATE SET
+           general_score = GREATEST(0, player_monthly_scores.general_score + $3),
+           infinite_score = GREATEST(0, player_monthly_scores.infinite_score + $4),
+           updated_at = NOW()`,
+        [playerId, currentMonthKey(), generalDelta, infiniteDelta]
+      );
+
+      await client.query(
+        `UPDATE player_secure_state
+         SET total_xp = LEAST(2000000000, total_xp + $2),
+             updated_at = NOW()
+         WHERE player_id = $1`,
+        [playerId, xpDelta]
+      );
+    }
+
+    const state = await buildPlayerState(client, playerId);
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      applied: inserted.rowCount > 0,
+      state,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Ödül kaydedilemedi.", "reward add error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/leaderboard/username/claim", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+
+    if (await usernameBelongsToAnother(client, username, playerId)) {
+      throw publicError("Bu kullanıcı adı zaten alınmış.", 409, "USERNAME_TAKEN");
+    }
+
+    await client.query(
+      `UPDATE players
+       SET username = $2,
+           country = $3,
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, username, country]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Kullanıcı adı kaydedilemedi.", "username claim error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/leaderboard/scores/sync", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+  const generalScore = safeScore(req.body.generalScore);
+  const infiniteScore = safeScore(req.body.infiniteScore);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+
+    await client.query(
+      `UPDATE player_scores
+       SET general_score = GREATEST(general_score, $2),
+           infinite_score = GREATEST(infinite_score, $3),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, generalScore, infiniteScore]
+    );
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Skor senkronize edilemedi.", "leaderboard sync error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/leaderboard/scores/add", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safePlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+  const generalDelta = safeSignedDelta(req.body.generalScoreDelta);
+  const infiniteDelta = safePositiveDelta(req.body.infiniteScoreDelta);
+
+  if (!playerId) {
+    return res.status(400).json({
+      ok: false,
+      message: "playerId zorunlu.",
+    });
+  }
+
+  if (generalDelta === 0 && infiniteDelta === 0) {
+    return res.status(400).json({
+      ok: false,
+      message: "Eklenecek skor yok.",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    await ensurePlayer(client, playerId, username, country);
+
+    await client.query(
+      `UPDATE player_scores
+       SET general_score = GREATEST(0, general_score + $2),
+           infinite_score = GREATEST(0, infinite_score + $3),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, generalDelta, infiniteDelta]
+    );
+
+    await client.query(
+      `INSERT INTO player_monthly_scores (
          player_id,
          month_key,
          general_score,
          infinite_score,
          updated_at
        )
-     SELECT
-       $2,
-       month_key,
-       general_score,
-       infinite_score,
-       updated_at
-     FROM player_monthly_scores
-     WHERE player_id = $1
-     ON CONFLICT (player_id, month_key)
-     DO UPDATE SET
-       general_score = GREATEST(
-         player_monthly_scores.general_score,
-         EXCLUDED.general_score
-       ),
-       infinite_score = GREATEST(
-         player_monthly_scores.infinite_score,
-         EXCLUDED.infinite_score
-       ),
-       updated_at = GREATEST(
-         player_monthly_scores.updated_at,
-         EXCLUDED.updated_at
-       )`,
-    [legacyPlayerId, stablePlayerId]
-  );
+       VALUES ($1, $2, GREATEST(0, $3), GREATEST(0, $4), NOW())
+       ON CONFLICT (player_id, month_key)
+       DO UPDATE SET
+         general_score = GREATEST(0, player_monthly_scores.general_score + $3),
+         infinite_score = GREATEST(0, player_monthly_scores.infinite_score + $4),
+         updated_at = NOW()`,
+      [playerId, currentMonthKey(), generalDelta, infiniteDelta]
+    );
 
-  // Eski oyuncu silinince ona bağlı eski skor satırları
-  // CASCADE ile temizlenir.
-  await client.query(
-    `DELETE FROM players
-     WHERE player_id = $1`,
-    [legacyPlayerId]
-  );
+    await client.query("COMMIT");
 
-  await client.query(
-    `UPDATE players
-     SET
-       username = $2,
-       country = $3,
-       updated_at = NOW()
-     WHERE player_id = $1`,
-    [stablePlayerId, username, country]
-  );
-
-  await ensurePlayerScoreRow(client, stablePlayerId);
-
-  console.log("Leaderboard identity migrated:", {
-    legacyPlayerId,
-    stablePlayerId,
-    username,
-  });
-}
-
-/**
- * Kullanıcı adı yalnızca kullanıcı adı kaydetme/değiştirme sırasında
- * sahiplenilir.
- *
- * Yeni pg_ kimliğine geçişte aynı ada bağlı eski local_ satırı
- * otomatik birleştirilir.
- */
-async function claimOrCreatePlayer(
-  client,
-  playerId,
-  username,
-  country
-) {
-  await client.query(
-    "SELECT pg_advisory_xact_lock(hashtext(LOWER($1::text)))",
-    [username]
-  );
-
-  const ownersResult = await client.query(
-    `SELECT player_id
-     FROM players
-     WHERE LOWER(username) = LOWER($1)
-       AND player_id <> $2
-     ORDER BY created_at ASC
-     FOR UPDATE`,
-    [username, playerId]
-  );
-
-  const foreignOwners = ownersResult.rows.map(
-    (row) => String(row.player_id)
-  );
-
-  const migratableLegacyOwners = foreignOwners.filter(
-    (ownerPlayerId) =>
-      isStablePlayGamesLeaderboardId(playerId) &&
-      isLegacyLocalLeaderboardId(ownerPlayerId)
-  );
-
-  const blockingOwners = foreignOwners.filter(
-    (ownerPlayerId) =>
-      !migratableLegacyOwners.includes(ownerPlayerId)
-  );
-
-  if (blockingOwners.length > 0) {
-    throw usernameTakenError();
+    res.json({
+      ok: true,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendError(res, error, "Skor eklenemedi.", "leaderboard add error:");
+  } finally {
+    client.release();
   }
-
-  for (const legacyPlayerId of migratableLegacyOwners) {
-    await mergeLegacyPlayerIntoStablePlayer(
-      client,
-      legacyPlayerId,
-      playerId,
-      username,
-      country
-    );
-  }
-
-  await client.query(
-    `INSERT INTO players (
-       player_id,
-       username,
-       country,
-       updated_at
-     )
-     VALUES ($1, $2, $3, NOW())
-     ON CONFLICT (player_id)
-     DO UPDATE SET
-       username = EXCLUDED.username,
-       country = EXCLUDED.country,
-       updated_at = NOW()`,
-    [playerId, username, country]
-  );
-
-  await ensurePlayerScoreRow(client, playerId);
-}
-
-/**
- * Skor isteği mevcut oyuncunun kullanıcı adını tekrar sahiplenmez.
- *
- * Böylece geçici/eski kullanıcı adı verisi skor güncellemesini
- * 409 hatasıyla durduramaz.
- *
- * Oyuncu kimliği henüz sunucuda yoksa ilk kayıt veya
- * legacy -> pg_ geçişi yapılır.
- */
-async function ensurePlayerForScore(
-  client,
-  playerId,
-  username,
-  country
-) {
-  const existingResult = await client.query(
-    `SELECT player_id
-     FROM players
-     WHERE player_id = $1
-     FOR UPDATE`,
-    [playerId]
-  );
-
-  if (existingResult.rowCount > 0) {
-    await client.query(
-      `UPDATE players
-       SET
-         country = $2,
-         updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, country]
-    );
-
-    await ensurePlayerScoreRow(client, playerId);
-    return;
-  }
-
-  await claimOrCreatePlayer(
-    client,
-    playerId,
-    username,
-    country
-  );
-}
-
-app.post(
-  "/leaderboard/username/claim",
-  async (req, res) => {
-    if (!requireDatabase(res)) return;
-
-    const playerId = safeLeaderboardPlayerId(
-      req.body.playerId
-    );
-    const username = safeUsername(req.body.username);
-    const country = safeCountry(req.body.country);
-
-    if (!playerId) {
-      res.status(400).json({
-        ok: false,
-        message: "playerId zorunlu.",
-      });
-
-      return;
-    }
-
-    const client = await pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      await claimOrCreatePlayer(
-        client,
-        playerId,
-        username,
-        country
-      );
-
-      await client.query("COMMIT");
-
-      res.json({
-        ok: true,
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
-
-      sendLeaderboardError(
-        res,
-        error,
-        "Kullanıcı adı kaydedilemedi.",
-        "username claim error:"
-      );
-    } finally {
-      client.release();
-    }
-  }
-);
-
-app.post(
-  "/leaderboard/scores/sync",
-  async (req, res) => {
-    if (!requireDatabase(res)) return;
-
-    const playerId = safeLeaderboardPlayerId(
-      req.body.playerId
-    );
-    const username = safeUsername(req.body.username);
-    const country = safeCountry(req.body.country);
-    const generalScore = safeScore(
-      req.body.generalScore
-    );
-    const infiniteScore = safeScore(
-      req.body.infiniteScore
-    );
-
-    if (!playerId) {
-      res.status(400).json({
-        ok: false,
-        message: "playerId zorunlu.",
-      });
-
-      return;
-    }
-
-    const client = await pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      await ensurePlayerForScore(
-        client,
-        playerId,
-        username,
-        country
-      );
-
-      await client.query(
-        `UPDATE player_scores
-         SET
-           general_score = $2,
-           infinite_score = GREATEST(
-             infinite_score,
-             $3
-           ),
-           updated_at = NOW()
-         WHERE player_id = $1`,
-        [
-          playerId,
-          generalScore,
-          infiniteScore,
-        ]
-      );
-
-      await client.query("COMMIT");
-
-      res.json({
-        ok: true,
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
-
-      sendLeaderboardError(
-        res,
-        error,
-        "Skor senkronize edilemedi.",
-        "leaderboard sync error:"
-      );
-    } finally {
-      client.release();
-    }
-  }
-);
-
-app.post(
-  "/leaderboard/scores/add",
-  async (req, res) => {
-    if (!requireDatabase(res)) return;
-
-    const playerId = safeLeaderboardPlayerId(
-      req.body.playerId
-    );
-    const username = safeUsername(req.body.username);
-    const country = safeCountry(req.body.country);
-
-    const generalDelta = safeSignedDelta(
-      req.body.generalScoreDelta
-    );
-
-    const infiniteDelta = safeDelta(
-      req.body.infiniteScoreDelta
-    );
-
-    const monthKey = currentMonthKey();
-
-    if (!playerId) {
-      res.status(400).json({
-        ok: false,
-        message: "playerId zorunlu.",
-      });
-
-      return;
-    }
-
-    if (
-      generalDelta === 0 &&
-      infiniteDelta <= 0
-    ) {
-      res.json({
-        ok: true,
-        skipped: true,
-      });
-
-      return;
-    }
-
-    const client = await pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      await ensurePlayerForScore(
-        client,
-        playerId,
-        username,
-        country
-      );
-
-      await client.query(
-        `UPDATE player_scores
-         SET
-           general_score = GREATEST(
-             0,
-             LEAST(
-               general_score + $2,
-               2000000000
-             )
-           ),
-           infinite_score = LEAST(
-             infinite_score + $3,
-             2000000000
-           ),
-           updated_at = NOW()
-         WHERE player_id = $1`,
-        [
-          playerId,
-          generalDelta,
-          infiniteDelta,
-        ]
-      );
-
-      await client.query(
-        `INSERT INTO player_monthly_scores
-           (
-             player_id,
-             month_key,
-             general_score,
-             infinite_score,
-             updated_at
-           )
-         VALUES
-           (
-             $1,
-             $2,
-             GREATEST($3, 0),
-             $4,
-             NOW()
-           )
-         ON CONFLICT (player_id, month_key)
-         DO UPDATE SET
-           general_score = GREATEST(
-             0,
-             LEAST(
-               player_monthly_scores.general_score + $3,
-               2000000000
-             )
-           ),
-           infinite_score = LEAST(
-             player_monthly_scores.infinite_score +
-               EXCLUDED.infinite_score,
-             2000000000
-           ),
-           updated_at = NOW()`,
-        [
-          playerId,
-          monthKey,
-          generalDelta,
-          infiniteDelta,
-        ]
-      );
-
-      await client.query("COMMIT");
-
-      res.json({
-        ok: true,
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
-
-      sendLeaderboardError(
-        res,
-        error,
-        "Skor kaydedilemedi.",
-        "leaderboard add error:"
-      );
-    } finally {
-      client.release();
-    }
-  }
-);
+});
 
 app.get("/leaderboard", async (req, res) => {
   if (!requireDatabase(res)) return;
 
-  const scoreType =
-    req.query.scoreType === "infinite"
-      ? "infinite"
-      : "general";
-
-  const period =
-    req.query.period === "month"
-      ? "month"
-      : "all";
-
-  const scope =
-    req.query.scope === "country"
-      ? "country"
-      : "world";
-
+  const scoreType = req.query.scoreType === "infinite" ? "infinite" : "general";
+  const period = req.query.period === "month" ? "month" : "all";
+  const scope = req.query.scope === "country" ? "country" : "world";
   const country = safeCountry(req.query.country);
+  const playerId = safePlayerId(req.query.playerId);
 
-  const playerId = safeLeaderboardPlayerId(
-    req.query.playerId
-  );
-
+  const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
+  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
   const monthKey = currentMonthKey();
 
-  const scoreColumn =
-    scoreType === "infinite"
-      ? "infinite_score"
-      : "general_score";
+  const values = [];
+  const where = [`s.${scoreColumn} > 0`];
 
-  const tableName =
-    period === "month"
-      ? "player_monthly_scores"
-      : "player_scores";
-
-  function buildWhere(includeCountry) {
-    const values = [];
-
-    const conditions = [
-      `s.${scoreColumn} > 0`,
-    ];
-
-    if (period === "month") {
-      values.push(monthKey);
-
-      conditions.push(
-        `s.month_key = $${values.length}`
-      );
-    }
-
-    if (includeCountry) {
-      values.push(country);
-
-      conditions.push(
-        `p.country = $${values.length}`
-      );
-    }
-
-    return {
-      values,
-      whereSql: conditions.join(" AND "),
-    };
+  if (period === "month") {
+    values.push(monthKey);
+    where.push(`s.month_key = $${values.length}`);
   }
 
-  async function getMyRank(includeCountry) {
-    if (!playerId) return null;
-
-    const built = buildWhere(includeCountry);
-
-    const values = [
-      ...built.values,
-      playerId,
-    ];
-
-    const playerParamIndex = values.length;
-
-    const sql = `
-      WITH ranked AS (
-        SELECT
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY
-              s.${scoreColumn} DESC,
-              s.updated_at ASC,
-              p.username ASC
-          ) AS position
-        FROM ${tableName} s
-        JOIN players p
-          ON p.player_id = s.player_id
-        WHERE ${built.whereSql}
-      )
-      SELECT
-        position,
-        score
-      FROM ranked
-      WHERE player_id = $${playerParamIndex}
-      LIMIT 1
-    `;
-
-    const result = await pool.query(
-      sql,
-      values
-    );
-
-    const row = result.rows[0];
-
-    if (!row) return null;
-
-    return {
-      rank: Number(row.position),
-      score: Number(row.score),
-    };
+  if (scope === "country") {
+    values.push(country);
+    where.push(`p.country = $${values.length}`);
   }
 
   try {
-    const listBuilt = buildWhere(
-      scope === "country"
+    const rows = await pool.query(
+      `SELECT
+         p.username,
+         p.country,
+         s.${scoreColumn} AS score,
+         ROW_NUMBER() OVER (
+           ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+         ) AS rank
+       FROM ${tableName} s
+       JOIN players p ON p.player_id = s.player_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+       LIMIT 100`,
+      values
     );
 
-    const listSql = `
-      WITH ranked AS (
-        SELECT
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY
-              s.${scoreColumn} DESC,
-              s.updated_at ASC,
-              p.username ASC
-          ) AS position
-        FROM ${tableName} s
-        JOIN players p
-          ON p.player_id = s.player_id
-        WHERE ${listBuilt.whereSql}
-      )
-      SELECT
-        position,
-        username,
-        country,
-        score
-      FROM ranked
-      ORDER BY position ASC
-      LIMIT 50
-    `;
+    async function rankFor(includeCountry) {
+      if (!playerId) return null;
 
-    const listResult = await pool.query(
-      listSql,
-      listBuilt.values
-    );
+      const rankValues = [];
+      const rankWhere = [`s.${scoreColumn} > 0`];
 
-    const myWorld = await getMyRank(false);
-    const myCountry = await getMyRank(true);
+      if (period === "month") {
+        rankValues.push(monthKey);
+        rankWhere.push(`s.month_key = $${rankValues.length}`);
+      }
+
+      if (includeCountry) {
+        rankValues.push(country);
+        rankWhere.push(`p.country = $${rankValues.length}`);
+      }
+
+      rankValues.push(playerId);
+      const playerIndex = rankValues.length;
+
+      const result = await pool.query(
+        `WITH ranked AS (
+           SELECT
+             p.player_id,
+             s.${scoreColumn} AS score,
+             ROW_NUMBER() OVER (
+               ORDER BY s.${scoreColumn} DESC, s.updated_at ASC, p.username ASC
+             ) AS rank
+           FROM ${tableName} s
+           JOIN players p ON p.player_id = s.player_id
+           WHERE ${rankWhere.join(" AND ")}
+         )
+         SELECT rank, score
+         FROM ranked
+         WHERE player_id = $${playerIndex}
+         LIMIT 1`,
+        rankValues
+      );
+
+      return result.rows[0] || null;
+    }
+
+    const myWorld = await rankFor(false);
+    const myCountry = await rankFor(true);
 
     res.json({
       ok: true,
@@ -904,301 +946,145 @@ app.get("/leaderboard", async (req, res) => {
       period,
       scope,
       country,
-      monthKey,
-      myWorldRank: myWorld
-        ? myWorld.rank
-        : null,
-      myCountryRank: myCountry
-        ? myCountry.rank
-        : null,
-      myScore: myWorld
-        ? myWorld.score
-        : 0,
-      rows: listResult.rows.map((row) => ({
-        rank: Number(row.position),
+      rows: rows.rows.map((row) => ({
+        rank: Number(row.rank),
         username: row.username,
         country: row.country,
         score: Number(row.score),
       })),
+      myWorldRank: myWorld ? Number(myWorld.rank) : null,
+      myCountryRank: myCountry ? Number(myCountry.rank) : null,
+      myScore: Number((scope === "country" ? myCountry : myWorld)?.score || 0),
     });
   } catch (error) {
-    console.error("leaderboard get error:", {
-      message: error.message,
-      code: error.code,
-      detail: error.detail,
-      stack: error.stack,
-    });
-
-    res.status(500).json({
-      ok: false,
-      message: "Skor tablosu alınamadı.",
-    });
+    sendError(res, error, "Skor tablosu alınamadı.", "leaderboard get error:");
   }
 });
 
-const io = new Server(server, {
-  path: SOCKET_PATH,
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 
-  cors: {
-    origin: true,
-    methods: ["GET", "POST"],
-    credentials: false,
-  },
+function generateTargetNumberPuzzle(difficulty) {
+  const isHard = String(difficulty) === "Hard";
+  const count = isHard ? 4 : 3;
+  const minNumber = isHard ? 2 : 1;
+  const maxNumber = isHard ? 20 : 9;
 
-  transports: [
-    "websocket",
-    "polling",
-  ],
-
-  allowEIO3: true,
-  pingInterval: 25_000,
-  pingTimeout: 20_000,
-
-  allowRequest: (req, callback) => {
-    console.log(
-      "Socket.IO handshake request:",
-      req.url,
-      "origin:",
-      req.headers.origin || "-"
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const numbers = Array.from(
+      { length: count },
+      () => randomInt(minNumber, maxNumber)
     );
 
-    callback(null, true);
-  },
-});
+    const ops = ["+", "-", "*"];
+    let value = numbers[0];
 
-const waitingQueues = new Map();
-const activeRooms = new Map();
-const realtimeRooms = new Map();
-const privateRooms = new Map();
+    for (let i = 1; i < numbers.length; i += 1) {
+      const op = ops[randomInt(0, ops.length - 1)];
+      const next = numbers[i];
 
-const PRIVATE_ROOM_TTL_MS = Number(
-  process.env.PRIVATE_ROOM_TTL_MS ||
-    15 * 60 * 1000
-);
+      if (op === "+") value += next;
+      else if (op === "-") value -= next;
+      else value *= next;
+    }
 
-const ROOM_RECONNECT_TIMEOUT_MS = Number(
-  process.env.ROOM_RECONNECT_TIMEOUT_MS ||
-    60 * 1000
-);
+    const target = Math.abs(Math.trunc(value));
 
-const RESOLVED_ROOM_TTL_MS = Number(
-  process.env.RESOLVED_ROOM_TTL_MS ||
-    10 * 60 * 1000
-);
-
-function normalizeMatchGameKey(value) {
-  const gameKey = String(
-    value || "target_number"
-  )
-    .trim()
-    .slice(0, 96);
-
-  if (
-    /^target_number_tournament(?:_stage_\d+)?$/i.test(
-      gameKey
-    )
-  ) {
-    return "target_number_tournament";
+    if (isHard) {
+      if (target > 20 && target < 200) {
+        return {
+          difficulty: "Hard",
+          target,
+          numbers,
+        };
+      }
+    } else if (target >= 10 && target < 50) {
+      return {
+        difficulty: "Medium",
+        target,
+        numbers,
+      };
+    }
   }
 
-  return gameKey || "target_number";
-}
-
-function queueKey(gameKey, difficulty) {
-  return `${String(
-    gameKey || "default"
-  )}::${String(
-    difficulty || "default"
-  )}`;
-}
-
-function safePlayerId(value, fallback = "") {
-  const cleaned = String(
-    value || fallback || ""
-  )
-    .trim()
-    .replace(/[^a-zA-Z0-9_.:-]/g, "")
-    .slice(0, 96);
-
-  return (
-    cleaned ||
-    String(fallback || "")
-      .trim()
-      .slice(0, 96)
-  );
-}
-
-function safePlayer(
-  rawPlayer,
-  fallbackId = ""
-) {
-  const id = safePlayerId(
-    rawPlayer?.id,
-    fallbackId
-  );
-
-  const name =
-    String(rawPlayer?.name || "Oyuncu")
-      .trim()
-      .slice(0, 24) || "Oyuncu";
-
-  const country = String(
-    rawPlayer?.country || ""
-  )
-    .trim()
-    .toUpperCase()
-    .slice(0, 3);
-
   return {
-    id,
-    name,
-    country,
+    difficulty: isHard ? "Hard" : "Medium",
+    target: isHard ? randomInt(21, 199) : randomInt(10, 49),
+    numbers: Array.from(
+      { length: count },
+      () => randomInt(minNumber, maxNumber)
+    ),
   };
 }
 
-function safePuzzle(
-  rawPuzzle,
-  difficulty
-) {
-  const numbers = Array.isArray(
-    rawPuzzle?.numbers
-  )
-    ? rawPuzzle.numbers
-        .map((n) => Number(n))
-        .filter((n) => Number.isFinite(n))
-        .slice(0, 8)
-    : [];
+function normalizeGameKey(value) {
+  return (
+    safeText(value, "target_number", 40)
+      .replace(/[^a-zA-Z0-9_.:-]/g, "")
+      .slice(0, 40) || "target_number"
+  );
+}
 
-  const target = Number(rawPuzzle?.target);
+function queueKey(gameKey, difficulty) {
+  return `${normalizeGameKey(gameKey)}:${String(difficulty || "Medium")}`;
+}
 
-  if (
-    !Number.isFinite(target) ||
-    target <= 0 ||
-    numbers.length < 3
-  ) {
-    return null;
-  }
+function safePlayer(payload, fallbackId) {
+  const data = payload && typeof payload === "object" ? payload : {};
 
   return {
-    difficulty: String(
-      rawPuzzle?.difficulty ||
-        difficulty ||
-        "Medium"
-    ),
-    target: Math.floor(target),
-    numbers: numbers.map(
-      (n) => Math.floor(n)
-    ),
+    id: safePlayerId(data.id || data.playerId || fallbackId) || safePlayerId(fallbackId),
+    name: safeUsername(data.name || data.playerName),
+    country: safeCountry(data.country || data.playerCountry),
   };
 }
 
 function normalizeRoomCode(value) {
   return String(value || "")
-    .trim()
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
     .slice(0, 6);
 }
 
 function generateRoomCode() {
-  const alphabet =
-    "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
   let code = "";
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-  for (let i = 0; i < 6; i += 1) {
-    code += alphabet[
-      crypto.randomInt(
-        0,
-        alphabet.length
-      )
-    ];
-  }
+  do {
+    code = Array.from(
+      { length: 6 },
+      () => chars[randomInt(0, chars.length - 1)]
+    ).join("");
+  } while (privateRooms.has(code));
 
   return code;
 }
 
-function generateUniqueRoomCode() {
-  for (
-    let attempt = 0;
-    attempt < 32;
-    attempt += 1
-  ) {
-    const code = generateRoomCode();
-
-    if (!privateRooms.has(code)) {
-      return code;
-    }
-  }
-
-  return crypto
-    .randomBytes(4)
-    .toString("hex")
-    .toUpperCase()
-    .slice(0, 6);
-}
+const waitingQueues = new Map();
+const realtimeRooms = new Map();
+const activeRooms = new Map();
+const privateRooms = new Map();
 
 function roomParticipants(room) {
-  return Object.values(
-    room?.participants || {}
-  );
+  return room ? [room.a, room.b].filter(Boolean) : [];
 }
 
 function getParticipant(room, playerId) {
-  if (!room || !playerId) {
-    return null;
-  }
-
-  return (
-    room.participants[playerId] ||
-    null
-  );
+  return roomParticipants(room).find((participant) => participant.playerId === playerId);
 }
 
-function getOpponentParticipant(
-  room,
-  playerId
-) {
-  return (
-    roomParticipants(room).find(
-      (participant) =>
-        participant.playerId !== playerId
-    ) || null
-  );
+function getOpponent(room, playerId) {
+  return roomParticipants(room).find((participant) => participant.playerId !== playerId);
 }
 
-function clearParticipantTimeout(
-  participant
-) {
-  if (participant?.timeoutHandle) {
-    clearTimeout(
-      participant.timeoutHandle
-    );
-
-    participant.timeoutHandle = null;
-  }
-}
-
-function clearRoomTimeouts(room) {
-  roomParticipants(room).forEach(
-    clearParticipantTimeout
-  );
-}
-
-function attachSocketToRoom(
-  socket,
-  room,
-  playerId
-) {
-  const participant = getParticipant(
-    room,
-    playerId
-  );
-
+function attachSocketToRoom(socket, room, playerId) {
+  const participant = getParticipant(room, playerId);
   if (!participant) return;
 
   participant.socketId = socket.id;
   participant.connected = true;
+  participant.awaySince = null;
 
   socket.join(room.roomId);
 
@@ -1208,188 +1094,8 @@ function attachSocketToRoom(
   });
 }
 
-function clearParticipantAwayState(
-  room,
-  playerId
-) {
-  const participant = getParticipant(
-    room,
-    playerId
-  );
-
-  if (!participant) return;
-
-  clearParticipantTimeout(participant);
-
-  participant.connected = true;
-  participant.awaySince = null;
-  participant.backgrounded = false;
-  participant.reconnectDeadlineAt = null;
-}
-
-function markRoomResolved(
-  room,
-  reason,
-  winnerPlayerId,
-  loserPlayerId
-) {
-  if (!room || room.resolved) return;
-
-  room.resolved = true;
-  room.resolvedReason = reason;
-
-  room.winnerPlayerId =
-    winnerPlayerId || null;
-
-  room.loserPlayerId =
-    loserPlayerId || null;
-
-  room.resolvedAt = Date.now();
-
-  clearRoomTimeouts(room);
-}
-
-function resolveRoomByAwayTimeout(
-  roomId,
-  loserPlayerId
-) {
-  const room = realtimeRooms.get(roomId);
-
-  if (!room || room.resolved) return;
-
-  const loser = getParticipant(
-    room,
-    loserPlayerId
-  );
-
-  const opponent =
-    getOpponentParticipant(
-      room,
-      loserPlayerId
-    );
-
-  if (!loser || loser.finishedAt) return;
-
-  markRoomResolved(
-    room,
-    "timeout",
-    opponent?.playerId,
-    loserPlayerId
-  );
-
-  const opponentSocket =
-    opponent?.socketId
-      ? io.sockets.sockets.get(
-          opponent.socketId
-        )
-      : null;
-
-  if (
-    opponentSocket &&
-    !opponent.finishedAt
-  ) {
-    opponentSocket.emit(
-      "opponent_left",
-      {
-        roomId,
-        reason: "timeout",
-      }
-    );
-  }
-
-  const loserSocket = loser.socketId
-    ? io.sockets.sockets.get(
-        loser.socketId
-      )
-    : null;
-
-  if (loserSocket) {
-    loserSocket.emit(
-      "resume_error",
-      {
-        code: "RECONNECT_EXPIRED",
-        message:
-          "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
-        opponentFinishedMs: Number(
-          opponent?.elapsedMs || 0
-        ),
-      }
-    );
-  }
-
-  console.log(
-    "Reconnect timeout loss:",
-    roomId,
-    loserPlayerId
-  );
-}
-
-function scheduleParticipantAwayTimeout(
-  room,
-  playerId
-) {
-  const participant = getParticipant(
-    room,
-    playerId
-  );
-
-  if (
-    !room ||
-    room.resolved ||
-    !participant ||
-    participant.finishedAt
-  ) {
-    return;
-  }
-
-  if (!participant.awaySince) {
-    participant.awaySince = Date.now();
-  }
-
-  participant.reconnectDeadlineAt =
-    participant.awaySince +
-    ROOM_RECONNECT_TIMEOUT_MS;
-
-  clearParticipantTimeout(participant);
-
-  const waitMs = Math.max(
-    0,
-    participant.reconnectDeadlineAt -
-      Date.now()
-  );
-
-  participant.timeoutHandle =
-    setTimeout(() => {
-      resolveRoomByAwayTimeout(
-        room.roomId,
-        playerId
-      );
-    }, waitMs);
-
-  if (
-    typeof participant.timeoutHandle
-      .unref === "function"
-  ) {
-    participant.timeoutHandle.unref();
-  }
-}
-
-function createRealtimeRoom(
-  socket,
-  player,
-  opponentSocket,
-  opponentPlayer,
-  gameKey,
-  difficulty,
-  puzzle
-) {
-  const roomId =
-    typeof crypto.randomUUID ===
-    "function"
-      ? crypto.randomUUID()
-      : crypto
-          .randomBytes(16)
-          .toString("hex");
+function createRealtimeRoom(socketA, playerA, socketB, playerB, gameKey, difficulty, puzzle) {
+  const roomId = crypto.randomUUID();
 
   const room = {
     roomId,
@@ -1398,275 +1104,157 @@ function createRealtimeRoom(
     puzzle,
     createdAt: Date.now(),
     resolved: false,
-    resolvedReason: null,
     resolvedAt: null,
+    reason: null,
     winnerPlayerId: null,
     loserPlayerId: null,
-
-    participants: {
-      [player.id]: {
-        playerId: player.id,
-        socketId: socket.id,
-        name: player.name,
-        country: player.country,
-        connected: true,
-        awaySince: null,
-        backgrounded: false,
-        reconnectDeadlineAt: null,
-        timeoutHandle: null,
-        finishedAt: null,
-        elapsedMs: null,
-      },
-
-      [opponentPlayer.id]: {
-        playerId: opponentPlayer.id,
-        socketId: opponentSocket.id,
-        name: opponentPlayer.name,
-        country: opponentPlayer.country,
-        connected: true,
-        awaySince: null,
-        backgrounded: false,
-        reconnectDeadlineAt: null,
-        timeoutHandle: null,
-        finishedAt: null,
-        elapsedMs: null,
-      },
+    a: {
+      playerId: playerA.id,
+      name: playerA.name,
+      country: playerA.country,
+      socketId: socketA.id,
+      connected: true,
+      finishedAt: null,
+      elapsedMs: null,
+      awaySince: null,
+      timeout: null,
+    },
+    b: {
+      playerId: playerB.id,
+      name: playerB.name,
+      country: playerB.country,
+      socketId: socketB.id,
+      connected: true,
+      finishedAt: null,
+      elapsedMs: null,
+      awaySince: null,
+      timeout: null,
     },
   };
 
   realtimeRooms.set(roomId, room);
-
-  attachSocketToRoom(
-    socket,
-    room,
-    player.id
-  );
-
-  attachSocketToRoom(
-    opponentSocket,
-    room,
-    opponentPlayer.id
-  );
+  attachSocketToRoom(socketA, room, playerA.id);
+  attachSocketToRoom(socketB, room, playerB.id);
 
   return room;
 }
 
-function removePrivateRoomsForSocket(
-  socketId,
-  notify = true
-) {
-  for (
-    const [roomCode, room]
-    of privateRooms.entries()
-  ) {
-    if (
-      room.ownerSocketId !== socketId
-    ) {
-      continue;
-    }
+function resolveRoom(room, reason, winnerPlayerId, loserPlayerId) {
+  if (!room || room.resolved) return;
 
-    privateRooms.delete(roomCode);
-
-    const ownerSocket =
-      io.sockets.sockets.get(socketId);
-
-    if (notify && ownerSocket) {
-      ownerSocket.emit(
-        "friend_room_closed",
-        {
-          roomCode,
-          reason: "cancelled",
-        }
-      );
-    }
-  }
+  room.resolved = true;
+  room.resolvedAt = Date.now();
+  room.reason = reason;
+  room.winnerPlayerId = winnerPlayerId || null;
+  room.loserPlayerId = loserPlayerId || null;
 }
 
-function expireOldPrivateRooms() {
-  const now = Date.now();
+function clearAwayTimeout(participant) {
+  if (!participant) return;
 
-  for (
-    const [roomCode, room]
-    of privateRooms.entries()
-  ) {
-    if (
-      now - room.createdAt <=
-      PRIVATE_ROOM_TTL_MS
-    ) {
-      continue;
-    }
-
-    privateRooms.delete(roomCode);
-
-    const ownerSocket =
-      io.sockets.sockets.get(
-        room.ownerSocketId
-      );
-
-    if (ownerSocket) {
-      ownerSocket.emit(
-        "friend_room_closed",
-        {
-          roomCode,
-          reason: "expired",
-        }
-      );
-    }
+  if (participant.timeout) {
+    clearTimeout(participant.timeout);
   }
+
+  participant.timeout = null;
+  participant.awaySince = null;
 }
 
-function expireResolvedRooms() {
-  const now = Date.now();
+function scheduleAwayTimeout(room, playerId) {
+  const participant = getParticipant(room, playerId);
+  if (!participant || participant.timeout) return;
 
-  for (
-    const [roomId, room]
-    of realtimeRooms.entries()
-  ) {
-    if (
-      !room.resolved ||
-      !room.resolvedAt
-    ) {
-      continue;
-    }
+  participant.timeout = setTimeout(() => {
+    const freshRoom = realtimeRooms.get(room.roomId);
+    const freshParticipant = getParticipant(freshRoom, playerId);
+    const opponent = getOpponent(freshRoom, playerId);
 
     if (
-      now - room.resolvedAt <=
-      RESOLVED_ROOM_TTL_MS
+      !freshRoom ||
+      freshRoom.resolved ||
+      !freshParticipant ||
+      freshParticipant.finishedAt
     ) {
-      continue;
+      return;
     }
 
-    clearRoomTimeouts(room);
-    realtimeRooms.delete(roomId);
-  }
-}
-
-function removeFromAllQueues(
-  socketId,
-  playerId = ""
-) {
-  for (
-    const [key, queue]
-    of waitingQueues.entries()
-  ) {
-    const filtered = queue.filter(
-      (item) => {
-        if (
-          item.socketId === socketId
-        ) {
-          return false;
-        }
-
-        if (
-          playerId &&
-          item.player?.id === playerId
-        ) {
-          return false;
-        }
-
-        return true;
-      }
+    resolveRoom(
+      freshRoom,
+      "reconnect_timeout",
+      opponent?.playerId,
+      freshParticipant.playerId
     );
 
-    if (filtered.length === 0) {
+    const opponentSocket = opponent?.socketId
+      ? io.sockets.sockets.get(opponent.socketId)
+      : null;
+
+    if (opponentSocket) {
+      opponentSocket.emit("opponent_left", {
+        roomId: freshRoom.roomId,
+        reason: "reconnect_timeout",
+      });
+    }
+  }, ROOM_RECONNECT_TIMEOUT_MS).unref();
+}
+
+function removeFromAllQueues(socketId, playerId) {
+  for (const [key, queue] of waitingQueues.entries()) {
+    const nextQueue = queue.filter((item) => {
+      if (item.socketId === socketId) return false;
+      if (playerId && item.player?.id === playerId) return false;
+      return true;
+    });
+
+    if (nextQueue.length === 0) {
       waitingQueues.delete(key);
     } else {
-      waitingQueues.set(
-        key,
-        filtered
-      );
+      waitingQueues.set(key, nextQueue);
     }
   }
 }
 
-function getRoomContextBySocket(socket) {
-  const active = activeRooms.get(
-    socket.id
-  );
-
-  if (!active) {
-    return {};
+function removePrivateRoomsForSocket(socketId) {
+  for (const [roomCode, room] of privateRooms.entries()) {
+    if (room.ownerSocketId === socketId) {
+      privateRooms.delete(roomCode);
+    }
   }
-
-  const room = realtimeRooms.get(
-    active.roomId
-  );
-
-  if (!room) {
-    activeRooms.delete(socket.id);
-    return {};
-  }
-
-  const participant = getParticipant(
-    room,
-    active.playerId
-  );
-
-  const opponent =
-    getOpponentParticipant(
-      room,
-      active.playerId
-    );
-
-  return {
-    active,
-    room,
-    participant,
-    opponent,
-  };
 }
 
 function leaveRoomAsCancel(socket) {
-  const {
-    active,
-    room,
-    participant,
-    opponent,
-  } = getRoomContextBySocket(socket);
-
+  const active = activeRooms.get(socket.id);
   if (!active) return;
 
-  if (room && participant) {
-    if (
-      !room.resolved &&
-      !participant.finishedAt &&
-      opponent &&
-      !opponent.finishedAt
-    ) {
-      markRoomResolved(
-        room,
-        "cancelled",
-        opponent.playerId,
-        participant.playerId
-      );
+  const room = realtimeRooms.get(active.roomId);
+  const participant = getParticipant(room, active.playerId);
+  const opponent = getOpponent(room, active.playerId);
 
-      const opponentSocket =
-        opponent.socketId
-          ? io.sockets.sockets.get(
-              opponent.socketId
-            )
-          : null;
+  if (
+    room &&
+    participant &&
+    opponent &&
+    !room.resolved &&
+    !participant.finishedAt &&
+    !opponent.finishedAt
+  ) {
+    resolveRoom(room, "cancelled", opponent.playerId, participant.playerId);
 
-      if (opponentSocket) {
-        opponentSocket.emit(
-          "opponent_left",
-          {
-            roomId: room.roomId,
-            reason: "cancelled",
-          }
-        );
-      }
+    const opponentSocket = opponent.socketId
+      ? io.sockets.sockets.get(opponent.socketId)
+      : null;
+
+    if (opponentSocket) {
+      opponentSocket.emit("opponent_left", {
+        roomId: room.roomId,
+        reason: "cancelled",
+      });
     }
+  }
 
-    clearParticipantTimeout(
-      participant
-    );
-
+  if (participant) {
+    clearAwayTimeout(participant);
     participant.connected = false;
-    participant.awaySince = null;
-    participant.backgrounded = false;
-    participant.reconnectDeadlineAt =
-      null;
     participant.socketId = null;
   }
 
@@ -1674,85 +1262,43 @@ function leaveRoomAsCancel(socket) {
   socket.leave(active.roomId);
 }
 
-function markSocketDisconnected(socket) {
-  const {
-    active,
-    room,
-    participant,
-  } = getRoomContextBySocket(socket);
+function expireRooms() {
+  const now = Date.now();
 
-  if (
-    !active ||
-    !room ||
-    !participant
-  ) {
-    return;
+  for (const [roomCode, room] of privateRooms.entries()) {
+    if (now - room.createdAt > PRIVATE_ROOM_TTL_MS) {
+      privateRooms.delete(roomCode);
+    }
   }
 
-  activeRooms.delete(socket.id);
-
-  if (
-    room.resolved ||
-    participant.finishedAt
-  ) {
-    participant.connected = false;
-    participant.socketId = null;
-    return;
+  for (const [roomId, room] of realtimeRooms.entries()) {
+    if (room.resolved && now - room.resolvedAt > RESOLVED_ROOM_TTL_MS) {
+      realtimeRooms.delete(roomId);
+    }
   }
-
-  participant.connected = false;
-  participant.socketId = null;
-
-  if (!participant.awaySince) {
-    participant.awaySince = Date.now();
-  }
-
-  scheduleParticipantAwayTimeout(
-    room,
-    participant.playerId
-  );
 }
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.json({
     ok: true,
-    service:
-      "target-number-matchmaking",
-    socket: "socket.io",
+    service: "target-number-matchmaking",
     socketPath: SOCKET_PATH,
     database: Boolean(pool),
-    leaderboard: Boolean(pool),
-
-    transports: [
-      "websocket",
-      "polling",
-    ],
-
-    waitingQueues: Array.from(
-      waitingQueues.entries()
-    ).map(([key, queue]) => ({
+    waitingQueues: Array.from(waitingQueues.entries()).map(([key, queue]) => ({
       key,
       count: queue.length,
     })),
-
-    activeRooms: Array.from(
-      realtimeRooms.values()
-    ).filter(
-      (room) => !room.resolved
-    ).length,
-
     privateRooms: privateRooms.size,
+    activeRooms: Array.from(realtimeRooms.values()).filter((room) => !room.resolved).length,
   });
 });
 
-app.get("/health", async (req, res) => {
+app.get("/health", async (_req, res) => {
   if (!pool) {
-    res.json({
+    return res.json({
       ok: true,
       database: false,
     });
-
-    return;
   }
 
   try {
@@ -1763,935 +1309,388 @@ app.get("/health", async (req, res) => {
       database: true,
     });
   } catch (error) {
-    console.error(
-      "health database error:",
-      {
-        message: error.message,
-        code: error.code,
-        detail: error.detail,
-      }
-    );
+    console.error("health database error:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+    });
 
     res.status(500).json({
       ok: false,
       database: false,
-      message:
-        "Database bağlantısı başarısız.",
+      message: "Database bağlantısı başarısız.",
     });
   }
 });
 
-app.get(
-  "/socket-check",
-  (req, res) => {
-    res.json({
-      ok: true,
-      socketPath: SOCKET_PATH,
-      androidUrlMustBe:
-        "https://renderdepo-tpqh.onrender.com",
-      androidUrlMustNotInclude:
-        "/socket.io",
-      transports: [
-        "websocket",
-        "polling",
-      ],
-    });
-  }
-);
+app.get("/socket-check", (_req, res) => {
+  res.json({
+    ok: true,
+    socketPath: SOCKET_PATH,
+    androidUrlMustNotInclude: "/socket.io",
+    transports: ["websocket", "polling"],
+  });
+});
 
-io.engine.on(
-  "connection_error",
-  (err) => {
-    console.log(
-      "Engine.IO connection_error:",
-      {
-        code: err.code,
-        message: err.message,
-        context: err.context,
-        url:
-          err.req &&
-          err.req.url,
-        userAgent:
-          err.req &&
-          err.req.headers &&
-          err.req.headers[
-            "user-agent"
-          ],
-        origin:
-          err.req &&
-          err.req.headers &&
-          err.req.headers.origin,
-      }
-    );
-  }
-);
+io.engine.on("connection_error", (error) => {
+  if (!LOG_HTTP) return;
 
-io.engine.on(
-  "connection",
-  (rawSocket) => {
-    console.log(
-      "Engine.IO connected:",
-      rawSocket.id,
-      "transport:",
-      rawSocket.transport.name
-    );
-  }
-);
+  console.log("Engine.IO connection_error:", {
+    code: error.code,
+    message: error.message,
+    context: error.context,
+    url: error.req && error.req.url,
+    userAgent: error.req && error.req.headers && error.req.headers["user-agent"],
+    origin: error.req && error.req.headers && error.req.headers.origin,
+  });
+});
 
 io.on("connection", (socket) => {
-  console.log(
-    "Socket connected:",
-    socket.id,
-    "transport:",
-    socket.conn.transport.name
-  );
+  if (LOG_HTTP) {
+    console.log("Socket connected:", socket.id, "transport:", socket.conn.transport.name);
+  }
 
-  socket.conn.on(
-    "upgrade",
-    (transport) => {
-      console.log(
-        "Socket upgraded:",
-        socket.id,
-        "transport:",
-        transport.name
-      );
+  socket.conn.on("upgrade", (transport) => {
+    if (LOG_HTTP) {
+      console.log("Socket upgraded:", socket.id, "transport:", transport.name);
     }
-  );
+  });
 
-  socket.on(
-    "join_match",
-    (payload = {}) => {
-      const gameKey =
-        normalizeMatchGameKey(
-          payload.gameKey
-        );
+  socket.on("join_match", (payload = {}) => {
+    const gameKey = normalizeGameKey(payload.gameKey);
+    const difficulty = String(payload.difficulty || "Medium");
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
+    const puzzle = generateTargetNumberPuzzle(difficulty);
 
-      const difficulty = String(
-        payload.difficulty ||
-          "Medium"
-      );
+    removeFromAllQueues(socket.id, player.id);
+    removePrivateRoomsForSocket(socket.id);
+    leaveRoomAsCancel(socket);
 
-      const player = safePlayer(
-        payload.player,
-        `guest:${socket.id}`
-      );
+    const key = queueKey(gameKey, difficulty);
+    const queue = waitingQueues.get(key) || [];
 
-      const puzzle = safePuzzle(
-        payload.puzzle,
-        difficulty
-      );
+    while (queue.length > 0) {
+      const opponent = queue.shift();
+      const opponentSocket = io.sockets.sockets.get(opponent.socketId);
 
-      if (!puzzle) {
-        socket.emit(
-          "match_error",
-          {
-            message:
-              "Geçersiz puzzle verisi.",
-          }
-        );
-
-        return;
+      if (!opponentSocket || opponent.player.id === player.id) {
+        continue;
       }
 
-      removeFromAllQueues(
-        socket.id,
-        player.id
-      );
+      waitingQueues.set(key, queue);
 
-      removePrivateRoomsForSocket(
-        socket.id,
-        false
-      );
+      const selectedPuzzle = opponent.puzzle || puzzle;
 
-      leaveRoomAsCancel(socket);
-
-      const key = queueKey(
-        gameKey,
-        difficulty
-      );
-
-      const queue =
-        waitingQueues.get(key) || [];
-
-      while (queue.length > 0) {
-        const opponent =
-          queue.shift();
-
-        const opponentSocket =
-          io.sockets.sockets.get(
-            opponent.socketId
-          );
-
-        if (
-          !opponentSocket ||
-          opponentSocket.id === socket.id
-        ) {
-          continue;
-        }
-
-        if (
-          opponent.player?.id &&
-          opponent.player.id === player.id
-        ) {
-          continue;
-        }
-
-        waitingQueues.set(
-          key,
-          queue
-        );
-
-        const selectedPuzzle =
-          opponent.puzzle || puzzle;
-
-        const room =
-          createRealtimeRoom(
-            socket,
-            player,
-            opponentSocket,
-            opponent.player,
-            gameKey,
-            difficulty,
-            selectedPuzzle
-          );
-
-        socket.emit(
-          "match_found",
-          {
-            roomId: room.roomId,
-            opponent: {
-              name:
-                opponent.player.name,
-              country:
-                opponent.player.country,
-            },
-            puzzle: selectedPuzzle,
-          }
-        );
-
-        opponentSocket.emit(
-          "match_found",
-          {
-            roomId: room.roomId,
-            opponent: {
-              name: player.name,
-              country:
-                player.country,
-            },
-            puzzle: selectedPuzzle,
-          }
-        );
-
-        console.log(
-          "Match found:",
-          room.roomId,
-          key
-        );
-
-        return;
-      }
-
-      queue.push({
-        socketId: socket.id,
+      const room = createRealtimeRoom(
+        socket,
         player,
-        puzzle,
-        joinedAt: Date.now(),
-      });
-
-      waitingQueues.set(
-        key,
-        queue
-      );
-
-      socket.emit("waiting", {
+        opponentSocket,
+        opponent.player,
         gameKey,
         difficulty,
+        selectedPuzzle
+      );
+
+      socket.emit("match_found", {
+        roomId: room.roomId,
+        opponent: {
+          name: opponent.player.name,
+          country: opponent.player.country,
+        },
+        puzzle: selectedPuzzle,
       });
 
-      console.log(
-        "Player waiting:",
-        socket.id,
-        key,
-        player.id
-      );
+      opponentSocket.emit("match_found", {
+        roomId: room.roomId,
+        opponent: {
+          name: player.name,
+          country: player.country,
+        },
+        puzzle: selectedPuzzle,
+      });
+
+      return;
     }
-  );
 
-  socket.on(
-    "resume_match",
-    (payload = {}) => {
-      const roomId = String(
-        payload.roomId || ""
-      ).trim();
+    queue.push({
+      socketId: socket.id,
+      player,
+      puzzle,
+      joinedAt: Date.now(),
+    });
 
-      const player = safePlayer(
-        payload.player,
-        `guest:${socket.id}`
-      );
+    waitingQueues.set(key, queue);
 
-      const room =
-        realtimeRooms.get(roomId);
+    socket.emit("waiting", {
+      gameKey,
+      difficulty,
+    });
+  });
 
-      if (!roomId || !room) {
-        socket.emit(
-          "resume_error",
-          {
-            code: "ROOM_NOT_FOUND",
-            message:
-              "Yeniden bağlanılacak aktif oda bulunamadı.",
-          }
-        );
+  socket.on("create_friend_room", (payload = {}) => {
+    expireRooms();
 
-        return;
-      }
+    const gameKey = normalizeGameKey(payload.gameKey);
+    const difficulty = String(payload.difficulty || "Medium");
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
+    const roomCode = generateRoomCode();
 
-      const participant =
-        getParticipant(
-          room,
-          player.id
-        );
+    removeFromAllQueues(socket.id, player.id);
+    removePrivateRoomsForSocket(socket.id);
+    leaveRoomAsCancel(socket);
 
-      const opponent =
-        getOpponentParticipant(
-          room,
-          player.id
-        );
+    privateRooms.set(roomCode, {
+      roomCode,
+      ownerSocketId: socket.id,
+      gameKey,
+      difficulty,
+      player,
+      puzzle: generateTargetNumberPuzzle(difficulty),
+      createdAt: Date.now(),
+    });
 
-      if (!participant) {
-        socket.emit(
-          "resume_error",
-          {
-            code:
-              "PLAYER_NOT_FOUND",
-            message:
-              "Bu oyuncu için yeniden bağlanma bilgisi bulunamadı.",
-          }
-        );
+    socket.emit("friend_room_created", {
+      roomCode,
+      gameKey,
+      difficulty,
+    });
+  });
 
-        return;
-      }
+  socket.on("join_friend_room", (payload = {}) => {
+    expireRooms();
 
-      if (room.resolved) {
-        socket.emit(
-          "resume_error",
-          {
-            code:
-              "MATCH_RESOLVED",
-            message:
-              "Bu maç zaten sona ermiş.",
-            opponentFinishedMs:
-              Number(
-                opponent?.elapsedMs ||
-                  0
-              ),
-          }
-        );
+    const roomCode = normalizeRoomCode(payload.roomCode);
+    const room = privateRooms.get(roomCode);
 
-        return;
-      }
-
-      if (
-        participant.awaySince &&
-        Date.now() >
-          participant.awaySince +
-            ROOM_RECONNECT_TIMEOUT_MS
-      ) {
-        resolveRoomByAwayTimeout(
-          room.roomId,
-          participant.playerId
-        );
-
-        socket.emit(
-          "resume_error",
-          {
-            code:
-              "RECONNECT_EXPIRED",
-            message:
-              "1 dakikalık yeniden bağlanma süresi doldu.",
-            opponentFinishedMs:
-              Number(
-                opponent?.elapsedMs ||
-                  0
-              ),
-          }
-        );
-
-        return;
-      }
-
-      if (
-        participant.socketId &&
-        participant.socketId !==
-          socket.id
-      ) {
-        activeRooms.delete(
-          participant.socketId
-        );
-      }
-
-      attachSocketToRoom(
-        socket,
-        room,
-        participant.playerId
-      );
-
-      clearParticipantAwayState(
-        room,
-        participant.playerId
-      );
-
-      socket.emit(
-        "resume_state",
-        {
-          roomId: room.roomId,
-
-          opponent: {
-            name:
-              opponent?.name ||
-              "Rakip",
-            country:
-              opponent?.country ||
-              "",
-          },
-
-          puzzle: room.puzzle,
-
-          opponentFinishedMs:
-            Number(
-              opponent?.elapsedMs ||
-                0
-            ),
-        }
-      );
-
-      console.log(
-        "Match resumed:",
-        room.roomId,
-        participant.playerId,
-        socket.id
-      );
+    if (!roomCode || roomCode.length !== 6) {
+      return socket.emit("friend_room_error", {
+        message: "Geçerli 6 haneli oda kodu gir.",
+      });
     }
-  );
 
-  socket.on(
-    "player_backgrounded",
-    (payload = {}) => {
-      const fallbackActive =
-        activeRooms.get(socket.id);
-
-      const roomId = String(
-        payload.roomId ||
-          fallbackActive?.roomId ||
-          ""
-      ).trim();
-
-      const room =
-        realtimeRooms.get(roomId);
-
-      const playerId =
-        fallbackActive?.playerId ||
-        roomParticipants(room).find(
-          (item) =>
-            item.socketId ===
-            socket.id
-        )?.playerId;
-
-      const participant =
-        getParticipant(
-          room,
-          playerId
-        );
-
-      if (
-        !room ||
-        !participant ||
-        room.resolved ||
-        participant.finishedAt
-      ) {
-        return;
-      }
-
-      if (!participant.awaySince) {
-        participant.awaySince =
-          Date.now();
-      }
-
-      participant.backgrounded = true;
-
-      scheduleParticipantAwayTimeout(
-        room,
-        participant.playerId
-      );
-
-      console.log(
-        "Player backgrounded:",
-        roomId,
-        participant.playerId
-      );
+    if (!room) {
+      return socket.emit("friend_room_error", {
+        message: "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
+      });
     }
-  );
 
-  socket.on(
-    "player_foregrounded",
-    (payload = {}) => {
-      const fallbackActive =
-        activeRooms.get(socket.id);
-
-      const roomId = String(
-        payload.roomId ||
-          fallbackActive?.roomId ||
-          ""
-      ).trim();
-
-      const room =
-        realtimeRooms.get(roomId);
-
-      const playerId =
-        fallbackActive?.playerId ||
-        roomParticipants(room).find(
-          (item) =>
-            item.socketId ===
-            socket.id
-        )?.playerId;
-
-      const participant =
-        getParticipant(
-          room,
-          playerId
-        );
-
-      if (!room || !participant) {
-        return;
-      }
-
-      if (
-        room.resolved &&
-        room.loserPlayerId ===
-          participant.playerId
-      ) {
-        socket.emit(
-          "resume_error",
-          {
-            code:
-              "RECONNECT_EXPIRED",
-            message:
-              "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
-            opponentFinishedMs:
-              Number(
-                getOpponentParticipant(
-                  room,
-                  participant.playerId
-                )?.elapsedMs || 0
-              ),
-          }
-        );
-
-        return;
-      }
-
-      clearParticipantAwayState(
-        room,
-        participant.playerId
-      );
-
-      console.log(
-        "Player foregrounded:",
-        roomId,
-        participant.playerId
-      );
+    if (room.ownerSocketId === socket.id) {
+      return socket.emit("friend_room_error", {
+        message: "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
+      });
     }
-  );
 
-  socket.on(
-    "create_friend_room",
-    (payload = {}) => {
-      expireOldPrivateRooms();
+    const ownerSocket = io.sockets.sockets.get(room.ownerSocketId);
 
-      const gameKey = String(
-        payload.gameKey ||
-          "target_number"
-      );
-
-      const difficulty = String(
-        payload.difficulty ||
-          "Medium"
-      );
-
-      const player = safePlayer(
-        payload.player,
-        `guest:${socket.id}`
-      );
-
-      const puzzle = safePuzzle(
-        payload.puzzle,
-        difficulty
-      );
-
-      if (!puzzle) {
-        socket.emit(
-          "friend_room_error",
-          {
-            message:
-              "Geçersiz puzzle verisi.",
-          }
-        );
-
-        return;
-      }
-
-      removeFromAllQueues(
-        socket.id,
-        player.id
-      );
-
-      removePrivateRoomsForSocket(
-        socket.id,
-        false
-      );
-
-      leaveRoomAsCancel(socket);
-
-      const roomCode =
-        generateUniqueRoomCode();
-
-      privateRooms.set(
-        roomCode,
-        {
-          roomCode,
-          ownerSocketId: socket.id,
-          gameKey,
-          difficulty,
-          player,
-          puzzle,
-          createdAt: Date.now(),
-        }
-      );
-
-      socket.emit(
-        "friend_room_created",
-        {
-          roomCode,
-          gameKey,
-          difficulty,
-        }
-      );
-
-      console.log(
-        "Friend room created:",
-        roomCode,
-        socket.id,
-        queueKey(
-          gameKey,
-          difficulty
-        )
-      );
-    }
-  );
-
-  socket.on(
-    "join_friend_room",
-    (payload = {}) => {
-      expireOldPrivateRooms();
-
-      const roomCode =
-        normalizeRoomCode(
-          payload.roomCode
-        );
-
-      const room =
-        privateRooms.get(roomCode);
-
-      if (
-        !roomCode ||
-        roomCode.length !== 6
-      ) {
-        socket.emit(
-          "friend_room_error",
-          {
-            message:
-              "Geçerli 6 haneli oda kodu gir.",
-          }
-        );
-
-        return;
-      }
-
-      if (!room) {
-        socket.emit(
-          "friend_room_error",
-          {
-            message:
-              "Oda bulunamadı. Kodu kontrol edip tekrar deneyin.",
-          }
-        );
-
-        return;
-      }
-
-      if (
-        room.ownerSocketId ===
-        socket.id
-      ) {
-        socket.emit(
-          "friend_room_error",
-          {
-            message:
-              "Kendi oluşturduğun odaya aynı cihazdan katılamazsın.",
-          }
-        );
-
-        return;
-      }
-
-      const ownerSocket =
-        io.sockets.sockets.get(
-          room.ownerSocketId
-        );
-
-      if (!ownerSocket) {
-        privateRooms.delete(
-          roomCode
-        );
-
-        socket.emit(
-          "friend_room_error",
-          {
-            message:
-              "Oda sahibi bağlantıdan ayrılmış.",
-          }
-        );
-
-        return;
-      }
-
-      const player = safePlayer(
-        payload.player,
-        `guest:${socket.id}`
-      );
-
-      removeFromAllQueues(
-        socket.id,
-        player.id
-      );
-
-      removePrivateRoomsForSocket(
-        socket.id,
-        false
-      );
-
-      leaveRoomAsCancel(socket);
-
+    if (!ownerSocket) {
       privateRooms.delete(roomCode);
 
-      const realtimeRoom =
-        createRealtimeRoom(
-          socket,
-          player,
-          ownerSocket,
-          room.player,
-          room.gameKey,
-          room.difficulty,
-          room.puzzle
-        );
-
-      socket.emit(
-        "match_found",
-        {
-          roomId:
-            realtimeRoom.roomId,
-          roomCode,
-
-          opponent: {
-            name:
-              room.player.name,
-            country:
-              room.player.country,
-          },
-
-          puzzle: room.puzzle,
-        }
-      );
-
-      ownerSocket.emit(
-        "match_found",
-        {
-          roomId:
-            realtimeRoom.roomId,
-          roomCode,
-
-          opponent: {
-            name: player.name,
-            country:
-              player.country,
-          },
-
-          puzzle: room.puzzle,
-        }
-      );
-
-      console.log(
-        "Friend match found:",
-        roomCode,
-        realtimeRoom.roomId,
-        queueKey(
-          room.gameKey,
-          room.difficulty
-        )
-      );
+      return socket.emit("friend_room_error", {
+        message: "Oda sahibi bağlantıdan ayrılmış.",
+      });
     }
-  );
 
-  socket.on(
-    "player_finished",
-    (payload = {}) => {
-      const roomId = String(
-        payload.roomId || ""
-      ).trim();
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
 
-      const elapsedMs = Math.max(
-        1,
-        Number(
-          payload.elapsedMs || 0
-        )
-      );
+    privateRooms.delete(roomCode);
+    removeFromAllQueues(socket.id, player.id);
+    removePrivateRoomsForSocket(socket.id);
+    leaveRoomAsCancel(socket);
 
-      const room =
-        realtimeRooms.get(roomId);
+    const realtimeRoom = createRealtimeRoom(
+      socket,
+      player,
+      ownerSocket,
+      room.player,
+      room.gameKey,
+      room.difficulty,
+      room.puzzle
+    );
 
-      const active =
-        activeRooms.get(socket.id);
+    socket.emit("match_found", {
+      roomId: realtimeRoom.roomId,
+      roomCode,
+      opponent: {
+        name: room.player.name,
+        country: room.player.country,
+      },
+      puzzle: room.puzzle,
+    });
 
-      const playerId =
-        active?.playerId ||
-        roomParticipants(room).find(
-          (item) =>
-            item.socketId ===
-            socket.id
-        )?.playerId;
+    ownerSocket.emit("match_found", {
+      roomId: realtimeRoom.roomId,
+      roomCode,
+      opponent: {
+        name: player.name,
+        country: player.country,
+      },
+      puzzle: room.puzzle,
+    });
+  });
 
-      const participant =
-        getParticipant(
-          room,
-          playerId
-        );
+  socket.on("resume_match", (payload = {}) => {
+    const roomId = String(payload.roomId || "").trim();
+    const player = safePlayer(payload.player, `guest:${socket.id}`);
+    const room = realtimeRooms.get(roomId);
+    const participant = getParticipant(room, player.id);
+    const opponent = getOpponent(room, player.id);
 
-      const opponent =
-        getOpponentParticipant(
-          room,
-          playerId
-        );
-
-      if (
-        !room ||
-        !participant ||
-        !Number.isFinite(elapsedMs) ||
-        room.resolved
-      ) {
-        return;
-      }
-
-      participant.finishedAt =
-        Date.now();
-
-      participant.elapsedMs =
-        Math.floor(elapsedMs);
-
-      clearParticipantAwayState(
-        room,
-        participant.playerId
-      );
-
-      markRoomResolved(
-        room,
-        "finished",
-        participant.playerId,
-        opponent?.playerId
-      );
-
-      const opponentSocket =
-        opponent?.socketId
-          ? io.sockets.sockets.get(
-              opponent.socketId
-            )
-          : null;
-
-      if (opponentSocket) {
-        opponentSocket.emit(
-          "opponent_finished",
-          {
-            roomId,
-            elapsedMs:
-              participant.elapsedMs,
-          }
-        );
-      }
+    if (!room || !participant) {
+      return socket.emit("resume_error", {
+        code: "ROOM_NOT_FOUND",
+        message: "Yeniden bağlanılacak aktif oda bulunamadı.",
+      });
     }
-  );
 
-  socket.on(
-    "cancel_match",
-    () => {
-      removeFromAllQueues(socket.id);
-
-      removePrivateRoomsForSocket(
-        socket.id,
-        false
-      );
-
-      leaveRoomAsCancel(socket);
+    if (room.resolved) {
+      return socket.emit("resume_error", {
+        code: "MATCH_RESOLVED",
+        message: "Bu maç zaten sona ermiş.",
+        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+      });
     }
-  );
 
-  socket.on(
-    "disconnect",
-    (reason) => {
-      console.log(
-        "Socket disconnected:",
-        socket.id,
-        reason
-      );
+    if (
+      participant.awaySince &&
+      Date.now() > participant.awaySince + ROOM_RECONNECT_TIMEOUT_MS
+    ) {
+      resolveRoom(room, "reconnect_timeout", opponent?.playerId, participant.playerId);
 
-      removeFromAllQueues(socket.id);
-
-      removePrivateRoomsForSocket(
-        socket.id,
-        false
-      );
-
-      markSocketDisconnected(socket);
+      return socket.emit("resume_error", {
+        code: "RECONNECT_EXPIRED",
+        message: "1 dakikalık yeniden bağlanma süresi doldu.",
+        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+      });
     }
-  );
+
+    if (participant.socketId && participant.socketId !== socket.id) {
+      activeRooms.delete(participant.socketId);
+    }
+
+    attachSocketToRoom(socket, room, participant.playerId);
+    clearAwayTimeout(participant);
+
+    socket.emit("resume_state", {
+      roomId: room.roomId,
+      opponent: {
+        name: opponent?.name || "Rakip",
+        country: opponent?.country || "",
+      },
+      puzzle: room.puzzle,
+      opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+    });
+  });
+
+  socket.on("player_backgrounded", (payload = {}) => {
+    const active = activeRooms.get(socket.id);
+    const room = realtimeRooms.get(String(payload.roomId || active?.roomId || "").trim());
+    const participant = getParticipant(room, active?.playerId);
+
+    if (!room || !participant || room.resolved || participant.finishedAt) {
+      return;
+    }
+
+    participant.awaySince = participant.awaySince || Date.now();
+    scheduleAwayTimeout(room, participant.playerId);
+  });
+
+  socket.on("player_foregrounded", (payload = {}) => {
+    const active = activeRooms.get(socket.id);
+    const room = realtimeRooms.get(String(payload.roomId || active?.roomId || "").trim());
+    const participant = getParticipant(room, active?.playerId);
+
+    if (!room || !participant) {
+      return;
+    }
+
+    if (room.resolved && room.loserPlayerId === participant.playerId) {
+      return socket.emit("resume_error", {
+        code: "RECONNECT_EXPIRED",
+        message: "1 dakika içinde oyuna dönmediğiniz için mağlup sayıldınız.",
+      });
+    }
+
+    clearAwayTimeout(participant);
+  });
+
+  socket.on("player_finished", (payload = {}) => {
+    const roomId = String(payload.roomId || "").trim();
+    const room = realtimeRooms.get(roomId);
+    const active = activeRooms.get(socket.id);
+    const participant = getParticipant(room, active?.playerId);
+    const opponent = getOpponent(room, active?.playerId);
+    const elapsedMs = Math.max(1, Number(payload.elapsedMs || 0));
+
+    if (!room || !participant || !Number.isFinite(elapsedMs) || room.resolved) {
+      return;
+    }
+
+    participant.finishedAt = Date.now();
+    participant.elapsedMs = Math.floor(elapsedMs);
+    clearAwayTimeout(participant);
+
+    resolveRoom(room, "finished", participant.playerId, opponent?.playerId);
+
+    const opponentSocket = opponent?.socketId
+      ? io.sockets.sockets.get(opponent.socketId)
+      : null;
+
+    if (opponentSocket) {
+      opponentSocket.emit("opponent_finished", {
+        roomId,
+        elapsedMs: participant.elapsedMs,
+      });
+    }
+  });
+
+  socket.on("cancel_match", () => {
+    removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id);
+    leaveRoomAsCancel(socket);
+  });
+
+  socket.on("disconnect", (reason) => {
+    if (LOG_HTTP) {
+      console.log("Socket disconnected:", socket.id, reason);
+    }
+
+    const active = activeRooms.get(socket.id);
+    const room = realtimeRooms.get(active?.roomId);
+    const participant = getParticipant(room, active?.playerId);
+
+    removeFromAllQueues(socket.id);
+    removePrivateRoomsForSocket(socket.id);
+
+    if (!room || !participant) {
+      return;
+    }
+
+    activeRooms.delete(socket.id);
+    participant.connected = false;
+    participant.socketId = null;
+
+    if (!room.resolved && !participant.finishedAt) {
+      participant.awaySince = participant.awaySince || Date.now();
+      scheduleAwayTimeout(room, participant.playerId);
+    }
+  });
 });
 
-setInterval(() => {
-  expireOldPrivateRooms();
-  expireResolvedRooms();
-}, 60_000).unref();
+setInterval(expireRooms, 60_000).unref();
 
-const PORT = Number(
-  process.env.PORT || 10000
-);
+const PORT = Number(process.env.PORT || 10000);
 
 initDatabase()
   .catch((error) => {
-    console.error(
-      "Database init failed:",
-      {
-        message: error.message,
-        code: error.code,
-        detail: error.detail,
-        stack: error.stack,
-      }
-    );
+    console.error("Database init failed:", {
+      message: error.message,
+      code: error.code,
+      detail: error.detail,
+      stack: error.stack,
+    });
   })
   .finally(() => {
-    server.listen(
-      PORT,
-      "0.0.0.0",
-      () => {
-        console.log(
-          `Target number matchmaking server running on port ${PORT}`
-        );
-      }
-    );
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`Target number matchmaking server running on port ${PORT}`);
+    });
   });
