@@ -71,6 +71,19 @@ async function initDatabase() {
       PRIMARY KEY (player_id, month_key)
     );
 
+    CREATE TABLE IF NOT EXISTS player_game_rights (
+      player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      remaining_rights INTEGER NOT NULL DEFAULT 10 CHECK (remaining_rights >= 0),
+      last_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS player_xp (
+      player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      total_xp INTEGER NOT NULL DEFAULT 0 CHECK (total_xp >= 0),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_player_scores_general
       ON player_scores (general_score DESC);
 
@@ -1056,17 +1069,31 @@ function safePlayer(
   };
 }
 
+function normalizeDifficulty(value) {
+  return String(value || "Medium") === "Hard"
+    ? "Hard"
+    : "Medium";
+}
+
 function safePuzzle(
   rawPuzzle,
   difficulty
 ) {
+  const normalizedDifficulty = normalizeDifficulty(
+    rawPuzzle?.difficulty || difficulty
+  );
+
+  const expectedCount =
+    normalizedDifficulty === "Hard" ? 4 : 3;
+
   const numbers = Array.isArray(
     rawPuzzle?.numbers
   )
     ? rawPuzzle.numbers
         .map((n) => Number(n))
         .filter((n) => Number.isFinite(n))
-        .slice(0, 8)
+        .map((n) => Math.floor(n))
+        .slice(0, expectedCount)
     : [];
 
   const target = Number(rawPuzzle?.target);
@@ -1074,22 +1101,252 @@ function safePuzzle(
   if (
     !Number.isFinite(target) ||
     target <= 0 ||
-    numbers.length < 3
+    numbers.length !== expectedCount
   ) {
     return null;
   }
 
   return {
-    difficulty: String(
-      rawPuzzle?.difficulty ||
-        difficulty ||
-        "Medium"
-    ),
+    difficulty: normalizedDifficulty,
     target: Math.floor(target),
-    numbers: numbers.map(
-      (n) => Math.floor(n)
-    ),
+    numbers,
   };
+}
+
+function evaluateWithOperatorPrecedence(
+  orderedNumbers,
+  operators
+) {
+  if (
+    !Array.isArray(orderedNumbers) ||
+    !Array.isArray(operators) ||
+    orderedNumbers.length === 0 ||
+    operators.length !== orderedNumbers.length - 1
+  ) {
+    return null;
+  }
+
+  let values = orderedNumbers.map((value) => Number(value));
+  let ops = operators.map((op) =>
+    String(op || "")
+      .replace("-", "−")
+      .replace("*", "×")
+      .replace("/", "÷")
+  );
+
+  if (values.some((value) => !Number.isFinite(value))) {
+    return null;
+  }
+
+  for (let index = 0; index < ops.length; ) {
+    const op = ops[index];
+
+    if (op !== "×" && op !== "÷") {
+      index += 1;
+      continue;
+    }
+
+    const left = values[index];
+    const right = values[index + 1];
+    const result = op === "×" ? left * right : right === 0 ? null : left / right;
+
+    if (result === null || !Number.isFinite(result)) {
+      return null;
+    }
+
+    values.splice(index, 2, result);
+    ops.splice(index, 1);
+  }
+
+  let result = values[0];
+  for (let index = 0; index < ops.length; index += 1) {
+    const op = ops[index];
+    const next = values[index + 1];
+
+    if (op === "+") {
+      result += next;
+    } else if (op === "−") {
+      result -= next;
+    } else {
+      return null;
+    }
+  }
+
+  return Number.isFinite(result) ? result : null;
+}
+
+function buildSolvableTarget(
+  numbers,
+  targetMin,
+  targetMax,
+  requireMultiplyOrDivide
+) {
+  const operators = ["+", "−", "×", "÷"];
+
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    const orderedNumbers = [...numbers].sort(
+      () => crypto.randomInt(0, 3) - 1
+    );
+
+    const selectedOperators = Array.from(
+      { length: numbers.length - 1 },
+      () => operators[crypto.randomInt(0, operators.length)]
+    );
+
+    const usesMultiplyOrDivide = selectedOperators.some(
+      (op) => op === "×" || op === "÷"
+    );
+
+    if (requireMultiplyOrDivide && !usesMultiplyOrDivide) {
+      continue;
+    }
+
+    const result = evaluateWithOperatorPrecedence(
+      orderedNumbers,
+      selectedOperators
+    );
+
+    if (result === null) continue;
+
+    const rounded = Math.round(result);
+    if (
+      Math.abs(result - rounded) < 0.0001 &&
+      rounded >= targetMin &&
+      rounded <= targetMax
+    ) {
+      return rounded;
+    }
+  }
+
+  return null;
+}
+
+function generateNumberPool(
+  count,
+  minInclusive,
+  maxInclusive
+) {
+  const numbers = [];
+  let oneUsed = false;
+
+  while (numbers.length < count) {
+    const number = crypto.randomInt(
+      minInclusive,
+      maxInclusive + 1
+    );
+
+    if (number === 1 && oneUsed) continue;
+    if (number === 1) oneUsed = true;
+    numbers.push(number);
+  }
+
+  return numbers.sort(() => crypto.randomInt(0, 3) - 1);
+}
+
+function generateTargetNumberPuzzle(difficulty) {
+  const normalizedDifficulty = normalizeDifficulty(difficulty);
+  const count = normalizedDifficulty === "Hard" ? 4 : 3;
+  const minInclusive = normalizedDifficulty === "Hard" ? 2 : 1;
+  const maxInclusive = normalizedDifficulty === "Hard" ? 20 : 9;
+  const targetMin = normalizedDifficulty === "Hard" ? 21 : 1;
+  const targetMax = normalizedDifficulty === "Hard" ? 199 : 49;
+  const requireMultiplyOrDivide = normalizedDifficulty === "Hard";
+
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
+    const numbers = generateNumberPool(
+      count,
+      minInclusive,
+      maxInclusive
+    );
+
+    const target = buildSolvableTarget(
+      numbers,
+      targetMin,
+      targetMax,
+      requireMultiplyOrDivide
+    );
+
+    if (target !== null) {
+      return {
+        difficulty: normalizedDifficulty,
+        target,
+        numbers,
+      };
+    }
+  }
+
+  const fallbackNumbers =
+    normalizedDifficulty === "Hard"
+      ? [10, 10, 5, 4]
+      : [3, 5, 7];
+
+  return {
+    difficulty: normalizedDifficulty,
+    target: normalizedDifficulty === "Hard" ? 24 : 15,
+    numbers: fallbackNumbers.sort(() => crypto.randomInt(0, 3) - 1),
+  };
+}
+
+function validateTargetNumberSolution(
+  puzzle,
+  numberSlots,
+  operatorSlots
+) {
+  const cleanPuzzle = safePuzzle(puzzle, puzzle?.difficulty);
+  if (!cleanPuzzle) return false;
+
+  if (
+    !Array.isArray(numberSlots) ||
+    !Array.isArray(operatorSlots) ||
+    numberSlots.length !== cleanPuzzle.numbers.length ||
+    operatorSlots.length !== cleanPuzzle.numbers.length - 1
+  ) {
+    return false;
+  }
+
+  const used = new Set();
+  const orderedNumbers = [];
+
+  for (const rawIndex of numberSlots) {
+    const index = Number(rawIndex);
+
+    if (
+      !Number.isInteger(index) ||
+      index < 0 ||
+      index >= cleanPuzzle.numbers.length ||
+      used.has(index)
+    ) {
+      return false;
+    }
+
+    used.add(index);
+    orderedNumbers.push(cleanPuzzle.numbers[index]);
+  }
+
+  const normalizedOperators = operatorSlots.map((op) =>
+    String(op || "")
+      .replace("-", "−")
+      .replace("*", "×")
+      .replace("/", "÷")
+  );
+
+  if (
+    normalizedOperators.some(
+      (op) => !["+", "−", "×", "÷"].includes(op)
+    )
+  ) {
+    return false;
+  }
+
+  const result = evaluateWithOperatorPrecedence(
+    orderedNumbers,
+    normalizedOperators
+  );
+
+  return (
+    result !== null &&
+    Math.abs(result - cleanPuzzle.target) < 0.0001
+  );
 }
 
 function normalizeRoomCode(value) {
@@ -1397,6 +1654,8 @@ function createRealtimeRoom(
     difficulty,
     puzzle,
     createdAt: Date.now(),
+    // Güvenlik için gerçek süreyi istemciden değil sunucu saatinden hesaplıyoruz.
+    startedAt: Date.now(),
     resolved: false,
     resolvedReason: null,
     resolvedAt: null,
@@ -1838,6 +2097,333 @@ io.engine.on(
   }
 );
 
+
+const MAX_GAME_RIGHTS = Number(process.env.MAX_GAME_RIGHTS || 10);
+const GAME_RIGHT_REFILL_MS = Number(
+  process.env.GAME_RIGHT_REFILL_MS || 10 * 60 * 1000
+);
+
+function targetNumberRewardForMode(payload) {
+  const mode = String(payload.mode || "single");
+  const difficulty = normalizeDifficulty(payload.difficulty);
+  const stage = Math.max(1, Math.floor(Number(payload.stage || 1)));
+
+  if (mode === "infinite") {
+    return {
+      generalDelta: Math.min(250, 5 + stage * 2),
+      infiniteDelta: Math.min(250, 5 + stage * 2),
+      xp: Math.min(500, 5 + stage * 3),
+    };
+  }
+
+  if (mode === "tournament") {
+    return {
+      generalDelta: stage >= 12 ? 300 : 0,
+      infiniteDelta: 0,
+      xp: difficulty === "Hard" ? 30 : 20,
+    };
+  }
+
+  if (mode === "hundred") {
+    return {
+      generalDelta: stage >= 12 ? 480 : stage * 10,
+      infiniteDelta: 0,
+      xp: stage >= 12 ? 480 : stage * 20,
+    };
+  }
+
+  return {
+    generalDelta: difficulty === "Hard" ? 15 : 10,
+    infiniteDelta: 0,
+    xp: difficulty === "Hard" ? 15 : 10,
+  };
+}
+
+async function ensurePlayerProgressRows(client, playerId) {
+  await ensurePlayerScoreRow(client, playerId);
+  await client.query(
+    `INSERT INTO player_game_rights (player_id)
+     VALUES ($1)
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId]
+  );
+  await client.query(
+    `INSERT INTO player_xp (player_id)
+     VALUES ($1)
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId]
+  );
+}
+
+async function readAndRefillRights(client, playerId) {
+  await client.query(
+    `INSERT INTO player_game_rights (
+       player_id,
+       remaining_rights,
+       last_refill_at,
+       updated_at
+     )
+     VALUES ($1, $2, NOW(), NOW())
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId, MAX_GAME_RIGHTS]
+  );
+
+  const result = await client.query(
+    `SELECT
+       remaining_rights,
+       last_refill_at,
+       updated_at
+     FROM player_game_rights
+     WHERE player_id = $1
+     FOR UPDATE`,
+    [playerId]
+  );
+
+  const row = result.rows[0];
+  const lastRefillAt = new Date(row.last_refill_at).getTime();
+  const now = Date.now();
+  const elapsedMs = Math.max(0, now - lastRefillAt);
+  const refillCount = Math.floor(elapsedMs / GAME_RIGHT_REFILL_MS);
+
+  let remainingRights = Math.max(
+    0,
+    Math.min(Number(row.remaining_rights || 0), MAX_GAME_RIGHTS)
+  );
+  let nextRefillAtMillis =
+    remainingRights >= MAX_GAME_RIGHTS
+      ? 0
+      : lastRefillAt + GAME_RIGHT_REFILL_MS;
+
+  if (refillCount > 0 && remainingRights < MAX_GAME_RIGHTS) {
+    remainingRights = Math.min(
+      MAX_GAME_RIGHTS,
+      remainingRights + refillCount
+    );
+
+    const updatedLastRefillAt =
+      remainingRights >= MAX_GAME_RIGHTS
+        ? now
+        : lastRefillAt + refillCount * GAME_RIGHT_REFILL_MS;
+
+    await client.query(
+      `UPDATE player_game_rights
+       SET
+         remaining_rights = $2,
+         last_refill_at = TO_TIMESTAMP($3 / 1000.0),
+         updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, remainingRights, updatedLastRefillAt]
+    );
+
+    nextRefillAtMillis =
+      remainingRights >= MAX_GAME_RIGHTS
+        ? 0
+        : updatedLastRefillAt + GAME_RIGHT_REFILL_MS;
+  }
+
+  return {
+    remainingRights,
+    maxRights: MAX_GAME_RIGHTS,
+    millisUntilNextRight:
+      nextRefillAtMillis > 0
+        ? Math.max(0, nextRefillAtMillis - now)
+        : 0,
+  };
+}
+
+app.post("/target/puzzle", (req, res) => {
+  const difficulty = normalizeDifficulty(req.body.difficulty);
+  res.json({
+    ok: true,
+    puzzle: generateTargetNumberPuzzle(difficulty),
+  });
+});
+
+app.post("/target/solution/verify", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safeLeaderboardPlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+  const puzzle = safePuzzle(req.body.puzzle, req.body.difficulty);
+
+  if (!playerId || !puzzle) {
+    res.status(400).json({
+      ok: false,
+      message: "playerId ve geçerli puzzle zorunlu.",
+    });
+    return;
+  }
+
+  const valid = validateTargetNumberSolution(
+    puzzle,
+    req.body.numberSlots,
+    req.body.operatorSlots
+  );
+
+  if (!valid) {
+    res.status(400).json({
+      ok: false,
+      message: "Çözüm doğrulanamadı.",
+    });
+    return;
+  }
+
+  const reward = targetNumberRewardForMode({
+    mode: req.body.mode,
+    difficulty: puzzle.difficulty,
+    stage: req.body.stage,
+  });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensurePlayerForScore(client, playerId, username, country);
+    await ensurePlayerProgressRows(client, playerId);
+
+    await client.query(
+      `UPDATE player_scores
+       SET
+         general_score = LEAST(general_score + $2, 2000000000),
+         infinite_score = LEAST(infinite_score + $3, 2000000000),
+         updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, reward.generalDelta, reward.infiniteDelta]
+    );
+
+    await client.query(
+      `INSERT INTO player_monthly_scores
+         (player_id, month_key, general_score, infinite_score, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (player_id, month_key)
+       DO UPDATE SET
+         general_score = LEAST(player_monthly_scores.general_score + $3, 2000000000),
+         infinite_score = LEAST(player_monthly_scores.infinite_score + $4, 2000000000),
+         updated_at = NOW()`,
+      [
+        playerId,
+        currentMonthKey(),
+        reward.generalDelta,
+        reward.infiniteDelta,
+      ]
+    );
+
+    await client.query(
+      `UPDATE player_xp
+       SET
+         total_xp = LEAST(total_xp + $2, 2000000000),
+         updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, reward.xp]
+    );
+
+    await client.query("COMMIT");
+    res.json({
+      ok: true,
+      reward,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(
+      res,
+      error,
+      "Ödül doğrulanamadı.",
+      "target solution verify error:"
+    );
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/game-rights/status", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safeLeaderboardPlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    res.status(400).json({ ok: false, message: "playerId zorunlu." });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensurePlayerForScore(client, playerId, username, country);
+    await ensurePlayerProgressRows(client, playerId);
+    const state = await readAndRefillRights(client, playerId);
+    await client.query("COMMIT");
+    res.json({ ok: true, ...state });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Oyun hakkı okunamadı.", "game rights status error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/game-rights/consume", async (req, res) => {
+  if (!requireDatabase(res)) return;
+
+  const playerId = safeLeaderboardPlayerId(req.body.playerId);
+  const username = safeUsername(req.body.username);
+  const country = safeCountry(req.body.country);
+
+  if (!playerId) {
+    res.status(400).json({ ok: false, message: "playerId zorunlu." });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensurePlayerForScore(client, playerId, username, country);
+    await ensurePlayerProgressRows(client, playerId);
+    const state = await readAndRefillRights(client, playerId);
+
+    if (state.remainingRights <= 0) {
+      await client.query("COMMIT");
+      res.status(409).json({
+        ok: false,
+        consumed: false,
+        message: "Oyun hakkınız kalmadı.",
+        ...state,
+      });
+      return;
+    }
+
+    const updatedRights = state.remainingRights - 1;
+    await client.query(
+      `UPDATE player_game_rights
+       SET
+         remaining_rights = $2,
+         last_refill_at = CASE
+           WHEN $3 THEN NOW()
+           ELSE last_refill_at
+         END,
+         updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, updatedRights, state.remainingRights >= MAX_GAME_RIGHTS]
+    );
+
+    await client.query("COMMIT");
+    res.json({
+      ok: true,
+      consumed: true,
+      remainingRights: updatedRights,
+      maxRights: MAX_GAME_RIGHTS,
+      millisUntilNextRight:
+        updatedRights >= MAX_GAME_RIGHTS ? 0 : GAME_RIGHT_REFILL_MS,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Oyun hakkı tüketilemedi.", "game rights consume error:");
+  } finally {
+    client.release();
+  }
+});
+
 io.on("connection", (socket) => {
   console.log(
     "Socket connected:",
@@ -1875,23 +2461,6 @@ io.on("connection", (socket) => {
         payload.player,
         `guest:${socket.id}`
       );
-
-      const puzzle = safePuzzle(
-        payload.puzzle,
-        difficulty
-      );
-
-      if (!puzzle) {
-        socket.emit(
-          "match_error",
-          {
-            message:
-              "Geçersiz puzzle verisi.",
-          }
-        );
-
-        return;
-      }
 
       removeFromAllQueues(
         socket.id,
@@ -1941,8 +2510,9 @@ io.on("connection", (socket) => {
           queue
         );
 
+        // Puzzle artık istemciden alınmaz; oda oluştuğu anda sunucu üretir.
         const selectedPuzzle =
-          opponent.puzzle || puzzle;
+          generateTargetNumberPuzzle(difficulty);
 
         const room =
           createRealtimeRoom(
@@ -1994,7 +2564,6 @@ io.on("connection", (socket) => {
       queue.push({
         socketId: socket.id,
         player,
-        puzzle,
         joinedAt: Date.now(),
       });
 
@@ -2322,22 +2891,8 @@ io.on("connection", (socket) => {
         `guest:${socket.id}`
       );
 
-      const puzzle = safePuzzle(
-        payload.puzzle,
-        difficulty
-      );
-
-      if (!puzzle) {
-        socket.emit(
-          "friend_room_error",
-          {
-            message:
-              "Geçersiz puzzle verisi.",
-          }
-        );
-
-        return;
-      }
+      // Arkadaş odasının puzzle'ı da istemciden alınmaz; oda sahibi sadece zorluk seçer.
+      const puzzle = generateTargetNumberPuzzle(difficulty);
 
       removeFromAllQueues(
         socket.id,
@@ -2548,13 +3103,6 @@ io.on("connection", (socket) => {
         payload.roomId || ""
       ).trim();
 
-      const elapsedMs = Math.max(
-        1,
-        Number(
-          payload.elapsedMs || 0
-        )
-      );
-
       const room =
         realtimeRooms.get(roomId);
 
@@ -2584,17 +3132,52 @@ io.on("connection", (socket) => {
       if (
         !room ||
         !participant ||
-        !Number.isFinite(elapsedMs) ||
         room.resolved
       ) {
         return;
       }
 
-      participant.finishedAt =
-        Date.now();
+      const solution =
+        payload.solution || {};
 
-      participant.elapsedMs =
-        Math.floor(elapsedMs);
+      const validSolution =
+        validateTargetNumberSolution(
+          room.puzzle,
+          solution.numberSlots,
+          solution.operatorSlots
+        );
+
+      if (!validSolution) {
+        socket.emit(
+          "match_error",
+          {
+            message:
+              "Çözüm sunucu tarafından doğrulanamadı.",
+          }
+        );
+
+        return;
+      }
+
+      const now = Date.now();
+      const startedAt = Number(
+        room.startedAt || room.createdAt || now
+      );
+      const serverElapsedMs = Math.max(
+        1,
+        Math.min(
+          now - startedAt,
+          Number(
+            process.env.COMPETITIVE_MATCH_LIMIT_MS ||
+              2 * 60 * 1000
+          )
+        )
+      );
+
+      participant.finishedAt = now;
+      participant.elapsedMs = Math.floor(
+        serverElapsedMs
+      );
 
       clearParticipantAwayState(
         room,
