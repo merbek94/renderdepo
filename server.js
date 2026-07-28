@@ -1911,6 +1911,10 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       const error = new Error("Oyun süresi doldu."); error.statusCode = 409; throw error;
     }
     const elapsedServerMs = Date.now() - new Date(challenge.created_at).getTime();
+    const reportedClientElapsedMs = Number.isFinite(Number(req.body.clientElapsedMs))
+      ? Math.max(0, Math.min(Number(req.body.clientElapsedMs), 2 * 60 * 1000))
+      : 0;
+    const effectiveElapsedMs = Math.max(elapsedServerMs, reportedClientElapsedMs);
     if (elapsedServerMs < 500) {
       const error = new Error("Sonuç olağan dışı hızda gönderildi."); error.statusCode = 409; throw error;
     }
@@ -1927,7 +1931,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.difficulty, challenge.stage);
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
-      const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true);
+      const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, effectiveElapsedMs, true);
       won = outcome.won;
       outcomeReason = outcome.reason;
       rewards = twoPlayerBotRewards(challenge.difficulty, won === true);
@@ -1967,7 +1971,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
         runScore: tournamentResult.runScore || 0,
         won,
         outcomeReason,
-        elapsedServerMs,
+        elapsedServerMs: effectiveElapsedMs,
       };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
@@ -2051,7 +2055,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       runScore: Number(row.infinite_run_score || infiniteRunScore || 0),
       won,
       outcomeReason,
-      elapsedServerMs,
+      elapsedServerMs: (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") ? effectiveElapsedMs : elapsedServerMs,
     };
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
