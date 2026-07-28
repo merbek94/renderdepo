@@ -1327,17 +1327,23 @@ function secureRandomInt(minInclusive, maxExclusive) {
 }
 
 function createSecureTwoPlayerBotPlan(difficulty) {
-  const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
+  const difficultyKey = secureDifficulty(difficulty);
+  // Eski aralık 6-117 sn olduğu için pratikte bot çoğu elde çok geç bitiriyordu.
+  // Güvenli sonuç yine sunucuda hesaplanır; burada yalnızca botun sunucu kayıtlı
+  // bitirme planını daha rekabetçi yapıyoruz.
+  const cannotFinishBps = difficultyKey === "Hard" ? 1800 : 800;
+  const leaveBps = 450;
   const roll = secureRandomInt(0, 10000);
-  if (roll < 560) {
-    return { finishMs: null, leaveMs: secureRandomInt(0, 120) * 1000 };
+  if (roll < leaveBps) {
+    return { finishMs: null, leaveMs: secureRandomInt(8, 55) * 1000 + secureRandomInt(0, 900) };
   }
-  if (roll < 560 + cannotFinishBps) {
+  if (roll < leaveBps + cannotFinishBps) {
     return { finishMs: null, leaveMs: null };
   }
-  const minSeconds = difficulty === "Hard" ? 8 : 6;
+  const minSeconds = difficultyKey === "Hard" ? 8 : 5;
+  const maxSecondsExclusive = difficultyKey === "Hard" ? 58 : 42;
   return {
-    finishMs: secureRandomInt(minSeconds, 117) * 1000 + secureRandomInt(0, 900),
+    finishMs: secureRandomInt(minSeconds, maxSecondsExclusive) * 1000 + secureRandomInt(0, 900),
     leaveMs: null,
   };
 }
