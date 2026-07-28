@@ -2250,10 +2250,16 @@ app.post(
       const isInitial = current.username_user_set !== true;
       const changeCount = Math.max(0, Number(current.username_change_count || 0));
       if (!isInitial && String(current.username || "") === username) {
-        const error = new Error("Yeni kullanıcı adı mevcut adınla aynı olamaz.");
-        error.statusCode = 409;
-        error.publicCode = "USERNAME_UNCHANGED";
-        throw error;
+        await client.query("COMMIT");
+        res.json({
+          ok: true,
+          username,
+          changeCountAfterInitial: changeCount,
+          lastChangeTimeMillis: current.username_last_changed_at
+            ? new Date(current.username_last_changed_at).getTime()
+            : 0,
+        });
+        return;
       }
       if (!isInitial && changeCount > 0 && current.username_last_changed_at) {
         const nextChangeAt = new Date(current.username_last_changed_at).getTime() + USERNAME_CHANGE_COOLDOWN_MS;
