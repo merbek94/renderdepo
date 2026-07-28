@@ -344,6 +344,12 @@ function currentMonthKey() {
   return new Date().toISOString().slice(0, 7);
 }
 
+function timestampMillis(value) {
+  if (!value) return 0;
+  const millis = new Date(value).getTime();
+  return Number.isFinite(millis) ? millis : 0;
+}
+
 function safeText(value, fallback, maxLength) {
   const text = String(value || fallback || "").trim();
   return (text || fallback || "").slice(0, maxLength);
@@ -1045,9 +1051,13 @@ async function readAuthoritativePlayerState(client, playerId) {
             p.tournament_stage, p.tournament_rights,
             p.tournament_bank, p.tournament_completed,
             p.hundred_active, p.hundred_stage,
-            p.game_rights, p.game_rights_refill_at
+            p.game_rights, p.game_rights_refill_at,
+            pl.username, pl.country, pl.username_user_set,
+            pl.username_change_count, pl.username_last_changed_at,
+            pl.updated_at AS profile_updated_at
      FROM player_scores s
      JOIN player_progress p ON p.player_id = s.player_id
+     JOIN players pl ON pl.player_id = s.player_id
      WHERE s.player_id = $1`,
     [playerId]
   );
@@ -1059,6 +1069,14 @@ async function readAuthoritativePlayerState(client, playerId) {
     totalXp: Number(row.total_xp || 0),
     runScore: Number(row.infinite_run_score || 0),
     infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
+    profile: {
+      username: safeUsername(row.username || ""),
+      userSet: row.username_user_set === true,
+      changeCountAfterInitial: Math.max(0, Number(row.username_change_count || 0)),
+      lastChangeTimeMillis: timestampMillis(row.username_last_changed_at),
+      updatedAtMillis: timestampMillis(row.profile_updated_at),
+      country: safeCountry(row.country),
+    },
     tournament: {
       currentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 12)),
       remainingRights: Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3)),
@@ -1343,12 +1361,20 @@ function createSecureTwoPlayerBotPlan(difficulty) {
 }
 
 function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
-  const leaveMs = Number.isFinite(Number(plan?.leaveMs)) ? Number(plan.leaveMs) : null;
-  const finishMs = Number.isFinite(Number(plan?.finishMs)) ? Number(plan.finishMs) : null;
-  if (leaveMs !== null && elapsedMs >= leaveMs) {
+  const safeElapsedMs = Math.max(0, Number(elapsedMs || 0));
+  const leaveMs = Number.isFinite(Number(plan?.leaveMs)) ? Math.max(0, Number(plan.leaveMs)) : null;
+  const finishMs = Number.isFinite(Number(plan?.finishMs)) ? Math.max(0, Number(plan.finishMs)) : null;
+
+  // Aynı planda iki zaman da bulunursa önce gerçekleşen olay kesin sonucu belirler.
+  // Böylece oyuncu botun bitiş zamanından sonra doğru cevap gönderse bile kazanç yazılmaz;
+  // turnuva botunda da yenilgi sunucu tarafında hak düşümüyle sonuçlanır.
+  if (finishMs !== null && safeElapsedMs >= finishMs && (leaveMs === null || finishMs <= leaveMs)) {
+    return { resolvable: true, won: false, reason: "bot_finished" };
+  }
+  if (leaveMs !== null && safeElapsedMs >= leaveMs) {
     return { resolvable: true, won: true, reason: "bot_left" };
   }
-  if (finishMs !== null && elapsedMs >= finishMs) {
+  if (finishMs !== null && safeElapsedMs >= finishMs) {
     return { resolvable: true, won: false, reason: "bot_finished" };
   }
   if (solvedByPlayer) {
@@ -1567,9 +1593,16 @@ app.get("/player/state", requireAuth, async (req, res) => {
   try {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, playerId);
-    const state = await readAuthoritativePlayerState(client, playerId);
+    const activeHundred = await client.query(
+      `SELECT hundred_active FROM player_progress WHERE player_id = $1 FOR UPDATE`,
+      [playerId]
+    );
+    const shouldSettleAbandonedHundred = activeHundred.rows[0]?.hundred_active === true;
+    const state = shouldSettleAbandonedHundred
+      ? await forfeitHundredRunInTransaction(client, playerId)
+      : await readAuthoritativePlayerState(client, playerId);
     await client.query("COMMIT");
-    res.json({ ok: true, ...state });
+    res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state });
   } catch (error) {
     await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Oyuncu durumu yüklenemedi.", "player state error:");
