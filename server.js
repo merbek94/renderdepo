@@ -1361,20 +1361,12 @@ function createSecureTwoPlayerBotPlan(difficulty) {
 }
 
 function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
-  const safeElapsedMs = Math.max(0, Number(elapsedMs || 0));
-  const leaveMs = Number.isFinite(Number(plan?.leaveMs)) ? Math.max(0, Number(plan.leaveMs)) : null;
-  const finishMs = Number.isFinite(Number(plan?.finishMs)) ? Math.max(0, Number(plan.finishMs)) : null;
-
-  // Aynı planda iki zaman da bulunursa önce gerçekleşen olay kesin sonucu belirler.
-  // Böylece oyuncu botun bitiş zamanından sonra doğru cevap gönderse bile kazanç yazılmaz;
-  // turnuva botunda da yenilgi sunucu tarafında hak düşümüyle sonuçlanır.
-  if (finishMs !== null && safeElapsedMs >= finishMs && (leaveMs === null || finishMs <= leaveMs)) {
-    return { resolvable: true, won: false, reason: "bot_finished" };
-  }
-  if (leaveMs !== null && safeElapsedMs >= leaveMs) {
+  const leaveMs = Number.isFinite(Number(plan?.leaveMs)) ? Number(plan.leaveMs) : null;
+  const finishMs = Number.isFinite(Number(plan?.finishMs)) ? Number(plan.finishMs) : null;
+  if (leaveMs !== null && elapsedMs >= leaveMs) {
     return { resolvable: true, won: true, reason: "bot_left" };
   }
-  if (finishMs !== null && safeElapsedMs >= finishMs) {
+  if (finishMs !== null && elapsedMs >= finishMs) {
     return { resolvable: true, won: false, reason: "bot_finished" };
   }
   if (solvedByPlayer) {
@@ -1911,10 +1903,6 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       const error = new Error("Oyun süresi doldu."); error.statusCode = 409; throw error;
     }
     const elapsedServerMs = Date.now() - new Date(challenge.created_at).getTime();
-    const reportedClientElapsedMs = Number.isFinite(Number(req.body.clientElapsedMs))
-      ? Math.max(0, Math.min(Number(req.body.clientElapsedMs), 2 * 60 * 1000))
-      : 0;
-    const effectiveElapsedMs = Math.max(elapsedServerMs, reportedClientElapsedMs);
     if (elapsedServerMs < 500) {
       const error = new Error("Sonuç olağan dışı hızda gönderildi."); error.statusCode = 409; throw error;
     }
@@ -1931,7 +1919,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.difficulty, challenge.stage);
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
-      const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, effectiveElapsedMs, true);
+      const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true);
       won = outcome.won;
       outcomeReason = outcome.reason;
       rewards = twoPlayerBotRewards(challenge.difficulty, won === true);
@@ -1971,7 +1959,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
         runScore: tournamentResult.runScore || 0,
         won,
         outcomeReason,
-        elapsedServerMs: effectiveElapsedMs,
+        elapsedServerMs,
       };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
@@ -2055,7 +2043,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       runScore: Number(row.infinite_run_score || infiniteRunScore || 0),
       won,
       outcomeReason,
-      elapsedServerMs: (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") ? effectiveElapsedMs : elapsedServerMs,
+      elapsedServerMs,
     };
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
