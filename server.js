@@ -1361,9 +1361,15 @@ function createSecureTwoPlayerBotPlan(difficulty) {
   };
 }
 
+function botPlanTimeMs(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
-  const leaveMs = Number.isFinite(Number(plan?.leaveMs)) ? Number(plan.leaveMs) : null;
-  const finishMs = Number.isFinite(Number(plan?.finishMs)) ? Number(plan.finishMs) : null;
+  const leaveMs = botPlanTimeMs(plan?.leaveMs);
+  const finishMs = botPlanTimeMs(plan?.finishMs);
   if (leaveMs !== null && elapsedMs >= leaveMs) {
     return { resolvable: true, won: true, reason: "bot_left" };
   }
