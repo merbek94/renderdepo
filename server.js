@@ -860,7 +860,8 @@ function challengeRewards(mode, difficulty, stage) {
   if (mode === "infinite") {
     const points = Math.min(2_000_000_000, safeStage * 5);
     const stageSum = safeStage * (safeStage + 1) / 2;
-    return { generalDelta: points, infiniteDelta: points, xpDelta: Math.min(2_000_000_000, stageSum * 5) };
+    // Sonsuz mod puanı ayrı tutulur; normal/genel puanı artırmaz.
+    return { generalDelta: 0, infiniteDelta: points, xpDelta: Math.min(2_000_000_000, stageSum * 5) };
   }
   const points = difficulty === "Hard" ? 15 : 10;
   return { generalDelta: points, infiniteDelta: 0, xpDelta: points };
