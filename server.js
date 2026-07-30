@@ -260,6 +260,9 @@ async function initDatabase() {
       hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12),
       game_rights INTEGER NOT NULL DEFAULT 10 CHECK (game_rights BETWEEN 0 AND 10),
       game_rights_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      diamond_balance INTEGER NOT NULL DEFAULT 0 CHECK (diamond_balance >= 0),
+      level_reward_claimed_through INTEGER NOT NULL DEFAULT 0
+        CHECK (level_reward_claimed_through BETWEEN 0 AND 1000),
       bot_fallback_game_key TEXT,
       bot_fallback_difficulty TEXT,
       bot_fallback_eligible_at TIMESTAMPTZ,
@@ -288,6 +291,10 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS game_rights INTEGER NOT NULL DEFAULT 10;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS game_rights_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS diamond_balance INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS level_reward_claimed_through INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS bot_fallback_game_key TEXT;
     ALTER TABLE player_progress
@@ -1045,10 +1052,98 @@ async function consumeBotFallbackEligibilityInTransaction(
   );
 }
 
+
+function playerLevelForTotalXp(totalXpValue) {
+  const totalXp = Math.max(0, Math.min(Number(totalXpValue || 0), 2_000_000_000));
+  const calculated = Math.floor((1 + Math.sqrt(1 + 4 * totalXp)) / 2);
+  return Math.max(1, Math.min(calculated, 1000));
+}
+
+function levelMilestoneReward(levelValue) {
+  const level = Number(levelValue || 0);
+  if (level < 10 || level > 1000 || level % 10 !== 0) return null;
+  if (level % 20 === 10) {
+    return { level, generalScore: level, diamonds: 0 };
+  }
+  return { level, generalScore: 0, diamonds: Math.floor(level / 10) };
+}
+
+async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
+  const progressResult = await client.query(
+    `SELECT total_xp, level_reward_claimed_through
+     FROM player_progress
+     WHERE player_id = $1
+     FOR UPDATE`,
+    [playerId]
+  );
+  const row = progressResult.rows[0];
+  if (!row) return { claimedThroughLevel: 0, generalDelta: 0, diamondDelta: 0 };
+
+  const currentLevel = playerLevelForTotalXp(row.total_xp);
+  const eligibleThroughLevel = Math.min(1000, Math.floor(currentLevel / 10) * 10);
+  const claimedThroughLevel = Math.max(
+    0,
+    Math.min(1000, Math.floor(Number(row.level_reward_claimed_through || 0) / 10) * 10)
+  );
+
+  if (eligibleThroughLevel <= claimedThroughLevel) {
+    return { claimedThroughLevel, generalDelta: 0, diamondDelta: 0 };
+  }
+
+  let generalDelta = 0;
+  let diamondDelta = 0;
+  for (let level = claimedThroughLevel + 10; level <= eligibleThroughLevel; level += 10) {
+    const reward = levelMilestoneReward(level);
+    if (!reward) continue;
+    generalDelta += reward.generalScore;
+    diamondDelta += reward.diamonds;
+  }
+
+  if (generalDelta > 0) {
+    const monthKey = currentMonthKey();
+    await client.query(
+      `UPDATE player_scores
+       SET general_score = LEAST(general_score + $2, 2000000000),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, generalDelta]
+    );
+    await client.query(
+      `INSERT INTO player_monthly_scores
+         (player_id, month_key, general_score, infinite_score, updated_at)
+       VALUES ($1, $2, $3, 0, NOW())
+       ON CONFLICT (player_id, month_key) DO UPDATE SET
+         general_score = LEAST(
+           player_monthly_scores.general_score + EXCLUDED.general_score,
+           2000000000
+         ),
+         updated_at = NOW()`,
+      [playerId, monthKey, generalDelta]
+    );
+  }
+
+  await client.query(
+    `UPDATE player_progress
+     SET diamond_balance = LEAST(diamond_balance + $2, 2000000000),
+         level_reward_claimed_through = $3,
+         updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, diamondDelta, eligibleThroughLevel]
+  );
+
+  return {
+    claimedThroughLevel: eligibleThroughLevel,
+    generalDelta,
+    diamondDelta,
+  };
+}
+
 async function readAuthoritativePlayerState(client, playerId) {
+  const levelRewardSettlement = await settleLevelMilestoneRewardsInTransaction(client, playerId);
   const result = await client.query(
     `SELECT s.general_score, s.infinite_score,
             p.total_xp, p.infinite_run_score, p.infinite_next_stage,
+            p.diamond_balance, p.level_reward_claimed_through,
             p.tournament_stage, p.tournament_rights,
             p.tournament_bank, p.tournament_completed,
             p.hundred_active, p.hundred_stage,
@@ -1068,6 +1163,12 @@ async function readAuthoritativePlayerState(client, playerId) {
     generalScore: Number(row.general_score || 0),
     infiniteScore: Number(row.infinite_score || 0),
     totalXp: Number(row.total_xp || 0),
+    diamondBalance: Math.max(0, Number(row.diamond_balance || 0)),
+    levelRewardClaimedThrough: Math.max(
+      0,
+      Math.min(1000, Number(row.level_reward_claimed_through || 0))
+    ),
+    levelRewardSettlement,
     runScore: Number(row.infinite_run_score || 0),
     infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
     profile: {
@@ -2034,20 +2135,12 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       );
     }
 
-    const totals = await client.query(
-      `SELECT s.general_score, s.infinite_score, p.total_xp, p.infinite_run_score
-       FROM player_scores s JOIN player_progress p ON p.player_id = s.player_id
-       WHERE s.player_id = $1`,
-      [req.auth.sub]
-    );
-    const row = totals.rows[0] || {};
+    const state = await readAuthoritativePlayerState(client, req.auth.sub);
     const response = {
       ok: true,
       ...rewards,
-      generalScore: Number(row.general_score || 0),
-      infiniteScore: Number(row.infinite_score || 0),
-      totalXp: Number(row.total_xp || 0),
-      runScore: Number(row.infinite_run_score || infiniteRunScore || 0),
+      ...state,
+      runScore: Number(state.runScore || infiniteRunScore || 0),
       won,
       outcomeReason,
       elapsedServerMs,
