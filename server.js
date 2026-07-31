@@ -379,7 +379,6 @@ function currentMonthKey() {
 
 const TASK_DEFINITIONS = [
   { code: "login", title: "Oyuna giriş yap", baseTarget: 1, baseReward: 10 },
-  { code: "single_play", title: "Tekli oyun oyna", baseTarget: 2, baseReward: 10 },
   { code: "multiplayer_play", title: "Çok oyunculu oyun oyna", baseTarget: 3, baseReward: 20 },
   { code: "multiplayer_win", title: "Çok oyunculu oyunu kazan", baseTarget: 1, baseReward: 20 },
   { code: "different_games", title: "Farklı oyunlar oyna", baseTarget: 2, baseReward: 10 },
@@ -395,8 +394,6 @@ function taskDisplayTitle(code, target, periodType) {
   switch (code) {
     case "login":
       return target === 1 ? "Oyuna giriş yap" : `${target} gün oyuna giriş yap`;
-    case "single_play":
-      return `${target} tekli oyun oyna`;
     case "multiplayer_play":
       return `${target} çok oyunculu oyun oyna`;
     case "multiplayer_win":
@@ -517,7 +514,6 @@ async function readTaskCenterState(client, playerId) {
       ? multiplayerEvents.filter((row) => row.game_key !== favoriteGameKey).length : 0;
     const counts = {
       login: events.filter((row) => row.event_type === "login").length,
-      single_play: gameEvents.filter((row) => row.multiplayer !== true).length,
       multiplayer_play: multiplayerEvents.length,
       multiplayer_win: multiplayerEvents.filter((row) => row.won === true).length,
       different_games: period.type === "daily" ? distinctGames : gameEvents.length,
@@ -1108,7 +1104,7 @@ function generateSecurePuzzle(difficultyValue) {
     : { difficulty, target: 15, numbers: shuffled([3, 5, 7]) };
 }
 
-function challengeRewards(mode, difficulty, stage) {
+function challengeRewards(mode, stage) {
   const safeStage = Math.max(1, Math.min(Number(stage || 1), 1000));
   if (mode === "infinite") {
     const points = Math.min(2_000_000_000, safeStage * 5);
@@ -1116,8 +1112,7 @@ function challengeRewards(mode, difficulty, stage) {
     // Sonsuz mod puanı ayrı tutulur; normal/genel puanı artırmaz.
     return { generalDelta: 0, infiniteDelta: points, xpDelta: Math.min(2_000_000_000, stageSum * 5) };
   }
-  const points = difficulty === "Hard" ? 15 : 10;
-  return { generalDelta: points, infiniteDelta: 0, xpDelta: points };
+  return { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 };
 }
 
 function tournamentStageReward(stageValue) {
@@ -2200,13 +2195,17 @@ app.post("/game/bot/start", requireAuth, async (req, res) => {
 
 app.post("/game/challenges/start", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
-  const mode = req.body.mode === "infinite" ? "infinite" : "single";
+  const mode = safeText(req.body.mode, "", 32);
+  if (mode !== "infinite") {
+    res.status(400).json({ ok: false, message: "Bu endpoint yalnızca sonsuz modu destekler." });
+    return;
+  }
   const requestedDifficulty = secureDifficulty(req.body.difficulty);
-  const freshInfiniteRun = mode === "infinite" && req.body.fresh === true;
+  const freshInfiniteRun = req.body.fresh === true;
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
   // Sonsuz modda uygulama arka plana alındığında yerel sayaç duraklatıldığı için
   // challenge uzun ömürlü tutulur; puan yine yalnızca tek kullanımlık kayıt ve doğru çözümle alınır.
-  const lifetimeMs = mode === "single" ? 5 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+  const lifetimeMs = 7 * 24 * 60 * 60 * 1000;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -2277,6 +2276,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
     const result = await client.query(
       `SELECT * FROM secure_game_challenges
        WHERE challenge_id = $1 AND player_id = $2
+         AND mode IN ('infinite', 'two_player_bot', 'tournament_bot', 'hundred')
        FOR UPDATE`,
       [challengeId, req.auth.sub]
     );
@@ -2311,7 +2311,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
     }
     let won = null;
     let outcomeReason = null;
-    let rewards = challengeRewards(challenge.mode, challenge.difficulty, challenge.stage);
+    let rewards = challengeRewards(challenge.mode, challenge.stage);
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
       const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true);
       won = outcome.won;
@@ -2437,14 +2437,14 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       );
     }
 
-    if (challenge.mode === "single" || challenge.mode === "two_player_bot") {
+    if (challenge.mode === "two_player_bot") {
       await recordTaskEventInTransaction(client, {
         playerId: req.auth.sub,
         sourceKey: `challenge:${challengeId}`,
         eventType: "game",
         gameKey: "target_number",
-        multiplayer: challenge.mode === "two_player_bot",
-        won: challenge.mode === "single" ? true : won === true,
+        multiplayer: true,
+        won: won === true,
       });
     }
     const state = await readAuthoritativePlayerState(client, req.auth.sub);
@@ -2473,68 +2473,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
 
 
 
-app.post("/game/challenges/forfeit", requireAuth, async (req, res) => {
-  if (!requireDatabase(res)) return;
-  const challengeId = safeText(req.body.challengeId, "", 128);
-  if (!challengeId) {
-    res.status(400).json({ ok: false, message: "challengeId zorunlu." });
-    return;
-  }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const result = await client.query(
-      `SELECT * FROM secure_game_challenges
-       WHERE challenge_id = $1 AND player_id = $2 AND mode IN ('single', 'infinite')
-       FOR UPDATE`,
-      [challengeId, req.auth.sub]
-    );
-    if (result.rowCount === 0) {
-      const error = new Error("Oyun doğrulama kaydı bulunamadı.");
-      error.statusCode = 404;
-      throw error;
-    }
-    const challenge = result.rows[0];
-    if (challenge.completed_at && challenge.result?.response) {
-      await client.query("COMMIT");
-      res.json(challenge.result.response);
-      return;
-    }
-    if (challenge.mode === "single") {
-      await recordTaskEventInTransaction(client, {
-        playerId: req.auth.sub,
-        sourceKey: `challenge:${challengeId}`,
-        eventType: "game",
-        gameKey: "target_number",
-        multiplayer: false,
-        won: false,
-      });
-    }
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
-    const response = {
-      ok: true,
-      ...state,
-      generalDelta: 0,
-      infiniteDelta: 0,
-      xpDelta: 0,
-      won: false,
-      outcomeReason: "player_forfeit",
-      elapsedServerMs: Math.max(0, Date.now() - new Date(challenge.created_at).getTime()),
-    };
-    await client.query(
-      `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb
-       WHERE challenge_id = $1`,
-      [challengeId, JSON.stringify({ status: "completed", response })]
-    );
-    await client.query("COMMIT");
-    res.json(response);
-  } catch (error) {
-    await client.query("ROLLBACK");
-    sendLeaderboardError(res, error, "Oyun terk kaydı işlenemedi.", "challenge forfeit error:");
-  } finally {
-    client.release();
-  }
-});
+
 
 app.post("/game/bot/resolve", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
