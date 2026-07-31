@@ -322,6 +322,31 @@ async function initDatabase() {
       result JSONB
     );
 
+    CREATE TABLE IF NOT EXISTS player_task_events (
+      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+      source_key TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK (event_type IN ('login', 'game')),
+      game_key TEXT,
+      multiplayer BOOLEAN NOT NULL DEFAULT FALSE,
+      won BOOLEAN NOT NULL DEFAULT FALSE,
+      occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (player_id, source_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS player_task_claims (
+      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+      period_type TEXT NOT NULL CHECK (period_type IN ('daily', 'weekly', 'monthly')),
+      period_key TEXT NOT NULL,
+      task_code TEXT NOT NULL,
+      reward_score INTEGER NOT NULL DEFAULT 0 CHECK (reward_score >= 0),
+      reward_diamonds INTEGER NOT NULL DEFAULT 0 CHECK (reward_diamonds >= 0),
+      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (player_id, period_type, period_key, task_code)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_task_events_player_time
+      ON player_task_events (player_id, occurred_at DESC);
+
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
 
@@ -349,6 +374,227 @@ async function initDatabase() {
 
 function currentMonthKey() {
   return new Date().toISOString().slice(0, 7);
+}
+
+
+const TASK_DEFINITIONS = [
+  { code: "login", title: "Oyuna giriş yap", baseTarget: 1, baseReward: 10 },
+  { code: "single_play", title: "Tekli oyun oyna", baseTarget: 2, baseReward: 10 },
+  { code: "multiplayer_play", title: "Çok oyunculu oyun oyna", baseTarget: 3, baseReward: 20 },
+  { code: "multiplayer_win", title: "Çok oyunculu oyunu kazan", baseTarget: 1, baseReward: 20 },
+  { code: "different_games", title: "Farklı oyunlar oyna", baseTarget: 2, baseReward: 10 },
+  { code: "different_multiplayer_games", title: "Farklı çok oyunculu oyunlar oyna", baseTarget: 2, baseReward: 20 },
+];
+const TASK_PERIOD_CONFIG = {
+  daily: { multiplier: 1, diamondReward: 2 },
+  weekly: { multiplier: 7, diamondReward: 15 },
+  monthly: { multiplier: 30, diamondReward: 60 },
+};
+
+function taskDisplayTitle(code, target, periodType) {
+  switch (code) {
+    case "login":
+      return target === 1 ? "Oyuna giriş yap" : `${target} gün oyuna giriş yap`;
+    case "single_play":
+      return `${target} tekli oyun oyna`;
+    case "multiplayer_play":
+      return `${target} çok oyunculu oyun oyna`;
+    case "multiplayer_win":
+      return `${target} çok oyunculu oyun kazan`;
+    case "different_games":
+      return periodType === "daily"
+        ? `${target} farklı oyun oyna`
+        : `${target} oyun oyna`;
+    case "different_multiplayer_games":
+      return periodType === "daily"
+        ? `${target} farklı çok oyunculu oyun oyna`
+        : `${target} çok oyunculu oyun oyna`;
+    default:
+      return `${target} görev ilerlemesi`;
+  }
+}
+
+function taskPeriodInfo(type, now = new Date()) {
+  const current = new Date(now.getTime());
+  let start;
+  let end;
+  let key;
+  if (type === "weekly") {
+    start = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate()));
+    const day = start.getUTCDay() || 7;
+    start.setUTCDate(start.getUTCDate() - day + 1);
+    end = new Date(start.getTime());
+    end.setUTCDate(end.getUTCDate() + 7);
+    key = start.toISOString().slice(0, 10);
+  } else if (type === "monthly") {
+    start = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), 1));
+    end = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 1));
+    key = start.toISOString().slice(0, 7);
+  } else {
+    start = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate()));
+    end = new Date(start.getTime());
+    end.setUTCDate(end.getUTCDate() + 1);
+    key = start.toISOString().slice(0, 10);
+  }
+  return { type, key, start, end };
+}
+
+async function recordTaskEventInTransaction(client, {
+  playerId, sourceKey, eventType, gameKey = null, multiplayer = false, won = false,
+}) {
+  if (!playerId || !sourceKey) return false;
+  await ensureAuthenticatedPlayer(client, playerId);
+  const result = await client.query(
+    `INSERT INTO player_task_events
+     (player_id, source_key, event_type, game_key, multiplayer, won, occurred_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+     ON CONFLICT (player_id, source_key) DO NOTHING
+     RETURNING source_key`,
+    [playerId, String(sourceKey).slice(0, 180), eventType, gameKey, multiplayer === true, won === true]
+  );
+  return result.rowCount > 0;
+}
+
+async function recordTaskGameEvent(playerId, sourceKey, gameKey, multiplayer, won) {
+  if (!pool || !playerId) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await recordTaskEventInTransaction(client, {
+      playerId, sourceKey, eventType: "game", gameKey, multiplayer, won,
+    });
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function readTaskCenterState(client, playerId) {
+  const now = new Date();
+  const periods = ["daily", "weekly", "monthly"].map((type) => taskPeriodInfo(type, now));
+  const earliest = new Date(Math.min(...periods.map((item) => item.start.getTime())));
+  const eventsResult = await client.query(
+    `SELECT event_type, game_key, multiplayer, won, occurred_at
+     FROM player_task_events
+     WHERE player_id = $1 AND occurred_at >= $2
+     ORDER BY occurred_at ASC`,
+    [playerId, earliest]
+  );
+  const favoriteResult = await client.query(
+    `SELECT game_key, COUNT(*)::INTEGER AS play_count
+     FROM player_task_events
+     WHERE player_id = $1 AND event_type = 'game' AND game_key IS NOT NULL
+     GROUP BY game_key
+     ORDER BY play_count DESC, game_key ASC
+     LIMIT 1`,
+    [playerId]
+  );
+  const favoriteGameKey = favoriteResult.rows[0]?.game_key || null;
+  const claimsResult = await client.query(
+    `SELECT period_type, period_key, task_code
+     FROM player_task_claims
+     WHERE player_id = $1 AND period_key = ANY($2::text[])`,
+    [playerId, periods.map((item) => item.key)]
+  );
+  const claims = new Set(claimsResult.rows.map((row) => `${row.period_type}:${row.period_key}:${row.task_code}`));
+
+  const periodStates = periods.map((period) => {
+    const config = TASK_PERIOD_CONFIG[period.type];
+    const events = eventsResult.rows.filter((row) => {
+      const time = new Date(row.occurred_at).getTime();
+      return time >= period.start.getTime() && time < period.end.getTime();
+    });
+    const gameEvents = events.filter((row) => row.event_type === "game");
+    const multiplayerEvents = gameEvents.filter((row) => row.multiplayer === true);
+    const distinctGames = new Set(gameEvents.map((row) => row.game_key).filter(Boolean)).size;
+    const distinctMultiplayerGames = new Set(multiplayerEvents.map((row) => row.game_key).filter(Boolean)).size;
+    const nonFavoriteGames = favoriteGameKey
+      ? gameEvents.filter((row) => row.game_key !== favoriteGameKey).length : 0;
+    const nonFavoriteMultiplayerGames = favoriteGameKey
+      ? multiplayerEvents.filter((row) => row.game_key !== favoriteGameKey).length : 0;
+    const counts = {
+      login: events.filter((row) => row.event_type === "login").length,
+      single_play: gameEvents.filter((row) => row.multiplayer !== true).length,
+      multiplayer_play: multiplayerEvents.length,
+      multiplayer_win: multiplayerEvents.filter((row) => row.won === true).length,
+      different_games: period.type === "daily" ? distinctGames : gameEvents.length,
+      different_multiplayer_games: period.type === "daily" ? distinctMultiplayerGames : multiplayerEvents.length,
+    };
+
+    const tasks = TASK_DEFINITIONS.map((definition) => {
+      const target = definition.baseTarget * config.multiplier;
+      const isDiversity = definition.code === "different_games" || definition.code === "different_multiplayer_games";
+      const secondaryTarget = isDiversity && period.type !== "daily" ? target / 2 : null;
+      const secondaryProgress = definition.code === "different_games"
+        ? nonFavoriteGames
+        : definition.code === "different_multiplayer_games" ? nonFavoriteMultiplayerGames : null;
+      const progress = counts[definition.code] || 0;
+      const completed = progress >= target && (secondaryTarget === null || secondaryProgress >= secondaryTarget);
+      return {
+        code: definition.code,
+        title: taskDisplayTitle(definition.code, target, period.type),
+        rewardScore: definition.baseReward * config.multiplier,
+        progress,
+        target,
+        secondaryProgress,
+        secondaryTarget,
+        secondaryLabel: secondaryTarget === null ? null : "Favori dışı",
+        completed,
+        claimed: claims.has(`${period.type}:${period.key}:${definition.code}`),
+      };
+    });
+    const allComplete = tasks.every((task) => task.completed);
+    return {
+      type: period.type,
+      periodKey: period.key,
+      endsAtMillis: period.end.getTime(),
+      favoriteGameKey,
+      tasks,
+      allComplete,
+      masterRewardDiamonds: config.diamondReward,
+      masterClaimed: claims.has(`${period.type}:${period.key}:all_complete`),
+    };
+  });
+
+  return { serverNowMillis: now.getTime(), periods: periodStates };
+}
+
+async function claimTaskRewardInTransaction(client, playerId, periodType, taskCode) {
+  const type = TASK_PERIOD_CONFIG[periodType] ? periodType : "daily";
+  const period = taskPeriodInfo(type);
+  const taskCenter = await readTaskCenterState(client, playerId);
+  const periodState = taskCenter.periods.find((item) => item.type === type);
+  const isMaster = taskCode === "all_complete";
+  const task = periodState?.tasks.find((item) => item.code === taskCode);
+  if ((!isMaster && (!task || !task.completed)) || (isMaster && !periodState?.allComplete)) {
+    const error = new Error("Bu görev henüz tamamlanmadı.");
+    error.statusCode = 409;
+    error.publicCode = "TASK_NOT_COMPLETE";
+    throw error;
+  }
+  const rewardScore = isMaster ? 0 : task.rewardScore;
+  const rewardDiamonds = isMaster ? periodState.masterRewardDiamonds : 0;
+  const inserted = await client.query(
+    `INSERT INTO player_task_claims
+     (player_id, period_type, period_key, task_code, reward_score, reward_diamonds, claimed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+     ON CONFLICT (player_id, period_type, period_key, task_code) DO NOTHING
+     RETURNING task_code`,
+    [playerId, type, period.key, taskCode, rewardScore, rewardDiamonds]
+  );
+  if (inserted.rowCount > 0) {
+    if (rewardScore > 0) await addPositiveGeneralAndXpInTransaction(client, playerId, rewardScore, 0);
+    if (rewardDiamonds > 0) {
+      await client.query(
+        `UPDATE player_progress SET diamond_balance = LEAST(diamond_balance + $2, 2000000000), updated_at = NOW()
+         WHERE player_id = $1`,
+        [playerId, rewardDiamonds]
+      );
+    }
+  }
 }
 
 function timestampMillis(value) {
@@ -1409,6 +1655,22 @@ async function forfeitHundredRunInTransaction(client, playerId) {
     };
   }
   const stage = Math.max(1, Math.min(Number(row.hundred_stage || 1), 12));
+  const activeChallenge = await client.query(
+    `SELECT challenge_id FROM secure_game_challenges
+     WHERE player_id = $1 AND mode = 'hundred' AND completed_at IS NULL
+     ORDER BY created_at DESC LIMIT 1`,
+    [playerId]
+  );
+  await recordTaskEventInTransaction(client, {
+    playerId,
+    sourceKey: activeChallenge.rows[0]?.challenge_id
+      ? `challenge:${activeChallenge.rows[0].challenge_id}`
+      : `hundred-forfeit:${stage}:${Date.now()}`,
+    eventType: "game",
+    gameKey: "target_number",
+    multiplayer: true,
+    won: false,
+  });
   const generalDelta = stage * 10;
   const xpDelta = stage * 20;
   await addPositiveGeneralAndXpInTransaction(client, playerId, generalDelta, xpDelta);
@@ -1534,6 +1796,14 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
       elapsedServerMs,
     };
   }
+  await recordTaskEventInTransaction(client, {
+    playerId,
+    sourceKey: `challenge:${challenge.challenge_id}`,
+    eventType: "game",
+    gameKey: "target_number",
+    multiplayer: true,
+    won: false,
+  });
   await client.query(
     `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb
      WHERE challenge_id = $1 AND completed_at IS NULL`,
@@ -1620,8 +1890,16 @@ async function applyAuthoritativeScoreDelta(playerId, generalDelta, infiniteDelt
 }
 
 async function awardRealtimeRoom(room, winner, loser) {
-  if (!room || room.isFriend || room.awardedAt) return;
+  if (!room || room.awardedAt) return;
   room.awardedAt = Date.now();
+
+  if (room.isFriend) {
+    await Promise.all([
+      winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
+      loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
+    ]);
+    return;
+  }
 
   if (room.gameKey === "target_number_tournament") {
     const [winnerState, loserState] = await Promise.all([
@@ -1632,6 +1910,10 @@ async function awardRealtimeRoom(room, winner, loser) {
     const loserSocket = loser?.socketId ? io.sockets.sockets.get(loser.socketId) : null;
     if (winnerSocket && winnerState) winnerSocket.emit("authoritative_tournament", winnerState);
     if (loserSocket && loserState) loserSocket.emit("authoritative_tournament", loserState);
+    await Promise.all([
+      winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
+      loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
+    ]);
     return;
   }
 
@@ -1646,6 +1928,10 @@ async function awardRealtimeRoom(room, winner, loser) {
   const loserSocket = loser?.socketId ? io.sockets.sockets.get(loser.socketId) : null;
   if (winnerSocket && winnerState) winnerSocket.emit("authoritative_reward", winnerState);
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
+  await Promise.all([
+    winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
+    loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
+  ]);
 }
 
 app.post("/auth/play-games", async (req, res) => {
@@ -2039,6 +2325,14 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
         req.auth.sub,
         Number(challenge.stage)
       );
+      await recordTaskEventInTransaction(client, {
+        playerId: req.auth.sub,
+        sourceKey: `challenge:${challengeId}`,
+        eventType: "game",
+        gameKey: "target_number",
+        multiplayer: true,
+        won: true,
+      });
       const response = {
         ok: true,
         ...hundredResult,
@@ -2061,6 +2355,14 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
         won,
         Number(challenge.stage)
       );
+      await recordTaskEventInTransaction(client, {
+        playerId: req.auth.sub,
+        sourceKey: `challenge:${challengeId}`,
+        eventType: "game",
+        gameKey: "target_number",
+        multiplayer: true,
+        won: won === true,
+      });
       const response = {
         ok: true,
         ...tournamentResult,
@@ -2135,6 +2437,16 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
       );
     }
 
+    if (challenge.mode === "single" || challenge.mode === "two_player_bot") {
+      await recordTaskEventInTransaction(client, {
+        playerId: req.auth.sub,
+        sourceKey: `challenge:${challengeId}`,
+        eventType: "game",
+        gameKey: "target_number",
+        multiplayer: challenge.mode === "two_player_bot",
+        won: challenge.mode === "single" ? true : won === true,
+      });
+    }
     const state = await readAuthoritativePlayerState(client, req.auth.sub);
     const response = {
       ok: true,
@@ -2159,6 +2471,70 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
   }
 });
 
+
+
+app.post("/game/challenges/forfeit", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const challengeId = safeText(req.body.challengeId, "", 128);
+  if (!challengeId) {
+    res.status(400).json({ ok: false, message: "challengeId zorunlu." });
+    return;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT * FROM secure_game_challenges
+       WHERE challenge_id = $1 AND player_id = $2 AND mode IN ('single', 'infinite')
+       FOR UPDATE`,
+      [challengeId, req.auth.sub]
+    );
+    if (result.rowCount === 0) {
+      const error = new Error("Oyun doğrulama kaydı bulunamadı.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const challenge = result.rows[0];
+    if (challenge.completed_at && challenge.result?.response) {
+      await client.query("COMMIT");
+      res.json(challenge.result.response);
+      return;
+    }
+    if (challenge.mode === "single") {
+      await recordTaskEventInTransaction(client, {
+        playerId: req.auth.sub,
+        sourceKey: `challenge:${challengeId}`,
+        eventType: "game",
+        gameKey: "target_number",
+        multiplayer: false,
+        won: false,
+      });
+    }
+    const state = await readAuthoritativePlayerState(client, req.auth.sub);
+    const response = {
+      ok: true,
+      ...state,
+      generalDelta: 0,
+      infiniteDelta: 0,
+      xpDelta: 0,
+      won: false,
+      outcomeReason: "player_forfeit",
+      elapsedServerMs: Math.max(0, Date.now() - new Date(challenge.created_at).getTime()),
+    };
+    await client.query(
+      `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb
+       WHERE challenge_id = $1`,
+      [challengeId, JSON.stringify({ status: "completed", response })]
+    );
+    await client.query("COMMIT");
+    res.json(response);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Oyun terk kaydı işlenemedi.", "challenge forfeit error:");
+  } finally {
+    client.release();
+  }
+});
 
 app.post("/game/bot/resolve", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
@@ -2245,6 +2621,15 @@ app.post("/game/bot/resolve", requireAuth, async (req, res) => {
       };
     }
 
+    await recordTaskEventInTransaction(client, {
+      playerId: req.auth.sub,
+      sourceKey: `challenge:${challengeId}`,
+      eventType: "game",
+      gameKey: "target_number",
+      multiplayer: true,
+      won: outcome.won === true,
+    });
+
     await client.query(
       `UPDATE secure_game_challenges
        SET completed_at = NOW(), result = $2::jsonb
@@ -2330,6 +2715,14 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
         elapsedServerMs,
       };
     }
+    await recordTaskEventInTransaction(client, {
+      playerId: req.auth.sub,
+      sourceKey: `challenge:${challengeId}`,
+      eventType: "game",
+      gameKey: "target_number",
+      multiplayer: true,
+      won: false,
+    });
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
       [challengeId, JSON.stringify({ status: "completed", response })]
@@ -2344,6 +2737,80 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
   }
 });
 
+
+
+app.get("/tasks/state", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, req.auth.sub);
+    const taskCenter = await readTaskCenterState(client, req.auth.sub);
+    const state = await readAuthoritativePlayerState(client, req.auth.sub);
+    await client.query("COMMIT");
+    res.json({ ok: true, taskCenter, ...state });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Görevler yüklenemedi.", "task state error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/tasks/login", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, req.auth.sub);
+    const daily = taskPeriodInfo("daily");
+    await recordTaskEventInTransaction(client, {
+      playerId: req.auth.sub,
+      sourceKey: `login:${daily.key}`,
+      eventType: "login",
+    });
+    const taskCenter = await readTaskCenterState(client, req.auth.sub);
+    const state = await readAuthoritativePlayerState(client, req.auth.sub);
+    await client.query("COMMIT");
+    res.json({ ok: true, taskCenter, ...state });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Günlük giriş görevi kaydedilemedi.", "task login error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/tasks/claim", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const periodType = safeText(req.body.periodType, "daily", 16).toLowerCase();
+  const taskCode = safeText(req.body.taskCode, "", 64).toLowerCase();
+  if (!TASK_PERIOD_CONFIG[periodType] || !taskCode) {
+    res.status(400).json({ ok: false, message: "Geçersiz görev ödülü isteği." });
+    return;
+  }
+  const allowedCodes = new Set([...TASK_DEFINITIONS.map((item) => item.code), "all_complete"]);
+  if (!allowedCodes.has(taskCode)) {
+    res.status(400).json({ ok: false, message: "Bilinmeyen görev kodu." });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, req.auth.sub);
+    await claimTaskRewardInTransaction(client, req.auth.sub, periodType, taskCode);
+    const taskCenter = await readTaskCenterState(client, req.auth.sub);
+    const state = await readAuthoritativePlayerState(client, req.auth.sub);
+    await client.query("COMMIT");
+    res.json({ ok: true, taskCenter, ...state });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Görev ödülü alınamadı.", "task claim error:");
+  } finally {
+    client.release();
+  }
+});
 
 app.post(
   "/leaderboard/username/claim",
@@ -2970,6 +3437,17 @@ async function resolveRoomByGameDeadline(roomId) {
         }
       });
     }
+    await Promise.all(
+      participants.map((participant) =>
+        recordTaskGameEvent(
+          participant.playerId,
+          `room:${room.roomId}`,
+          "target_number",
+          true,
+          false
+        )
+      )
+    );
     room.awardedAt = Date.now();
   } catch (error) {
     console.error("realtime game deadline reward error:", error);
