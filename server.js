@@ -1898,8 +1898,8 @@ async function awardRealtimeRoom(room, winner, loser) {
 
   if (room.gameKey === "target_number_tournament") {
     const [winnerState, loserState] = await Promise.all([
-      winner ? applyTournamentOutcome(winner.playerId, true, room.tournamentStage) : null,
-      loser ? applyTournamentOutcome(loser.playerId, false, room.tournamentStage) : null,
+      winner ? applyTournamentOutcome(winner.playerId, true, winner.tournamentStage) : null,
+      loser ? applyTournamentOutcome(loser.playerId, false, loser.tournamentStage) : null,
     ]);
     const winnerSocket = winner?.socketId ? io.sockets.sockets.get(winner.socketId) : null;
     const loserSocket = loser?.socketId ? io.sockets.sockets.get(loser.socketId) : null;
@@ -3349,7 +3349,7 @@ async function resolveRoomByGameDeadline(roomId) {
     if (!room.isFriend && room.gameKey === "target_number_tournament") {
       const states = await Promise.all(
         participants.map((participant) =>
-          applyTournamentOutcome(participant.playerId, false, room.tournamentStage)
+          applyTournamentOutcome(participant.playerId, false, participant.tournamentStage)
         )
       );
       participants.forEach((participant, index) => {
@@ -3532,7 +3532,8 @@ function createRealtimeRoom(
   gameKey,
   difficulty,
   puzzle,
-  tournamentStage = null
+  tournamentStage = null,
+  opponentTournamentStage = null
 ) {
   const roomId =
     typeof crypto.randomUUID ===
@@ -3556,9 +3557,6 @@ function createRealtimeRoom(
     isFriend: false,
     awardedAt: null,
     deadlineHandle: null,
-    tournamentStage: tournamentStage == null
-      ? null
-      : Math.max(1, Math.min(Number(tournamentStage || 1), 12)),
 
     participants: {
       [player.id]: {
@@ -3573,6 +3571,9 @@ function createRealtimeRoom(
         timeoutHandle: null,
         finishedAt: null,
         elapsedMs: null,
+        tournamentStage: tournamentStage == null
+          ? null
+          : Math.max(1, Math.min(Number(tournamentStage || 1), 12)),
       },
 
       [opponentPlayer.id]: {
@@ -3587,6 +3588,9 @@ function createRealtimeRoom(
         timeoutHandle: null,
         finishedAt: null,
         elapsedMs: null,
+        tournamentStage: opponentTournamentStage == null
+          ? null
+          : Math.max(1, Math.min(Number(opponentTournamentStage || 1), 12)),
       },
     },
   };
@@ -4127,11 +4131,11 @@ io.on("connection", (socket) => {
 
       leaveRoomAsCancel(socket);
 
+      // Turnuvada aynı zorluk grubundaki tüm aşamalar aynı kuyruğu paylaşır.
+      // Orta: 1-4. aşamalar, Zor: 5-12. aşamalar.
       const key = queueKey(
         gameKey,
-        gameKey === "target_number_tournament"
-          ? `${difficulty}:stage:${tournamentStage}`
-          : difficulty
+        difficulty
       );
 
       const queue =
@@ -4190,7 +4194,8 @@ io.on("connection", (socket) => {
             gameKey,
             difficulty,
             selectedPuzzle,
-            tournamentStage
+            tournamentStage,
+            opponent.tournamentStage
           );
 
         socket.emit(
