@@ -1209,6 +1209,35 @@ function randomStakeWithNaturalEnding(minimumValue, maximumValue) {
   return secureRandomInt(minimum, maximum + 1);
 }
 
+function minimumOpenTableStake(availableScore, difficulty) {
+  const score = Math.max(0, Math.min(Number(availableScore || 0), 2_000_000_000));
+  const lowestEligibleGroup = TWO_PLAYER_ROOM_GROUPS.find((group) =>
+    score >= group.minScore && (group.maxScore == null || score <= group.maxScore)
+  );
+  return Math.max(
+    minimumTwoPlayerStake(difficulty),
+    Number(lowestEligibleGroup?.minScore || minimumTwoPlayerStake(difficulty))
+  );
+}
+
+function assertOpenTableStake(stakePoints, availableScore, difficulty) {
+  const minimum = minimumOpenTableStake(availableScore, difficulty);
+  const requested = Math.floor(Number(stakePoints || 0));
+  if (!Number.isFinite(requested) || requested < minimum) {
+    const error = new Error(`Masa puanı, girebildiğiniz en düşük salon için en az ${minimum} olmalıdır.`);
+    error.statusCode = 409;
+    error.publicCode = "INVALID_WAGER";
+    throw error;
+  }
+  if (requested > Number(availableScore || 0)) {
+    const error = new Error("Masa puanı mevcut genel puanınızı aşamaz.");
+    error.statusCode = 409;
+    error.publicCode = "INSUFFICIENT_SCORE";
+    throw error;
+  }
+  return requested;
+}
+
 function normalizeRequestedStake(value, difficulty, availableScore, allowAutomatic = false) {
   const minimum = minimumTwoPlayerStake(difficulty);
   const score = Math.max(0, Math.min(Number(availableScore || 0), 2_000_000_000));
@@ -2258,6 +2287,14 @@ app.post("/game/bot/start", requireAuth, async (req, res) => {
 
     let stakePoints = 0;
     if (!tournamentMode) {
+      if (matchMode === "open_table") {
+        const scoreResult = await client.query(
+          `SELECT general_score FROM player_scores WHERE player_id = $1 FOR UPDATE`,
+          [req.auth.sub]
+        );
+        const availableScore = Number(scoreResult.rows[0]?.general_score || 0);
+        assertOpenTableStake(req.body.wagerPoints, availableScore, requestedDifficulty);
+      }
       const consumed = await consumeGameRightInTransaction(
         client,
         req.auth.sub,
@@ -4460,6 +4497,7 @@ io.on("connection", (socket) => {
       const difficulty = secureDifficulty(payload.difficulty);
       let stakePoints;
       try {
+        assertOpenTableStake(payload.stakePoints, identity.generalScore, difficulty);
         stakePoints = normalizeRequestedStake(payload.stakePoints, difficulty, identity.generalScore, false);
       } catch (error) {
         socket.emit("match_error", { code: error.publicCode || "INVALID_WAGER", message: error.message });
