@@ -3300,19 +3300,34 @@ function randomStakeForGroup(group, difficulty) {
   return randomStakeWithNaturalEnding(minimum, maximum);
 }
 
+function emitRoomLobbyChanged(difficulty) {
+  io.emit("room_lobby_changed", {
+    difficulty: difficulty ? secureDifficulty(difficulty) : "",
+    changedAtMillis: Date.now(),
+  });
+}
+
 function removeOpenTablesForSocket(socketId) {
+  const changedDifficulties = new Set();
   for (const [listingId, table] of publicOpenTables.entries()) {
-    if (table.ownerSocketId === socketId) publicOpenTables.delete(listingId);
+    if (table.ownerSocketId === socketId) {
+      changedDifficulties.add(table.difficulty);
+      publicOpenTables.delete(listingId);
+    }
   }
+  for (const difficulty of changedDifficulties) emitRoomLobbyChanged(difficulty);
 }
 
 function expireOldOpenTables() {
   const now = Date.now();
+  const changedDifficulties = new Set();
   for (const [listingId, table] of publicOpenTables.entries()) {
     if (now - table.createdAt > 15 * 60 * 1000 || !io.sockets.sockets.get(table.ownerSocketId)) {
+      changedDifficulties.add(table.difficulty);
       publicOpenTables.delete(listingId);
     }
   }
+  for (const difficulty of changedDifficulties) emitRoomLobbyChanged(difficulty);
 }
 
 const PRIVATE_ROOM_TTL_MS = Number(
@@ -4466,6 +4481,7 @@ io.on("connection", (socket) => {
         puzzle: generateSecurePuzzle(difficulty),
         createdAt: Date.now(),
       });
+      emitRoomLobbyChanged(difficulty);
       socket.emit("open_table_created", { listingId, stakePoints, difficulty });
       socket.emit("waiting", { gameKey: "target_number", difficulty, matchMode: "open_table", stakePoints });
     }
@@ -4516,9 +4532,11 @@ io.on("connection", (socket) => {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
           ownerSocket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
           publicOpenTables.delete(listingId);
+          emitRoomLobbyChanged(table.difficulty);
           return;
         }
         publicOpenTables.delete(listingId);
+        emitRoomLobbyChanged(table.difficulty);
         await clearBotFallbackEligibilityForPlayers([player.id, table.player.id]);
         const room = createRealtimeRoom(
           socket, player, ownerSocket, table.player, "target_number", table.difficulty,
