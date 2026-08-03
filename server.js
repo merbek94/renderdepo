@@ -1173,13 +1173,49 @@ function quickStakeRange(availableScore, difficulty) {
   return { minStake, maxStake };
 }
 
+function randomStakeEndingWith50Or100(minimumValue, maximumValue) {
+  const minimum = Math.max(0, Math.floor(Number(minimumValue || 0)));
+  const maximum = Math.max(minimum, Math.floor(Number(maximumValue || minimum)));
+  const endings = [];
+
+  const fiftyMinMultiplier = Math.ceil((minimum - 50) / 100);
+  const fiftyMaxMultiplier = Math.floor((maximum - 50) / 100);
+  if (fiftyMinMultiplier <= fiftyMaxMultiplier) {
+    endings.push({ offset: 50, minMultiplier: fiftyMinMultiplier, maxMultiplier: fiftyMaxMultiplier });
+  }
+
+  const hundredMinMultiplier = Math.ceil(minimum / 100);
+  const hundredMaxMultiplier = Math.floor(maximum / 100);
+  if (hundredMinMultiplier <= hundredMaxMultiplier) {
+    endings.push({ offset: 0, minMultiplier: hundredMinMultiplier, maxMultiplier: hundredMaxMultiplier });
+  }
+
+  if (endings.length === 0) return null;
+  const selected = endings[secureRandomInt(0, endings.length)];
+  const multiplier = secureRandomInt(selected.minMultiplier, selected.maxMultiplier + 1);
+  return multiplier * 100 + selected.offset;
+}
+
+function randomStakeWithNaturalEnding(minimumValue, maximumValue) {
+  const minimum = Math.max(0, Math.floor(Number(minimumValue || 0)));
+  const maximum = Math.max(minimum, Math.floor(Number(maximumValue || minimum)));
+  if (maximum <= minimum) return minimum;
+
+  if (secureRandomInt(0, 100) < 40) {
+    const friendlyStake = randomStakeEndingWith50Or100(minimum, maximum);
+    if (friendlyStake != null) return friendlyStake;
+  }
+
+  return secureRandomInt(minimum, maximum + 1);
+}
+
 function normalizeRequestedStake(value, difficulty, availableScore, allowAutomatic = false) {
   const minimum = minimumTwoPlayerStake(difficulty);
   const score = Math.max(0, Math.min(Number(availableScore || 0), 2_000_000_000));
   const requested = Math.floor(Number(value || 0));
   if (allowAutomatic && requested <= 0) {
     const { minStake: lower, maxStake: upper } = quickStakeRange(score, difficulty);
-    return upper <= lower ? lower : secureRandomInt(lower, upper + 1);
+    return randomStakeWithNaturalEnding(lower, upper);
   }
   if (!Number.isFinite(requested) || requested < minimum) {
     const error = new Error(`Bu zorluk için oyun puanı en az ${minimum} olmalıdır.`);
@@ -3261,7 +3297,7 @@ function randomStakeForGroup(group, difficulty) {
   const maximum = group.maxScore == null
     ? Math.min(2_000_000_000, Math.max(minimum, minimum * secureRandomInt(2, 15)))
     : Math.max(minimum, group.maxScore);
-  return maximum <= minimum ? minimum : secureRandomInt(minimum, maximum + 1);
+  return randomStakeWithNaturalEnding(minimum, maximum);
 }
 
 function removeOpenTablesForSocket(socketId) {
@@ -3344,6 +3380,15 @@ function safePlayerId(value, fallback = "") {
       .trim()
       .slice(0, 96)
   );
+}
+
+function matchmakingPlayerKey(playerId) {
+  const secret = SESSION_SECRET || "target-number-matchmaking";
+  return crypto
+    .createHmac("sha256", secret)
+    .update(String(playerId || ""))
+    .digest("base64url")
+    .slice(0, 32);
 }
 
 function safePlayer(
@@ -4439,6 +4484,7 @@ io.on("connection", (socket) => {
         ? "tournament"
         : safeText(payload.matchMode, "quick", 32);
       const listingId = safeText(payload.listingId, "", 128);
+      const excludedOpponentMatchKey = safeText(payload.excludedOpponentMatchKey, "", 64);
 
       if (gameKey === "target_number_tournament") {
         difficulty = tournamentStage <= 4 ? "Medium" : "Hard";
@@ -4479,12 +4525,12 @@ io.on("connection", (socket) => {
           table.puzzle, null, null, table.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS
         );
         socket.emit("match_found", {
-          roomId: room.roomId, opponent: { name: table.player.name, country: table.player.country },
+          roomId: room.roomId, opponent: { name: table.player.name, country: table.player.country, matchKey: matchmakingPlayerKey(table.player.id) },
           puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "ready_room",
           startsAtMillis: room.startsAtMillis
         });
         ownerSocket.emit("match_found", {
-          roomId: room.roomId, opponent: { name: player.name, country: player.country },
+          roomId: room.roomId, opponent: { name: player.name, country: player.country, matchKey: matchmakingPlayerKey(player.id) },
           puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "open_table",
           startsAtMillis: room.startsAtMillis
         });
@@ -4515,6 +4561,20 @@ io.on("connection", (socket) => {
         const opponentSocket = io.sockets.sockets.get(opponent.socketId);
         if (!opponentSocket || opponentSocket.id === socket.id) continue;
         if (opponent.player?.id && opponent.player.id === player.id) continue;
+        if (
+          excludedOpponentMatchKey &&
+          matchmakingPlayerKey(opponent.player?.id) === excludedOpponentMatchKey
+        ) {
+          skippedOpponents.push(opponent);
+          continue;
+        }
+        if (
+          opponent.excludedOpponentMatchKey &&
+          matchmakingPlayerKey(player.id) === opponent.excludedOpponentMatchKey
+        ) {
+          skippedOpponents.push(opponent);
+          continue;
+        }
 
         let selectedStake = 0;
         if (gameKey === "target_number") {
@@ -4554,12 +4614,12 @@ io.on("connection", (socket) => {
           gameKey === "target_number" ? TWO_PLAYER_PREPARE_MS : 0
         );
         socket.emit("match_found", {
-          roomId: room.roomId, opponent: { name: opponent.player.name, country: opponent.player.country },
+          roomId: room.roomId, opponent: { name: opponent.player.name, country: opponent.player.country, matchKey: matchmakingPlayerKey(opponent.player.id) },
           puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode,
           startsAtMillis: room.startsAtMillis
         });
         opponentSocket.emit("match_found", {
-          roomId: room.roomId, opponent: { name: player.name, country: player.country },
+          roomId: room.roomId, opponent: { name: player.name, country: player.country, matchKey: matchmakingPlayerKey(player.id) },
           puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode,
           startsAtMillis: room.startsAtMillis
         });
@@ -4573,6 +4633,7 @@ io.on("connection", (socket) => {
         stakePoints: requestedStake, generalScore: identity.generalScore, matchMode,
         quickMinStake: quickRange?.minStake || requestedStake,
         quickMaxStake: quickRange?.maxStake || requestedStake,
+        excludedOpponentMatchKey,
       });
       waitingQueues.set(key, queue);
       await markBotFallbackEligibility(player.id, gameKey, difficulty);
@@ -4713,6 +4774,9 @@ io.on("connection", (socket) => {
             country:
               opponent?.country ||
               "",
+            matchKey: opponent?.playerId
+              ? matchmakingPlayerKey(opponent.playerId)
+              : "",
           },
 
           puzzle: room.puzzle,
@@ -5066,6 +5130,7 @@ io.on("connection", (socket) => {
               room.player.name,
             country:
               room.player.country,
+            matchKey: matchmakingPlayerKey(room.player.id),
           },
 
           puzzle: room.puzzle,
@@ -5083,6 +5148,7 @@ io.on("connection", (socket) => {
             name: player.name,
             country:
               player.country,
+            matchKey: matchmakingPlayerKey(player.id),
           },
 
           puzzle: room.puzzle,
