@@ -1257,6 +1257,50 @@ async function consumeGameRightsForPlayers(playerIds, difficulty, wagerPoints = 
   }
 }
 
+async function refundGameRightInTransaction(client, playerId) {
+  await ensureAuthenticatedPlayer(client, playerId);
+  const state = await normalizeGameRightsInTransaction(client, playerId);
+  const refunded = Math.min(GAME_RIGHT_MAX, state.remainingRights + 1);
+  const anchor = refunded >= GAME_RIGHT_MAX
+    ? Date.now()
+    : state.lastRefillTimeMillis;
+  await client.query(
+    `UPDATE player_progress SET game_rights = $2,
+       game_rights_refill_at = TO_TIMESTAMP($3 / 1000.0), updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, refunded, anchor]
+  );
+}
+
+async function refundConsumedGameRights(playerIds) {
+  if (!pool) return new Map();
+  const uniqueIds = [...new Set((playerIds || []).filter(Boolean).map(String))].sort();
+  if (uniqueIds.length === 0) return new Map();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const playerId of uniqueIds) {
+      await refundGameRightInTransaction(client, playerId);
+    }
+    const states = new Map();
+    for (const playerId of uniqueIds) {
+      states.set(playerId, {
+        ...(await readAuthoritativePlayerState(client, playerId)),
+        generalDelta: 0,
+        infiniteDelta: 0,
+        xpDelta: 0,
+      });
+    }
+    await client.query("COMMIT");
+    return states;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function markBotFallbackEligibility(playerId, gameKey, difficulty) {
   if (!pool || !playerId) return;
   const normalizedGameKey = gameKey === "target_number_tournament"
@@ -3157,11 +3201,47 @@ const TWO_PLAYER_ROOM_GROUPS = [
   { id: "sonsuz", title: "Sonsuz Masa", subtitle: "1.000.000 ve üzeri", minScore: 1_000_000, maxScore: null },
 ];
 
-const LOBBY_BOT_NAMES = [
-  ["MertRüzgar", "TR"], ["LunaFox", "US"], ["Akira77", "JP"], ["SofiaM", "ES"],
-  ["NoahPrime", "GB"], ["Deniz34", "TR"], ["MilaNova", "DE"], ["LeoBR", "BR"],
-  ["ArdaX", "TR"], ["NoraSky", "FR"], ["JinWoo", "KR"], ["Vera88", "RU"],
+const LOBBY_BOT_FIRST_PARTS = [
+  "Atlas", "Luna", "Nova", "Mira", "Arda", "Sora", "Raven", "Astra",
+  "Deniz", "Leo", "Nora", "Akira", "Mert", "Mila", "Vega", "Jin",
+  "Kuzey", "Sofia", "Noah", "Vera", "Ember", "Orion", "Arya", "Kai",
 ];
+const LOBBY_BOT_SECOND_PARTS = [
+  "Fox", "Sky", "Prime", "Storm", "Ruzgar", "Nova", "Moon", "Wolf",
+  "Star", "Blade", "Wave", "Pixel", "Spark", "Zen", "Knight", "Dream",
+];
+const LOBBY_BOT_COUNTRIES = [
+  "TR", "US", "GB", "ES", "FR", "DE", "IT", "BR", "MX", "ID", "RU", "UA",
+  "JP", "CN", "KR", "TH", "EG", "SA", "IR", "IN", "BD", "PK", "VN", "AR",
+];
+
+function createLobbyBotIdentity(usedNames = new Set()) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const first = LOBBY_BOT_FIRST_PARTS[secureRandomInt(0, LOBBY_BOT_FIRST_PARTS.length)];
+    const second = LOBBY_BOT_SECOND_PARTS[secureRandomInt(0, LOBBY_BOT_SECOND_PARTS.length)];
+    const number = secureRandomInt(1, 1000);
+    const pattern = secureRandomInt(0, 5);
+    const name = pattern === 0
+      ? `${first}${second}`
+      : pattern === 1
+        ? `${first}.${second}`
+        : pattern === 2
+          ? `${first}${number}`
+          : pattern === 3
+            ? `${second}${first}`
+            : `${first}_${second}${secureRandomInt(1, 100)}`;
+    if (!usedNames.has(name)) {
+      usedNames.add(name);
+      return {
+        name,
+        country: LOBBY_BOT_COUNTRIES[secureRandomInt(0, LOBBY_BOT_COUNTRIES.length)],
+      };
+    }
+  }
+  const fallbackName = `Oyuncu${crypto.randomBytes(4).toString("hex")}`;
+  usedNames.add(fallbackName);
+  return { name: fallbackName, country: "TR" };
+}
 
 function roomGroupForStake(stakePoints) {
   const stake = Math.max(0, Number(stakePoints || 0));
@@ -3212,6 +3292,11 @@ const ROOM_RECONNECT_TIMEOUT_MS = Number(
 const REALTIME_MATCH_LIMIT_MS = Number(
   process.env.REALTIME_MATCH_LIMIT_MS ||
     2 * 60 * 1000
+);
+
+const TWO_PLAYER_PREPARE_MS = Number(
+  process.env.TWO_PLAYER_PREPARE_MS ||
+    10 * 1000
 );
 
 const RESOLVED_ROOM_TTL_MS = Number(
@@ -3647,7 +3732,8 @@ function createRealtimeRoom(
   tournamentStage = null,
   opponentTournamentStage = null,
   stakePoints = 0,
-  matchMode = "quick"
+  matchMode = "quick",
+  prepareMs = 0
 ) {
   const roomId =
     typeof crypto.randomUUID ===
@@ -3657,6 +3743,8 @@ function createRealtimeRoom(
           .randomBytes(16)
           .toString("hex");
 
+  const createdAt = Date.now();
+  const safePrepareMs = Math.max(0, Math.min(Number(prepareMs || 0), 30_000));
   const room = {
     roomId,
     gameKey,
@@ -3664,7 +3752,8 @@ function createRealtimeRoom(
     puzzle,
     stakePoints: Math.max(0, Math.floor(Number(stakePoints || 0))),
     matchMode: safeText(matchMode, "quick", 32),
-    createdAt: Date.now(),
+    createdAt,
+    startsAtMillis: createdAt + safePrepareMs,
     resolved: false,
     resolvedReason: null,
     resolvedAt: null,
@@ -3729,7 +3818,7 @@ function createRealtimeRoom(
     resolveRoomByGameDeadline(room.roomId).catch((error) => {
       console.error("realtime deadline handler error:", error);
     });
-  }, REALTIME_MATCH_LIMIT_MS);
+  }, safePrepareMs + REALTIME_MATCH_LIMIT_MS);
   if (typeof room.deadlineHandle.unref === "function") {
     room.deadlineHandle.unref();
   }
@@ -3919,32 +4008,68 @@ function leaveRoomAsCancel(socket) {
       opponent &&
       !opponent.finishedAt
     ) {
-      markRoomResolved(
-        room,
-        "cancelled",
-        opponent.playerId,
-        participant.playerId
-      );
+      const isFreePreparationExit =
+        !room.isFriend &&
+        room.gameKey === "target_number" &&
+        Date.now() < Number(room.startsAtMillis || 0);
 
-      awardRealtimeRoom(room, opponent, participant).catch((error) => {
-        console.error("realtime cancel reward error:", error);
-      });
+      if (isFreePreparationExit) {
+        const participants = roomParticipants(room);
+        markRoomResolved(room, "prestart_cancelled", null, null);
 
-      const opponentSocket =
-        opponent.socketId
-          ? io.sockets.sockets.get(
-              opponent.socketId
-            )
+        refundConsumedGameRights(participants.map((item) => item.playerId))
+          .then((states) => {
+            participants.forEach((item) => {
+              const participantSocket = item.socketId
+                ? io.sockets.sockets.get(item.socketId)
+                : null;
+              const state = states.get(item.playerId);
+              if (participantSocket && state) {
+                participantSocket.emit("authoritative_reward", state);
+              }
+            });
+          })
+          .catch((error) => {
+            console.error("prestart game-right refund error:", error);
+          });
+
+        const opponentSocket = opponent.socketId
+          ? io.sockets.sockets.get(opponent.socketId)
           : null;
-
-      if (opponentSocket) {
-        opponentSocket.emit(
-          "opponent_left",
-          {
+        if (opponentSocket) {
+          opponentSocket.emit("opponent_left", {
             roomId: room.roomId,
-            reason: "cancelled",
-          }
+            reason: "prestart_cancelled",
+          });
+        }
+      } else {
+        markRoomResolved(
+          room,
+          "cancelled",
+          opponent.playerId,
+          participant.playerId
         );
+
+        awardRealtimeRoom(room, opponent, participant).catch((error) => {
+          console.error("realtime cancel reward error:", error);
+        });
+
+        const opponentSocket =
+          opponent.socketId
+            ? io.sockets.sockets.get(
+                opponent.socketId
+              )
+            : null;
+
+        if (opponentSocket) {
+          opponentSocket.emit(
+            "opponent_left",
+            {
+              roomId: room.roomId,
+              reason: "cancelled",
+            }
+          );
+        }
       }
     }
 
@@ -4205,6 +4330,7 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
       .sort((a, b) => a.createdAt - b.createdAt);
 
     const usedListings = new Set();
+    const usedLobbyBotNames = new Set(realTables.map((table) => table.player.name));
     const groups = TWO_PLAYER_ROOM_GROUPS.map((group, groupIndex) => {
       const targetCount = roomTargetCount(groupIndex);
       const matchingReal = realTables.filter((table) => {
@@ -4222,12 +4348,12 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         isBot: false,
       }));
       while (rooms.length < targetCount) {
-        const [name, country] = LOBBY_BOT_NAMES[secureRandomInt(0, LOBBY_BOT_NAMES.length)];
+        const botIdentity = createLobbyBotIdentity(usedLobbyBotNames);
         const stakePoints = randomStakeForGroup(group, difficulty);
         rooms.push({
           listingId: `bot:${group.id}:${crypto.randomBytes(8).toString("hex")}`,
-          opponentName: name,
-          opponentCountry: country,
+          opponentName: botIdentity.name,
+          opponentCountry: botIdentity.country,
           stakePoints,
           isBot: true,
         });
@@ -4350,15 +4476,17 @@ io.on("connection", (socket) => {
         await clearBotFallbackEligibilityForPlayers([player.id, table.player.id]);
         const room = createRealtimeRoom(
           socket, player, ownerSocket, table.player, "target_number", table.difficulty,
-          table.puzzle, null, null, table.stakePoints, "ready_room"
+          table.puzzle, null, null, table.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS
         );
         socket.emit("match_found", {
           roomId: room.roomId, opponent: { name: table.player.name, country: table.player.country },
-          puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "ready_room"
+          puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "ready_room",
+          startsAtMillis: room.startsAtMillis
         });
         ownerSocket.emit("match_found", {
           roomId: room.roomId, opponent: { name: player.name, country: player.country },
-          puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "open_table"
+          puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "open_table",
+          startsAtMillis: room.startsAtMillis
         });
         return;
       }
@@ -4422,15 +4550,18 @@ io.on("connection", (socket) => {
         await clearBotFallbackEligibilityForPlayers([player.id, opponent.player.id]);
         const room = createRealtimeRoom(
           socket, player, opponentSocket, opponent.player, gameKey, difficulty, selectedPuzzle,
-          tournamentStage, opponent.tournamentStage, selectedStake, matchMode
+          tournamentStage, opponent.tournamentStage, selectedStake, matchMode,
+          gameKey === "target_number" ? TWO_PLAYER_PREPARE_MS : 0
         );
         socket.emit("match_found", {
           roomId: room.roomId, opponent: { name: opponent.player.name, country: opponent.player.country },
-          puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode
+          puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode,
+          startsAtMillis: room.startsAtMillis
         });
         opponentSocket.emit("match_found", {
           roomId: room.roomId, opponent: { name: player.name, country: player.country },
-          puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode
+          puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode,
+          startsAtMillis: room.startsAtMillis
         });
         console.log("Match found:", room.roomId, key, "stake:", selectedStake);
         return;
@@ -4587,6 +4718,7 @@ io.on("connection", (socket) => {
           puzzle: room.puzzle,
           stakePoints: room.stakePoints || 0,
           matchMode: room.matchMode || "quick",
+          startsAtMillis: room.startsAtMillis || room.createdAt,
 
           opponentFinishedMs:
             Number(
@@ -5010,6 +5142,14 @@ io.on("connection", (socket) => {
         return;
       }
 
+      if (Date.now() < Number(room.startsAtMillis || room.createdAt || 0)) {
+        socket.emit("match_error", {
+          code: "MATCH_NOT_STARTED",
+          message: "Hazırlık geri sayımı henüz tamamlanmadı.",
+        });
+        return;
+      }
+
       if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators)) {
         socket.emit("match_error", {
           code: "INVALID_SOLUTION",
@@ -5022,7 +5162,10 @@ io.on("connection", (socket) => {
 
       // Süre istemciden alınmaz. Cihaz saati veya değiştirilmiş APK sonucu
       // etkileyemesin diye oda başlangıcından sunucu saatiyle hesaplanır.
-      participant.elapsedMs = Math.max(1, participant.finishedAt - room.createdAt);
+      participant.elapsedMs = Math.max(
+        1,
+        participant.finishedAt - Number(room.startsAtMillis || room.createdAt)
+      );
 
       clearParticipantAwayState(
         room,
