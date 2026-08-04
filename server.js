@@ -252,7 +252,7 @@ async function initDatabase() {
       total_xp INTEGER NOT NULL DEFAULT 0 CHECK (total_xp >= 0),
       infinite_run_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
       infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
-      tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 12),
+      tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
       tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3),
       tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
       tournament_completed BOOLEAN NOT NULL DEFAULT FALSE,
@@ -287,6 +287,16 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS tournament_bank INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
+
+    UPDATE player_progress
+      SET tournament_stage = LEAST(GREATEST(tournament_stage, 1), 8);
+    ALTER TABLE player_progress
+      DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check;
+    ALTER TABLE player_progress
+      DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check_v2;
+    ALTER TABLE player_progress
+      ADD CONSTRAINT player_progress_tournament_stage_check_v2
+      CHECK (tournament_stage BETWEEN 1 AND 8);
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS hundred_active BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_progress
@@ -1000,8 +1010,9 @@ async function ensurePlayerForScore(
 }
 
 
-function secureDifficulty(value) {
-  return String(value || "Medium") === "Hard" ? "Hard" : "Medium";
+function secureDifficulty(_value) {
+  // İstemciden eski Medium/Hard değeri gelse bile bütün yeni oyunlar tek seviyededir.
+  return "Standard";
 }
 
 function shuffled(values) {
@@ -1092,29 +1103,32 @@ function buildSolvableTarget(numbers, minTarget, maxTarget, requireMultiplyOrDiv
 
 function generateSecurePuzzle(difficultyValue) {
   const difficulty = secureDifficulty(difficultyValue);
-  const count = difficulty === "Hard" ? 4 : 3;
-  const min = difficulty === "Hard" ? 2 : 1;
-  const max = difficulty === "Hard" ? 20 : 9;
-  const targetMin = difficulty === "Hard" ? 21 : 1;
-  const targetMax = difficulty === "Hard" ? 199 : 49;
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    const numbers = [];
-    let oneUsed = false;
-    while (numbers.length < count) {
-      const value = crypto.randomInt(min, max + 1);
-      if (value === 1 && oneUsed) continue;
-      if (value === 1) oneUsed = true;
-      numbers.push(value);
-    }
-    const shuffledNumbers = shuffled(numbers);
-    const target = buildSolvableTarget(shuffledNumbers, targetMin, targetMax, difficulty === "Hard");
-    if (target !== null) return { difficulty, target, numbers: shuffledNumbers };
-  }
-  return difficulty === "Hard"
-    ? { difficulty, target: 24, numbers: shuffled([10, 10, 5, 4]) }
-    : { difficulty, target: 15, numbers: shuffled([3, 5, 7]) };
-}
+  const count = secureRandomInt(3, 5); // 3 veya 4 sayı
 
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const numbers = Array.from({ length: count }, () => secureRandomInt(2, 10));
+    const operatorCount = count - 1;
+    const operators = [];
+
+    // Her bulmacada en az bir ×/÷ ve en az bir +/− bulunur.
+    operators.push(["×", "÷"][secureRandomInt(0, 2)]);
+    operators.push(["+", "−"][secureRandomInt(0, 2)]);
+    while (operators.length < operatorCount) {
+      operators.push(["+", "−", "×", "÷"][secureRandomInt(0, 4)]);
+    }
+
+    const shuffledNumbers = shuffled(numbers);
+    const shuffledOperators = shuffled(operators);
+    const result = evaluateExpression(shuffledNumbers, shuffledOperators);
+    if (result === null) continue;
+    const rounded = Math.round(result);
+    if (Math.abs(result - rounded) < 0.0001 && rounded >= 1 && rounded < 100) {
+      return { difficulty, target: rounded, numbers: shuffledNumbers };
+    }
+  }
+
+  return { difficulty, target: 20, numbers: shuffled([2, 4, 5]) };
+}
 function challengeRewards(mode, stage) {
   const safeStage = Math.max(1, Math.min(Number(stage || 1), 1000));
   if (mode === "infinite") {
@@ -1126,15 +1140,41 @@ function challengeRewards(mode, stage) {
   return { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 };
 }
 
+const TOURNAMENT_STAGE_REWARDS = [50, 150, 350, 1000, 2500, 7000, 18000, 50000];
+
 function tournamentStageReward(stageValue) {
-  const stage = Math.max(1, Math.min(Number(stageValue || 1), 12));
-  return stage >= 12 ? 480 : stage * 20;
+  const stage = Math.max(1, Math.min(Number(stageValue || 1), TOURNAMENT_STAGE_REWARDS.length));
+  return TOURNAMENT_STAGE_REWARDS[stage - 1];
 }
 
 const GAME_RIGHT_MAX = 10;
 const GAME_RIGHT_REFILL_MS = 10 * 60 * 1000;
 const BOT_FALLBACK_MIN_WAIT_MS = 20 * 1000;
 const USERNAME_CHANGE_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
+const OPEN_TABLE_MIN_SCORE = 1_000;
+const MULTI_ROUND_MIN_SCORE_EXCLUSIVE = 2_000;
+
+function normalizeRoundCount(value) {
+  return Math.max(1, Math.min(Math.floor(Number(value || 1)), 3));
+}
+
+function assertRoundCountEligibility(roundCountValue, generalScore, stakePoints = 0) {
+  const roundCount = normalizeRoundCount(roundCountValue);
+  const score = Math.max(0, Number(generalScore || 0));
+  if (score < OPEN_TABLE_MIN_SCORE) {
+    const error = new Error("Masa açmak için en az 1.000 genel puan gerekir.");
+    error.statusCode = 409;
+    error.publicCode = "OPEN_TABLE_SCORE_REQUIRED";
+    throw error;
+  }
+  if (roundCount > 1 && score <= MULTI_ROUND_MIN_SCORE_EXCLUSIVE) {
+    const error = new Error("2 veya 3 ellik masa açmak/oynamak için 2.000 puandan fazla puan gerekir.");
+    error.statusCode = 409;
+    error.publicCode = "MULTI_ROUND_SCORE_REQUIRED";
+    throw error;
+  }
+  return roundCount;
+}
 
 async function normalizeGameRightsInTransaction(client, playerId) {
   await ensureAuthenticatedPlayer(client, playerId);
@@ -1229,6 +1269,12 @@ function minimumOpenTableStake(availableScore, difficulty) {
 }
 
 function assertOpenTableStake(stakePoints, availableScore, difficulty) {
+  if (Number(availableScore || 0) < OPEN_TABLE_MIN_SCORE) {
+    const error = new Error("Masa açmak için en az 1.000 genel puan gerekir.");
+    error.statusCode = 409;
+    error.publicCode = "OPEN_TABLE_SCORE_REQUIRED";
+    throw error;
+  }
   const minimum = minimumOpenTableStake(availableScore, difficulty);
   const requested = Math.floor(Number(stakePoints || 0));
   if (!Number.isFinite(requested) || requested < minimum) {
@@ -1581,7 +1627,7 @@ async function readAuthoritativePlayerState(client, playerId) {
       country: safeCountry(row.country),
     },
     tournament: {
-      currentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 12)),
+      currentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
       remainingRights: Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3)),
       totalScore: Math.max(0, Number(row.tournament_bank || 0)),
       completed: row.tournament_completed === true,
@@ -1602,11 +1648,11 @@ async function applyTournamentOutcomeInTransaction(client, playerId, won, reques
     [playerId]
   );
   const row = locked.rows[0] || {};
-  const currentStage = Math.max(1, Math.min(Number(row.tournament_stage || 1), 12));
+  const currentStage = Math.max(1, Math.min(Number(row.tournament_stage || 1), 8));
   const remainingRights = Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3));
   const bank = Math.max(0, Number(row.tournament_bank || 0));
   const completedBefore = row.tournament_completed === true;
-  const stage = Math.max(1, Math.min(Number(requestedStage || currentStage), 12));
+  const stage = Math.max(1, Math.min(Number(requestedStage || currentStage), 8));
   if (stage !== currentStage || completedBefore || remainingRights <= 0) {
     const error = new Error("Turnuva aşaması sunucu ilerlemesiyle uyuşmuyor.");
     error.statusCode = 409;
@@ -1625,8 +1671,8 @@ async function applyTournamentOutcomeInTransaction(client, playerId, won, reques
     const stageReward = tournamentStageReward(currentStage);
     nextBank = Math.min(2_000_000_000, bank + stageReward);
     xpDelta = stageReward;
-    completed = currentStage >= 12;
-    nextStage = completed ? 12 : currentStage + 1;
+    completed = currentStage >= 8;
+    nextStage = completed ? 8 : currentStage + 1;
     if (completed) awardedScore = nextBank;
   } else if (won === false) {
     nextRights = Math.max(0, remainingRights - 1);
@@ -2148,52 +2194,54 @@ async function awardRealtimeRoom(room, winner, loser) {
   if (!room || room.awardedAt) return;
   room.awardedAt = Date.now();
 
+  const realWinner = winner && !winner.isBot ? winner : null;
+  const realLoser = loser && !loser.isBot ? loser : null;
+
   if (room.isFriend) {
     await Promise.all([
-      winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
-      loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
+      realWinner ? recordTaskGameEvent(realWinner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
+      realLoser ? recordTaskGameEvent(realLoser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
     ]);
     return;
   }
 
   if (room.gameKey === "target_number_tournament") {
     const [winnerState, loserState] = await Promise.all([
-      winner ? applyTournamentOutcome(winner.playerId, true, winner.tournamentStage) : null,
-      loser ? applyTournamentOutcome(loser.playerId, false, loser.tournamentStage) : null,
+      realWinner ? applyTournamentOutcome(realWinner.playerId, true, realWinner.tournamentStage) : null,
+      realLoser ? applyTournamentOutcome(realLoser.playerId, false, realLoser.tournamentStage) : null,
     ]);
-    const winnerSocket = winner?.socketId ? io.sockets.sockets.get(winner.socketId) : null;
-    const loserSocket = loser?.socketId ? io.sockets.sockets.get(loser.socketId) : null;
+    const winnerSocket = realWinner?.socketId ? io.sockets.sockets.get(realWinner.socketId) : null;
+    const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
     if (winnerSocket && winnerState) winnerSocket.emit("authoritative_tournament", winnerState);
     if (loserSocket && loserState) loserSocket.emit("authoritative_tournament", loserState);
     await Promise.all([
-      winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
-      loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
+      realWinner ? recordTaskGameEvent(realWinner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
+      realLoser ? recordTaskGameEvent(realLoser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
     ]);
     return;
   }
 
   if (room.gameKey !== "target_number") return;
   const reward = Math.max(minimumTwoPlayerStake(room.difficulty), Number(room.stakePoints || 0));
-  const winnerXp = secureDifficulty(room.difficulty) === "Hard" ? 30 : 20;
+  const winnerXp = 20;
   const [winnerState, loserState] = await Promise.all([
-    winner ? applyAuthoritativeScoreDelta(winner.playerId, reward, 0, winnerXp) : null,
-    loser ? applyAuthoritativeScoreDelta(loser.playerId, -reward, 0, 0) : null,
+    realWinner ? applyAuthoritativeScoreDelta(realWinner.playerId, reward, 0, winnerXp) : null,
+    realLoser ? applyAuthoritativeScoreDelta(realLoser.playerId, -reward, 0, 0) : null,
   ]);
-  const winnerSocket = winner?.socketId ? io.sockets.sockets.get(winner.socketId) : null;
-  const loserSocket = loser?.socketId ? io.sockets.sockets.get(loser.socketId) : null;
+  const winnerSocket = realWinner?.socketId ? io.sockets.sockets.get(realWinner.socketId) : null;
+  const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
   if (winnerSocket && winnerState) winnerSocket.emit("authoritative_reward", winnerState);
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
-  if (winner?.elapsedMs != null) {
+  if (realWinner?.totalElapsedMs != null) {
     try {
-      // Gerçek oyunculu normal ikili maçta süre istemciden değil sunucu saatinden gelir.
-      await recordTwoPlayerFinishTime(winner.playerId, winner.elapsedMs);
+      await recordTwoPlayerFinishTime(realWinner.playerId, realWinner.totalElapsedMs);
     } catch (error) {
       console.error("two-player finish average update error:", error);
     }
   }
   await Promise.all([
-    winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
-    loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
+    realWinner ? recordTaskGameEvent(realWinner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
+    realLoser ? recordTaskGameEvent(realLoser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
   ]);
 }
 
@@ -2447,8 +2495,8 @@ app.post("/game/bot/start", requireAuth, async (req, res) => {
         error.statusCode = 409;
         throw error;
       }
-      stage = Math.max(1, Math.min(Number(progress.tournament_stage || 1), 12));
-      difficulty = stage <= 4 ? "Medium" : "Hard";
+      stage = Math.max(1, Math.min(Number(progress.tournament_stage || 1), 8));
+      difficulty = "Standard";
     }
 
     const puzzle = generateSecurePuzzle(difficulty);
@@ -3390,6 +3438,7 @@ const activeRooms = new Map();
 const realtimeRooms = new Map();
 const privateRooms = new Map();
 const publicOpenTables = new Map();
+const generatedLobbyBots = new Map();
 
 const TWO_PLAYER_ROOM_GROUPS = [
   { id: "acemi", title: "Acemi Masaları", subtitle: "10 - 100", minScore: 10, maxScore: 100 },
@@ -3455,6 +3504,19 @@ function roomTargetCount(groupIndex) {
   if (groupIndex <= 4) return 10;
   if (groupIndex === 5) return secureRandomInt(5, 11);
   return secureRandomInt(2, 6);
+}
+
+function generatedRoomRoundCount(groupIndex, currentMultiRoomCount, targetCount) {
+  if (groupIndex < 3) return 1;
+  const desiredMultiRoomCount = Math.round(targetCount / 2);
+  return currentMultiRoomCount < desiredMultiRoomCount ? secureRandomInt(2, 4) : 1;
+}
+
+function expireGeneratedLobbyBots() {
+  const now = Date.now();
+  for (const [listingId, bot] of generatedLobbyBots.entries()) {
+    if (now - Number(bot.createdAt || 0) > 3 * 60 * 1000) generatedLobbyBots.delete(listingId);
+  }
 }
 
 function randomStakeForGroup(group, difficulty) {
@@ -3693,6 +3755,10 @@ function clearRoomTimeouts(room) {
   if (room?.deadlineHandle) {
     clearTimeout(room.deadlineHandle);
     room.deadlineHandle = null;
+  }
+  if (room?.botFinishHandle) {
+    clearTimeout(room.botFinishHandle);
+    room.botFinishHandle = null;
   }
 }
 
@@ -3946,6 +4012,190 @@ function scheduleParticipantAwayTimeout(
   }
 }
 
+function emitToRoomParticipant(participant, eventName, payload) {
+  if (!participant?.socketId) return;
+  const targetSocket = io.sockets.sockets.get(participant.socketId);
+  if (targetSocket) targetSocket.emit(eventName, payload);
+}
+
+function realtimeRoundWinner(room, first, second) {
+  const firstElapsed = Number(first?.roundElapsedMs ?? REALTIME_MATCH_LIMIT_MS);
+  const secondElapsed = Number(second?.roundElapsedMs ?? REALTIME_MATCH_LIMIT_MS);
+  if (firstElapsed < secondElapsed) return first;
+  if (secondElapsed < firstElapsed) return second;
+  return String(first?.playerId || "").localeCompare(String(second?.playerId || "")) <= 0 ? first : second;
+}
+
+function realtimeMatchWinner(room) {
+  const participants = roomParticipants(room);
+  if (participants.length !== 2) return participants[0] || null;
+  const [first, second] = participants;
+  if (room.roundCount === 3) {
+    if (first.roundWins >= 2) return first;
+    if (second.roundWins >= 2) return second;
+  }
+  if (room.roundIndex + 1 < room.roundCount) return null;
+  if (first.roundWins !== second.roundWins) return first.roundWins > second.roundWins ? first : second;
+  if (first.totalElapsedMs !== second.totalElapsedMs) {
+    return first.totalElapsedMs < second.totalElapsedMs ? first : second;
+  }
+  return String(first.playerId).localeCompare(String(second.playerId)) <= 0 ? first : second;
+}
+
+function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
+  if (!room || room.resolved || !winner) return;
+  const loser = getOpponentParticipant(room, winner.playerId);
+  markRoomResolved(room, reason, winner.playerId, loser?.playerId);
+
+  roomParticipants(room).forEach((participant) => {
+    const opponent = getOpponentParticipant(room, participant.playerId);
+    emitToRoomParticipant(participant, "match_completed", {
+      roomId: room.roomId,
+      won: participant.playerId === winner.playerId,
+      myRoundWins: Number(participant.roundWins || 0),
+      opponentRoundWins: Number(opponent?.roundWins || 0),
+      myTotalElapsedMs: Number(participant.totalElapsedMs || 0),
+      opponentTotalElapsedMs: Number(opponent?.totalElapsedMs || 0),
+    });
+  });
+
+  awardRealtimeRoom(room, winner, loser).catch((error) => {
+    console.error("realtime reward error:", error);
+  });
+}
+
+function scheduleRealtimeRound(room, prepareMs = 3_000) {
+  if (!room || room.resolved) return;
+  if (room.deadlineHandle) clearTimeout(room.deadlineHandle);
+  if (room.botFinishHandle) clearTimeout(room.botFinishHandle);
+
+  room.puzzle = room.puzzles[room.roundIndex] || generateSecurePuzzle(room.difficulty);
+  const safePrepareMs = Math.max(0, Math.min(Number(prepareMs || 0), 30_000));
+  room.startsAtMillis = Date.now() + safePrepareMs;
+
+  roomParticipants(room).forEach((participant) => {
+    participant.finishedAt = null;
+    participant.elapsedMs = null;
+    participant.roundElapsedMs = null;
+    participant.finishedRoundIndex = null;
+  });
+
+  room.deadlineHandle = setTimeout(() => {
+    if (room.resolved) return;
+    roomParticipants(room).forEach((participant) => {
+      if (participant.finishedRoundIndex !== room.roundIndex) {
+        participant.finishedAt = Date.now();
+        participant.elapsedMs = REALTIME_MATCH_LIMIT_MS;
+        participant.roundElapsedMs = REALTIME_MATCH_LIMIT_MS;
+        participant.finishedRoundIndex = room.roundIndex;
+      }
+    });
+    resolveRealtimeRound(room);
+  }, safePrepareMs + REALTIME_MATCH_LIMIT_MS);
+  if (typeof room.deadlineHandle.unref === "function") room.deadlineHandle.unref();
+
+  const botParticipant = roomParticipants(room).find((participant) => participant.isBot);
+  if (botParticipant) {
+    const botElapsedMs = secureRandomInt(15_000, Math.min(95_000, REALTIME_MATCH_LIMIT_MS - 1) + 1);
+    room.botFinishHandle = setTimeout(() => {
+      registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
+    }, safePrepareMs + botElapsedMs);
+    if (typeof room.botFinishHandle.unref === "function") room.botFinishHandle.unref();
+  }
+}
+
+function registerRealtimeRoundFinish(room, participant, elapsedMs) {
+  if (!room || !participant || room.resolved) return;
+  if (participant.finishedRoundIndex === room.roundIndex) return;
+  const safeElapsedMs = Math.max(1, Math.min(Number(elapsedMs || 1), REALTIME_MATCH_LIMIT_MS));
+  participant.finishedAt = Date.now();
+  participant.elapsedMs = safeElapsedMs;
+  participant.roundElapsedMs = safeElapsedMs;
+  participant.finishedRoundIndex = room.roundIndex;
+  clearParticipantAwayState(room, participant.playerId);
+
+  const opponent = getOpponentParticipant(room, participant.playerId);
+  emitToRoomParticipant(opponent, "opponent_finished", {
+    roomId: room.roomId,
+    elapsedMs: safeElapsedMs,
+    roundIndex: room.roundIndex,
+    roundCount: room.roundCount,
+  });
+
+  const participants = roomParticipants(room);
+  if (room.roundCount !== 2) {
+    const unfinishedOpponent = getOpponentParticipant(room, participant.playerId);
+    if (unfinishedOpponent && unfinishedOpponent.finishedRoundIndex !== room.roundIndex) {
+      unfinishedOpponent.finishedAt = Date.now();
+      unfinishedOpponent.elapsedMs = REALTIME_MATCH_LIMIT_MS;
+      unfinishedOpponent.roundElapsedMs = REALTIME_MATCH_LIMIT_MS;
+      unfinishedOpponent.finishedRoundIndex = room.roundIndex;
+    }
+    resolveRealtimeRound(room);
+  } else if (participants.every((item) => item.finishedRoundIndex === room.roundIndex)) {
+    // İki ellik maçta 1-1 ihtimali bulunduğu için her iki oyuncunun gerçek
+    // bitirme süresi alınır ve toplam süre beraberlik bozucu olarak kullanılır.
+    resolveRealtimeRound(room);
+  }
+}
+
+function resolveRealtimeRound(room) {
+  if (!room || room.resolved) return;
+  const participants = roomParticipants(room);
+  if (participants.length !== 2) return;
+  if (!participants.every((item) => item.finishedRoundIndex === room.roundIndex)) return;
+  if (room.deadlineHandle) {
+    clearTimeout(room.deadlineHandle);
+    room.deadlineHandle = null;
+  }
+  if (room.botFinishHandle) {
+    clearTimeout(room.botFinishHandle);
+    room.botFinishHandle = null;
+  }
+
+  const [first, second] = participants;
+  const roundWinner = realtimeRoundWinner(room, first, second);
+  roundWinner.roundWins += 1;
+  participants.forEach((participant) => {
+    participant.totalElapsedMs += Number(participant.roundElapsedMs || REALTIME_MATCH_LIMIT_MS);
+  });
+
+  participants.forEach((participant) => {
+    const opponent = getOpponentParticipant(room, participant.playerId);
+    emitToRoomParticipant(participant, "round_result", {
+      roomId: room.roomId,
+      roundIndex: room.roundIndex,
+      roundCount: room.roundCount,
+      myRoundWins: participant.roundWins,
+      opponentRoundWins: opponent?.roundWins || 0,
+      myElapsedMs: participant.roundElapsedMs,
+      opponentElapsedMs: opponent?.roundElapsedMs || 0,
+      wonRound: participant.playerId === roundWinner.playerId,
+    });
+  });
+
+  const matchWinner = realtimeMatchWinner(room);
+  if (matchWinner) {
+    finishRealtimeMatch(room, matchWinner);
+    return;
+  }
+
+  room.roundIndex += 1;
+  scheduleRealtimeRound(room, 3_000);
+  participants.forEach((participant) => {
+    const opponent = getOpponentParticipant(room, participant.playerId);
+    emitToRoomParticipant(participant, "next_round", {
+      roomId: room.roomId,
+      puzzle: room.puzzle,
+      roundIndex: room.roundIndex,
+      roundCount: room.roundCount,
+      startsAtMillis: room.startsAtMillis,
+      myRoundWins: participant.roundWins,
+      opponentRoundWins: opponent?.roundWins || 0,
+    });
+  });
+}
+
 function createRealtimeRoom(
   socket,
   player,
@@ -3958,27 +4208,31 @@ function createRealtimeRoom(
   opponentTournamentStage = null,
   stakePoints = 0,
   matchMode = "quick",
-  prepareMs = 0
+  prepareMs = 0,
+  roundCountValue = 1,
+  suppliedPuzzles = null
 ) {
-  const roomId =
-    typeof crypto.randomUUID ===
-    "function"
-      ? crypto.randomUUID()
-      : crypto
-          .randomBytes(16)
-          .toString("hex");
+  const roomId = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString("hex");
 
   const createdAt = Date.now();
-  const safePrepareMs = Math.max(0, Math.min(Number(prepareMs || 0), 30_000));
+  const roundCount = gameKey === "target_number" ? normalizeRoundCount(roundCountValue) : 1;
+  const puzzles = Array.isArray(suppliedPuzzles) && suppliedPuzzles.length >= roundCount
+    ? suppliedPuzzles.slice(0, roundCount)
+    : [puzzle, ...Array.from({ length: Math.max(0, roundCount - 1) }, () => generateSecurePuzzle(difficulty))];
   const room = {
     roomId,
     gameKey,
-    difficulty,
-    puzzle,
+    difficulty: secureDifficulty(difficulty),
+    puzzle: puzzles[0],
+    puzzles,
+    roundCount,
+    roundIndex: 0,
     stakePoints: Math.max(0, Math.floor(Number(stakePoints || 0))),
     matchMode: safeText(matchMode, "quick", 32),
     createdAt,
-    startsAtMillis: createdAt + safePrepareMs,
+    startsAtMillis: createdAt,
     resolved: false,
     resolvedReason: null,
     resolvedAt: null,
@@ -3987,6 +4241,7 @@ function createRealtimeRoom(
     isFriend: false,
     awardedAt: null,
     deadlineHandle: null,
+    botFinishHandle: null,
 
     participants: {
       [player.id]: {
@@ -3994,6 +4249,7 @@ function createRealtimeRoom(
         socketId: socket.id,
         name: player.name,
         country: player.country,
+        isBot: false,
         connected: true,
         awaySince: null,
         backgrounded: false,
@@ -4001,53 +4257,39 @@ function createRealtimeRoom(
         timeoutHandle: null,
         finishedAt: null,
         elapsedMs: null,
-        tournamentStage: tournamentStage == null
-          ? null
-          : Math.max(1, Math.min(Number(tournamentStage || 1), 12)),
+        roundElapsedMs: null,
+        finishedRoundIndex: null,
+        roundWins: 0,
+        totalElapsedMs: 0,
+        tournamentStage: tournamentStage == null ? null : Math.max(1, Math.min(Number(tournamentStage || 1), 8)),
       },
 
       [opponentPlayer.id]: {
         playerId: opponentPlayer.id,
-        socketId: opponentSocket.id,
+        socketId: opponentSocket?.id || null,
         name: opponentPlayer.name,
         country: opponentPlayer.country,
-        connected: true,
+        isBot: opponentPlayer.isBot === true,
+        connected: opponentPlayer.isBot === true || Boolean(opponentSocket),
         awaySince: null,
         backgrounded: false,
         reconnectDeadlineAt: null,
         timeoutHandle: null,
         finishedAt: null,
         elapsedMs: null,
-        tournamentStage: opponentTournamentStage == null
-          ? null
-          : Math.max(1, Math.min(Number(opponentTournamentStage || 1), 12)),
+        roundElapsedMs: null,
+        finishedRoundIndex: null,
+        roundWins: 0,
+        totalElapsedMs: 0,
+        tournamentStage: opponentTournamentStage == null ? null : Math.max(1, Math.min(Number(opponentTournamentStage || 1), 8)),
       },
     },
   };
 
   realtimeRooms.set(roomId, room);
-
-  attachSocketToRoom(
-    socket,
-    room,
-    player.id
-  );
-
-  attachSocketToRoom(
-    opponentSocket,
-    room,
-    opponentPlayer.id
-  );
-
-  room.deadlineHandle = setTimeout(() => {
-    resolveRoomByGameDeadline(room.roomId).catch((error) => {
-      console.error("realtime deadline handler error:", error);
-    });
-  }, safePrepareMs + REALTIME_MATCH_LIMIT_MS);
-  if (typeof room.deadlineHandle.unref === "function") {
-    room.deadlineHandle.unref();
-  }
-
+  attachSocketToRoom(socket, room, player.id);
+  if (opponentSocket) attachSocketToRoom(opponentSocket, room, opponentPlayer.id);
+  scheduleRealtimeRound(room, prepareMs);
   return room;
 }
 
@@ -4527,7 +4769,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
     const row = result.rows[0] || {};
     return {
       player: safePlayer({ id: session.sub, name: row.username, country: row.country }, session.sub),
-      tournamentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 12)),
+      tournamentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
       generalScore: Math.max(0, Number(row.general_score || 0)),
     };
   } catch (error) {
@@ -4543,6 +4785,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
 app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   expireOldOpenTables();
+  expireGeneratedLobbyBots();
   const difficulty = secureDifficulty(req.query.difficulty);
   try {
     const scoreResult = await pool.query(
@@ -4575,16 +4818,40 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         opponentName: table.player.name,
         opponentCountry: table.player.country,
         stakePoints: table.stakePoints,
+        roundCount: normalizeRoundCount(table.roundCount),
         isBot: false,
       }));
       while (rooms.length < targetCount) {
         const botIdentity = createLobbyBotIdentity(usedLobbyBotNames);
         const stakePoints = randomStakeForGroup(group, difficulty);
+        const currentMultiRoomCount = rooms
+          .filter((room) => normalizeRoundCount(room.roundCount) > 1)
+          .length;
+        const roundCount = generatedRoomRoundCount(
+          groupIndex,
+          currentMultiRoomCount,
+          targetCount
+        );
+        const listingId = `bot:${group.id}:${crypto.randomBytes(8).toString("hex")}`;
+        generatedLobbyBots.set(listingId, {
+          listingId,
+          player: {
+            id: `bot_${crypto.randomBytes(12).toString("hex")}`,
+            name: botIdentity.name,
+            country: botIdentity.country,
+            isBot: true,
+          },
+          difficulty,
+          stakePoints,
+          roundCount,
+          createdAt: Date.now(),
+        });
         rooms.push({
-          listingId: `bot:${group.id}:${crypto.randomBytes(8).toString("hex")}`,
+          listingId,
           opponentName: botIdentity.name,
           opponentCountry: botIdentity.country,
           stakePoints,
+          roundCount,
           isBot: true,
         });
       }
@@ -4629,9 +4896,11 @@ io.on("connection", (socket) => {
       if (!identity) return;
       const difficulty = secureDifficulty(payload.difficulty);
       let stakePoints;
+      let roundCount;
       try {
         assertOpenTableStake(payload.stakePoints, identity.generalScore, difficulty);
         stakePoints = normalizeRequestedStake(payload.stakePoints, difficulty, identity.generalScore, false);
+        roundCount = assertRoundCountEligibility(payload.roundCount, identity.generalScore, stakePoints);
       } catch (error) {
         socket.emit("match_error", { code: error.publicCode || "INVALID_WAGER", message: error.message });
         return;
@@ -4642,6 +4911,7 @@ io.on("connection", (socket) => {
       leaveRoomAsCancel(socket);
 
       const listingId = `real:${crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString("hex")}`;
+      const tablePuzzles = Array.from({ length: roundCount }, () => generateSecurePuzzle(difficulty));
       publicOpenTables.set(listingId, {
         listingId,
         ownerSocketId: socket.id,
@@ -4649,12 +4919,14 @@ io.on("connection", (socket) => {
         generalScore: identity.generalScore,
         difficulty,
         stakePoints,
-        puzzle: generateSecurePuzzle(difficulty),
+        roundCount,
+        puzzles: tablePuzzles,
+        puzzle: tablePuzzles[0],
         createdAt: Date.now(),
       });
       emitRoomLobbyChanged(difficulty);
-      socket.emit("open_table_created", { listingId, stakePoints, difficulty });
-      socket.emit("waiting", { gameKey: "target_number", difficulty, matchMode: "open_table", stakePoints });
+      socket.emit("open_table_created", { listingId, stakePoints, difficulty, roundCount });
+      socket.emit("waiting", { gameKey: "target_number", difficulty, matchMode: "open_table", stakePoints, roundCount });
     }
   );
 
@@ -4674,7 +4946,7 @@ io.on("connection", (socket) => {
       const excludedOpponentMatchKey = safeText(payload.excludedOpponentMatchKey, "", 64);
 
       if (gameKey === "target_number_tournament") {
-        difficulty = tournamentStage <= 4 ? "Medium" : "Hard";
+        difficulty = "Standard";
       } else {
         difficulty = secureDifficulty(difficulty);
       }
@@ -4683,6 +4955,45 @@ io.on("connection", (socket) => {
       removePrivateRoomsForSocket(socket.id, false);
       removeOpenTablesForSocket(socket.id);
       leaveRoomAsCancel(socket);
+
+      if (gameKey === "target_number" && listingId.startsWith("bot:")) {
+        expireGeneratedLobbyBots();
+        const botTable = generatedLobbyBots.get(listingId);
+        if (!botTable) {
+          socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen bot masası artık uygun değil." });
+          return;
+        }
+        if (identity.generalScore < botTable.stakePoints) {
+          socket.emit("match_error", { code: "INSUFFICIENT_SCORE", message: "Bu masaya katılmak için yeterli puanınız yok." });
+          return;
+        }
+        try {
+          assertRoundCountEligibility(botTable.roundCount, identity.generalScore, botTable.stakePoints);
+          await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints);
+        } catch (error) {
+          socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
+          return;
+        }
+        generatedLobbyBots.delete(listingId);
+        const botPuzzles = Array.from({ length: botTable.roundCount }, () => generateSecurePuzzle(botTable.difficulty));
+        const room = createRealtimeRoom(
+          socket, player, null, botTable.player, "target_number", botTable.difficulty,
+          botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
+          botTable.roundCount, botPuzzles
+        );
+        socket.emit("match_found", {
+          roomId: room.roomId,
+          opponent: { name: botTable.player.name, country: botTable.player.country, matchKey: matchmakingPlayerKey(botTable.player.id) },
+          puzzle: room.puzzle,
+          stakePoints: room.stakePoints,
+          matchMode: "ready_room",
+          startsAtMillis: room.startsAtMillis,
+          roundCount: room.roundCount,
+          roundIndex: room.roundIndex,
+          isBot: true,
+        });
+        return;
+      }
 
       if (gameKey === "target_number" && listingId.startsWith("real:")) {
         expireOldOpenTables();
@@ -4697,6 +5008,7 @@ io.on("connection", (socket) => {
           return;
         }
         try {
+          assertRoundCountEligibility(table.roundCount, identity.generalScore, table.stakePoints);
           await consumeGameRightsForPlayers([player.id, table.player.id], table.difficulty, table.stakePoints);
         } catch (error) {
           const message = error.message || "İki oyunculu oyun hakkı doğrulanamadı.";
@@ -4711,17 +5023,18 @@ io.on("connection", (socket) => {
         await clearBotFallbackEligibilityForPlayers([player.id, table.player.id]);
         const room = createRealtimeRoom(
           socket, player, ownerSocket, table.player, "target_number", table.difficulty,
-          table.puzzle, null, null, table.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS
+          table.puzzle, null, null, table.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
+          table.roundCount, table.puzzles
         );
         socket.emit("match_found", {
           roomId: room.roomId, opponent: { name: table.player.name, country: table.player.country, matchKey: matchmakingPlayerKey(table.player.id) },
-          puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "ready_room",
-          startsAtMillis: room.startsAtMillis
+          puzzle: room.puzzle, stakePoints: table.stakePoints, matchMode: "ready_room",
+          startsAtMillis: room.startsAtMillis, roundCount: room.roundCount, roundIndex: room.roundIndex, isBot: false
         });
         ownerSocket.emit("match_found", {
           roomId: room.roomId, opponent: { name: player.name, country: player.country, matchKey: matchmakingPlayerKey(player.id) },
-          puzzle: table.puzzle, stakePoints: table.stakePoints, matchMode: "open_table",
-          startsAtMillis: room.startsAtMillis
+          puzzle: room.puzzle, stakePoints: table.stakePoints, matchMode: "open_table",
+          startsAtMillis: room.startsAtMillis, roundCount: room.roundCount, roundIndex: room.roundIndex, isBot: false
         });
         return;
       }
@@ -4804,13 +5117,13 @@ io.on("connection", (socket) => {
         );
         socket.emit("match_found", {
           roomId: room.roomId, opponent: { name: opponent.player.name, country: opponent.player.country, matchKey: matchmakingPlayerKey(opponent.player.id) },
-          puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode,
-          startsAtMillis: room.startsAtMillis
+          puzzle: room.puzzle, stakePoints: selectedStake, matchMode,
+          startsAtMillis: room.startsAtMillis, roundCount: room.roundCount, roundIndex: room.roundIndex, isBot: false
         });
         opponentSocket.emit("match_found", {
           roomId: room.roomId, opponent: { name: player.name, country: player.country, matchKey: matchmakingPlayerKey(player.id) },
-          puzzle: selectedPuzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode,
-          startsAtMillis: room.startsAtMillis
+          puzzle: room.puzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode,
+          startsAtMillis: room.startsAtMillis, roundCount: room.roundCount, roundIndex: room.roundIndex, isBot: false
         });
         console.log("Match found:", room.roomId, key, "stake:", selectedStake);
         return;
@@ -4972,12 +5285,13 @@ io.on("connection", (socket) => {
           stakePoints: room.stakePoints || 0,
           matchMode: room.matchMode || "quick",
           startsAtMillis: room.startsAtMillis || room.createdAt,
+          roundCount: room.roundCount || 1,
+          roundIndex: room.roundIndex || 0,
+          isBot: opponent?.isBot === true,
+          myRoundWins: Number(participant.roundWins || 0),
+          opponentRoundWins: Number(opponent?.roundWins || 0),
 
-          opponentFinishedMs:
-            Number(
-              opponent?.elapsedMs ||
-                0
-            ),
+          opponentFinishedMs: Number(opponent?.roundElapsedMs || 0),
         }
       );
 
@@ -5359,102 +5673,25 @@ io.on("connection", (socket) => {
   socket.on(
     "player_finished",
     (payload = {}) => {
-      const roomId = String(
-        payload.roomId || ""
-      ).trim();
+      const roomId = String(payload.roomId || "").trim();
+      const room = realtimeRooms.get(roomId);
+      const active = activeRooms.get(socket.id);
+      const playerId = active?.playerId || roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
+      const participant = getParticipant(room, playerId);
 
-      const room =
-        realtimeRooms.get(roomId);
-
-      const active =
-        activeRooms.get(socket.id);
-
-      const playerId =
-        active?.playerId ||
-        roomParticipants(room).find(
-          (item) =>
-            item.socketId ===
-            socket.id
-        )?.playerId;
-
-      const participant =
-        getParticipant(
-          room,
-          playerId
-        );
-
-      const opponent =
-        getOpponentParticipant(
-          room,
-          playerId
-        );
-
-      if (
-        !room ||
-        !participant ||
-        room.resolved
-      ) {
-        return;
-      }
-
+      if (!room || !participant || room.resolved || participant.isBot) return;
+      if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
       if (Date.now() < Number(room.startsAtMillis || room.createdAt || 0)) {
-        socket.emit("match_error", {
-          code: "MATCH_NOT_STARTED",
-          message: "Hazırlık geri sayımı henüz tamamlanmadı.",
-        });
+        socket.emit("match_error", { code: "MATCH_NOT_STARTED", message: "Hazırlık geri sayımı henüz tamamlanmadı." });
         return;
       }
-
       if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators)) {
-        socket.emit("match_error", {
-          code: "INVALID_SOLUTION",
-          message: "Gönderilen işlem sunucuda doğrulanamadı.",
-        });
+        socket.emit("match_error", { code: "INVALID_SOLUTION", message: "Gönderilen işlem sunucuda doğrulanamadı." });
         return;
       }
 
-      participant.finishedAt = Date.now();
-
-      // Süre istemciden alınmaz. Cihaz saati veya değiştirilmiş APK sonucu
-      // etkileyemesin diye oda başlangıcından sunucu saatiyle hesaplanır.
-      participant.elapsedMs = Math.max(
-        1,
-        participant.finishedAt - Number(room.startsAtMillis || room.createdAt)
-      );
-
-      clearParticipantAwayState(
-        room,
-        participant.playerId
-      );
-
-      markRoomResolved(
-        room,
-        "finished",
-        participant.playerId,
-        opponent?.playerId
-      );
-
-      awardRealtimeRoom(room, participant, opponent).catch((error) => {
-        console.error("realtime reward error:", error);
-      });
-
-      const opponentSocket =
-        opponent?.socketId
-          ? io.sockets.sockets.get(
-              opponent.socketId
-            )
-          : null;
-
-      if (opponentSocket) {
-        opponentSocket.emit(
-          "opponent_finished",
-          {
-            roomId,
-            elapsedMs:
-              participant.elapsedMs,
-          }
-        );
-      }
+      const elapsedMs = Math.max(1, Date.now() - Number(room.startsAtMillis || room.createdAt));
+      registerRealtimeRoundFinish(room, participant, elapsedMs);
     }
   );
 
