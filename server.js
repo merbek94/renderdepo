@@ -266,6 +266,10 @@ async function initDatabase() {
       bot_fallback_game_key TEXT,
       bot_fallback_difficulty TEXT,
       bot_fallback_eligible_at TIMESTAMPTZ,
+      two_player_finish_count INTEGER NOT NULL DEFAULT 0
+        CHECK (two_player_finish_count >= 0),
+      two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0
+        CHECK (two_player_finish_total_ms >= 0),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
@@ -301,6 +305,10 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS bot_fallback_difficulty TEXT;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS bot_fallback_eligible_at TIMESTAMPTZ;
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0;
 
     ALTER TABLE players
       ADD COLUMN IF NOT EXISTS username_user_set BOOLEAN NOT NULL DEFAULT FALSE;
@@ -1855,7 +1863,80 @@ function secureRandomInt(minInclusive, maxExclusive) {
   return crypto.randomInt(minInclusive, maxExclusive);
 }
 
-function createSecureTwoPlayerBotPlan(difficulty) {
+const BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES = 5;
+const BOT_CALIBRATION_MIN_FINISH_MS = 90 * 1000;
+const BOT_CALIBRATION_MAX_FINISH_MS = 119_000;
+const BOT_AVERAGE_VARIANCE_MS = 4 * 1000;
+const BOT_MIN_FINISH_MS = 1_000;
+const BOT_MAX_FINISH_MS = 119_000;
+
+function normalizeTwoPlayerFinishProfile(profile = {}) {
+  const parsedFinishCount = Number(profile.finishCount || 0);
+  const parsedFinishTotalMs = Number(profile.finishTotalMs || 0);
+  const finishCount = Number.isFinite(parsedFinishCount)
+    ? Math.max(0, Math.floor(parsedFinishCount))
+    : 0;
+  const finishTotalMs = Number.isFinite(parsedFinishTotalMs)
+    ? Math.max(0, Math.floor(parsedFinishTotalMs))
+    : 0;
+  const averageFinishMs = finishCount > 0
+    ? Math.round(finishTotalMs / finishCount)
+    : null;
+  return { finishCount, finishTotalMs, averageFinishMs };
+}
+
+async function readTwoPlayerFinishProfileInTransaction(client, playerId) {
+  const result = await client.query(
+    `SELECT two_player_finish_count, two_player_finish_total_ms
+     FROM player_progress
+     WHERE player_id = $1
+     FOR UPDATE`,
+    [playerId]
+  );
+  const row = result.rows[0] || {};
+  return normalizeTwoPlayerFinishProfile({
+    finishCount: row.two_player_finish_count,
+    finishTotalMs: row.two_player_finish_total_ms,
+  });
+}
+
+async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs) {
+  const parsedElapsedMs = Number(elapsedMs);
+  if (!Number.isFinite(parsedElapsedMs) || parsedElapsedMs <= 0) return;
+  const safeElapsedMs = Math.max(
+    1,
+    Math.min(Math.floor(parsedElapsedMs), 2 * 60 * 1000)
+  );
+  await client.query(
+    `UPDATE player_progress
+     SET two_player_finish_count = LEAST(two_player_finish_count + 1, 2000000000),
+         two_player_finish_total_ms = LEAST(
+           two_player_finish_total_ms + $2::bigint,
+           9223372036854775807::bigint
+         ),
+         updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, safeElapsedMs]
+  );
+}
+
+async function recordTwoPlayerFinishTime(playerId, elapsedMs) {
+  if (!pool || !playerId) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, playerId);
+    await recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
   const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
   const roll = secureRandomInt(0, 10000);
   if (roll < 560) {
@@ -1864,9 +1945,36 @@ function createSecureTwoPlayerBotPlan(difficulty) {
   if (roll < 560 + cannotFinishBps) {
     return { finishMs: null, leaveMs: null };
   }
-  const minSeconds = difficulty === "Hard" ? 8 : 6;
+
+  const profile = normalizeTwoPlayerFinishProfile(finishProfile);
+  if (
+    profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
+    profile.averageFinishMs === null
+  ) {
+    return {
+      finishMs: secureRandomInt(
+        BOT_CALIBRATION_MIN_FINISH_MS,
+        BOT_CALIBRATION_MAX_FINISH_MS + 1
+      ),
+      leaveMs: null,
+    };
+  }
+
+  const averageFinishMs = Math.max(
+    BOT_MIN_FINISH_MS,
+    Math.min(profile.averageFinishMs, BOT_MAX_FINISH_MS)
+  );
+  const minimumFinishMs = Math.max(
+    BOT_MIN_FINISH_MS,
+    averageFinishMs - BOT_AVERAGE_VARIANCE_MS
+  );
+  const maximumFinishMs = Math.min(
+    BOT_MAX_FINISH_MS,
+    averageFinishMs + BOT_AVERAGE_VARIANCE_MS
+  );
+
   return {
-    finishMs: secureRandomInt(minSeconds, 117) * 1000 + secureRandomInt(0, 900),
+    finishMs: secureRandomInt(minimumFinishMs, maximumFinishMs + 1),
     leaveMs: null,
   };
 }
@@ -2075,6 +2183,14 @@ async function awardRealtimeRoom(room, winner, loser) {
   const loserSocket = loser?.socketId ? io.sockets.sockets.get(loser.socketId) : null;
   if (winnerSocket && winnerState) winnerSocket.emit("authoritative_reward", winnerState);
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
+  if (winner?.elapsedMs != null) {
+    try {
+      // Gerçek oyunculu normal ikili maçta süre istemciden değil sunucu saatinden gelir.
+      await recordTwoPlayerFinishTime(winner.playerId, winner.elapsedMs);
+    } catch (error) {
+      console.error("two-player finish average update error:", error);
+    }
+  }
   await Promise.all([
     winner ? recordTaskGameEvent(winner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
     loser ? recordTaskGameEvent(loser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
@@ -2336,7 +2452,11 @@ app.post("/game/bot/start", requireAuth, async (req, res) => {
     }
 
     const puzzle = generateSecurePuzzle(difficulty);
-    const plan = createSecureTwoPlayerBotPlan(difficulty);
+    const finishProfile = await readTwoPlayerFinishProfileInTransaction(
+      client,
+      req.auth.sub
+    );
+    const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile);
     await client.query(
       `INSERT INTO secure_game_challenges
        (challenge_id, player_id, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
@@ -2483,6 +2603,14 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
     }
     if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators)) {
       const error = new Error("İşlem sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
+    }
+    if (challenge.mode === "two_player_bot") {
+      // Yalnızca sunucuda doğrulanmış normal ikili oyun çözümleri ortalamaya eklenir.
+      await recordTwoPlayerFinishTimeInTransaction(
+        client,
+        req.auth.sub,
+        elapsedServerMs
+      );
     }
     let won = null;
     let outcomeReason = null;
@@ -4429,14 +4557,19 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
     const usedListings = new Set();
     const usedLobbyBotNames = new Set(realTables.map((table) => table.player.name));
     const groups = TWO_PLAYER_ROOM_GROUPS.map((group, groupIndex) => {
-      const targetCount = roomTargetCount(groupIndex);
-      const matchingReal = realTables.filter((table) => {
+      const normalTargetCount = roomTargetCount(groupIndex);
+      const realCandidates = realTables.filter((table) => {
         if (usedListings.has(table.listingId)) return false;
-        const belongs = table.stakePoints >= group.minScore &&
+        return table.stakePoints >= group.minScore &&
           (group.maxScore == null || table.stakePoints <= group.maxScore);
-        if (belongs) usedListings.add(table.listingId);
-        return belongs;
-      }).slice(0, targetCount);
+      });
+      // Üst salonlarda gerçek masa sayısı normal bot hedefini aşarsa bütün gerçek
+      // masaları göster; ancak tek salonda görünen toplam masa sayısı 10'u geçmesin.
+      const targetCount = groupIndex >= 5
+        ? Math.min(10, Math.max(normalTargetCount, realCandidates.length))
+        : normalTargetCount;
+      const matchingReal = realCandidates.slice(0, targetCount);
+      matchingReal.forEach((table) => usedListings.add(table.listingId));
       const rooms = matchingReal.map((table) => ({
         listingId: table.listingId,
         opponentName: table.player.name,
