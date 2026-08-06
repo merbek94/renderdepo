@@ -2056,6 +2056,43 @@ function twoPlayerBotRewards(difficulty, won, wagerPoints = 0) {
   };
 }
 
+async function settleTwoPlayerBotChallengeAsDrawInTransaction(
+  client,
+  challenge,
+  playerId,
+  elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime())
+) {
+  await ensureAuthenticatedPlayer(client, playerId);
+  const state = await readAuthoritativePlayerState(client, playerId);
+  const response = {
+    ok: true,
+    generalDelta: 0,
+    infiniteDelta: 0,
+    xpDelta: 0,
+    ...state,
+    won: null,
+    outcomeReason: "time_draw",
+    elapsedServerMs,
+  };
+
+  await recordTaskEventInTransaction(client, {
+    playerId,
+    sourceKey: `challenge:${challenge.challenge_id}`,
+    eventType: "game",
+    gameKey: "target_number",
+    multiplayer: true,
+    won: false,
+  });
+
+  await client.query(
+    `UPDATE secure_game_challenges
+     SET completed_at = NOW(), result = $2::jsonb
+     WHERE challenge_id = $1 AND completed_at IS NULL`,
+    [challenge.challenge_id, JSON.stringify({ status: "completed", response })]
+  );
+  return response;
+}
+
 async function settleBotChallengeAsForfeitInTransaction(client, challenge, playerId) {
   const elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime());
   let response;
@@ -2480,7 +2517,32 @@ app.post("/game/bot/start", requireAuth, async (req, res) => {
       [req.auth.sub, challengeMode]
     );
     for (const activeChallenge of activeResult.rows) {
-      await settleBotChallengeAsForfeitInTransaction(client, activeChallenge, req.auth.sub);
+      const elapsedServerMs = Math.max(
+        0,
+        Date.now() - new Date(activeChallenge.created_at).getTime()
+      );
+      const normalOutcome = botOutcomeForElapsed(
+        activeChallenge.result?.plan || {},
+        elapsedServerMs,
+        false
+      );
+      const expiredAt = new Date(activeChallenge.expires_at).getTime();
+      const isExpiredUnfinishedTwoPlayerBot =
+        activeChallenge.mode === "two_player_bot" &&
+        Number.isFinite(expiredAt) &&
+        Date.now() >= expiredAt &&
+        !normalOutcome.resolvable;
+
+      if (isExpiredUnfinishedTwoPlayerBot) {
+        await settleTwoPlayerBotChallengeAsDrawInTransaction(
+          client,
+          activeChallenge,
+          req.auth.sub,
+          elapsedServerMs
+        );
+      } else {
+        await settleBotChallengeAsForfeitInTransaction(client, activeChallenge, req.auth.sub);
+      }
     }
 
     if (tournamentMode) {
@@ -2856,8 +2918,17 @@ app.post("/game/bot/resolve", requireAuth, async (req, res) => {
       }
       const error = new Error("Bu bot eşleşmesi daha önce sonuçlandı."); error.statusCode = 409; throw error;
     }
-    const elapsedServerMs = Date.now() - new Date(challenge.created_at).getTime();
-    const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, false);
+    const elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime());
+    const timeoutAsDraw = req.body.timeoutAsDraw === true;
+    let outcome = botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, false);
+
+    if (!outcome.resolvable && timeoutAsDraw && challenge.mode === "two_player_bot") {
+      const expiresAt = new Date(challenge.expires_at).getTime();
+      if (Number.isFinite(expiresAt) && Date.now() >= expiresAt) {
+        outcome = { resolvable: true, won: null, reason: "time_draw" };
+      }
+    }
+
     if (!outcome.resolvable) {
       const error = new Error("Bot eşleşmesi henüz sonuçlanmadı."); error.statusCode = 409; throw error;
     }
@@ -2875,6 +2946,13 @@ app.post("/game/bot/resolve", requireAuth, async (req, res) => {
         outcomeReason: outcome.reason,
         elapsedServerMs,
       };
+    } else if (outcome.won === null) {
+      response = await settleTwoPlayerBotChallengeAsDrawInTransaction(
+        client,
+        challenge,
+        req.auth.sub,
+        elapsedServerMs
+      );
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, outcome.won === true, challenge.wager_points);
       await ensureAuthenticatedPlayer(client, req.auth.sub);
@@ -2911,21 +2989,23 @@ app.post("/game/bot/resolve", requireAuth, async (req, res) => {
       };
     }
 
-    await recordTaskEventInTransaction(client, {
-      playerId: req.auth.sub,
-      sourceKey: `challenge:${challengeId}`,
-      eventType: "game",
-      gameKey: "target_number",
-      multiplayer: true,
-      won: outcome.won === true,
-    });
+    if (outcome.won !== null) {
+      await recordTaskEventInTransaction(client, {
+        playerId: req.auth.sub,
+        sourceKey: `challenge:${challengeId}`,
+        eventType: "game",
+        gameKey: "target_number",
+        multiplayer: true,
+        won: outcome.won === true,
+      });
 
-    await client.query(
-      `UPDATE secure_game_challenges
-       SET completed_at = NOW(), result = $2::jsonb
-       WHERE challenge_id = $1`,
-      [challengeId, JSON.stringify({ status: "completed", response })]
-    );
+      await client.query(
+        `UPDATE secure_game_challenges
+         SET completed_at = NOW(), result = $2::jsonb
+         WHERE challenge_id = $1`,
+        [challengeId, JSON.stringify({ status: "completed", response })]
+      );
+    }
     await client.query("COMMIT");
     res.json(response);
   } catch (error) {
