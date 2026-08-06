@@ -1985,10 +1985,10 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs) {
 function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
   const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
   const roll = secureRandomInt(0, 10000);
-  if (roll < 9600) {
+  if (roll < 560) {
     return { finishMs: null, leaveMs: secureRandomInt(0, 120) * 1000 };
   }
-  if (roll < 9600 + cannotFinishBps) {
+  if (roll < 560 + cannotFinishBps) {
     return { finishMs: null, leaveMs: null };
   }
 
