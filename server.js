@@ -30,6 +30,10 @@ const GOOGLE_WEB_CLIENT_SECRET = process.env.GOOGLE_WEB_CLIENT_SECRET || "";
 const PLAY_GAMES_APP_ID = process.env.PLAY_GAMES_APP_ID || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 24 * 60 * 60);
+const GAMEPLAY_LEASE_TTL_SECONDS = Math.max(
+  45,
+  Math.min(300, Number(process.env.GAMEPLAY_LEASE_TTL_SECONDS || 75) || 75)
+);
 
 function assertSecurityEnvironment() {
   const missing = [];
@@ -230,6 +234,32 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS player_game_sessions (
+      player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      lease_id TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      game_key TEXT NOT NULL,
+      acquired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      protocol_version INTEGER NOT NULL DEFAULT 2
+    );
+
+    ALTER TABLE player_game_sessions
+      ADD COLUMN IF NOT EXISTS protocol_version INTEGER NOT NULL DEFAULT 1;
+
+    -- Önceki lease-v1 sürümünün bıraktığı kayıtlar yeni protokolle güvenle
+    -- sahiplenilemez. Deploy sırasında yalnızca v1 kayıtlarını bir kez temizle;
+    -- bundan sonra oluşturulan v2 lease'ler restartlarda korunur.
+    DELETE FROM player_game_sessions
+      WHERE protocol_version < 2;
+
+    ALTER TABLE player_game_sessions
+      ALTER COLUMN protocol_version SET DEFAULT 2;
+
+    CREATE INDEX IF NOT EXISTS idx_player_game_sessions_expires_at
+      ON player_game_sessions (expires_at);
 
     CREATE TABLE IF NOT EXISTS player_scores (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
@@ -2191,6 +2221,104 @@ async function ensureAuthenticatedPlayer(client, playerId) {
   );
 }
 
+function normalizeGameplayDeviceId(value) {
+  const deviceId = safeText(value, "", 128);
+  return /^device_[a-f0-9]{32}$/i.test(deviceId) ? deviceId.toLowerCase() : "";
+}
+
+function normalizeGameplayLeaseId(value) {
+  const leaseId = safeText(value, "", 128);
+  return /^[a-f0-9-]{20,128}$/i.test(leaseId) ? leaseId.toLowerCase() : "";
+}
+
+function gameplayLeaseIdFromRequest(req) {
+  return normalizeGameplayLeaseId(req.headers["x-game-session-id"]);
+}
+
+async function requireGameplayLease(req, res, next) {
+  if (!requireDatabase(res)) return;
+  const leaseId = gameplayLeaseIdFromRequest(req);
+  if (!leaseId) {
+    res.status(409).json({
+      ok: false,
+      code: "GAME_SESSION_REQUIRED",
+      message: "Oyunu başlatmak için aktif cihaz oyun oturumu gerekli.",
+    });
+    return;
+  }
+
+  try {
+    // Geçerli bir oyun isteği de heartbeat sayılır. Böylece kısa ağ gecikmelerinde
+    // aktif oyunun kilidi gereksiz yere düşmez.
+    const result = await pool.query(
+      `UPDATE player_game_sessions
+       SET heartbeat_at = NOW(),
+           expires_at = NOW() + ($3 * INTERVAL '1 second')
+       WHERE player_id = $1
+         AND lease_id = $2
+         AND expires_at > NOW()
+       RETURNING lease_id, device_id, game_key, expires_at`,
+      [req.auth.sub, leaseId, GAMEPLAY_LEASE_TTL_SECONDS]
+    );
+    if (result.rowCount === 0) {
+      res.status(409).json({
+        ok: false,
+        code: "GAME_SESSION_LOST",
+        message: "Bu cihazın oyun oturumu sona erdi. Ana ekrana dönüp tekrar deneyin.",
+      });
+      return;
+    }
+    req.gameplayLease = result.rows[0];
+    next();
+  } catch (error) {
+    console.error("gameplay lease middleware error:", error);
+    res.status(500).json({
+      ok: false,
+      code: "GAME_SESSION_ERROR",
+      message: "Oyun cihaz oturumu doğrulanamadı.",
+    });
+  }
+}
+
+async function socketHasActiveGameplayLease(socket, playerId, errorEvent = "match_error") {
+  if (!pool) {
+    socket.emit(errorEvent, { code: "DATABASE_REQUIRED", message: "Sunucu veritabanı hazır değil." });
+    return false;
+  }
+  const leaseId = normalizeGameplayLeaseId(socket.data?.gameSessionId);
+  if (!leaseId) {
+    socket.emit(errorEvent, {
+      code: "GAME_SESSION_REQUIRED",
+      message: "Bu cihaz için aktif oyun oturumu bulunamadı.",
+    });
+    return false;
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE player_game_sessions
+       SET heartbeat_at = NOW(),
+           expires_at = NOW() + ($3 * INTERVAL '1 second')
+       WHERE player_id = $1
+         AND lease_id = $2
+         AND expires_at > NOW()
+       RETURNING lease_id`,
+      [playerId, leaseId, GAMEPLAY_LEASE_TTL_SECONDS]
+    );
+    if (result.rowCount === 0) {
+      socket.emit(errorEvent, {
+        code: "GAME_SESSION_LOST",
+        message: "Oyun oturumunuz başka bir cihaz nedeniyle sona erdi veya süresi doldu.",
+      });
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("socket gameplay lease check error:", error);
+    socket.emit(errorEvent, { code: "GAME_SESSION_ERROR", message: "Oyun oturumu doğrulanamadı." });
+    return false;
+  }
+}
+
 
 function normalizeGuestId(value) {
   const guestId = safeText(value, "", 64).toLowerCase();
@@ -2615,6 +2743,157 @@ app.post("/auth/play-games", async (req, res) => {
   }
 });
 
+app.post("/game-session/acquire", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  // deviceId yalnızca teşhis bilgisidir; kilidin sahipliği lease_id ile belirlenir.
+  // Böylece üretici/ROM kaynaklı ANDROID_ID sorunları iki cihazı birden engelleyemez.
+  const deviceId = normalizeGameplayDeviceId(req.body.deviceId) || "device_unreported";
+  const gameKey = safeText(req.body.gameKey, "unknown_game", 64) || "unknown_game";
+  const currentLeaseId = normalizeGameplayLeaseId(req.body.currentLeaseId);
+  const protocolVersion = Math.max(2, Math.min(100, Number(req.body.protocolVersion || 2) || 2));
+
+  const requestedLeaseId = crypto.randomUUID
+    ? crypto.randomUUID()
+    : crypto.randomBytes(24).toString("hex");
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, req.auth.sub);
+
+    // Satır henüz yokken SELECT ... FOR UPDATE tek başına yeterli değildir: iki cihaz
+    // aynı anda "satır yok" görebilir. Oyuncu kimliğine bağlı transaction advisory lock
+    // ile acquire işlemlerini oyuncu başına kesin olarak sırala; ilk transaction kazanır.
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`,
+      [String(req.auth.sub)]
+    );
+
+    const existingResult = await client.query(
+      `SELECT lease_id, device_id, game_key, expires_at, protocol_version,
+              (expires_at > NOW()) AS is_active
+       FROM player_game_sessions
+       WHERE player_id = $1
+       FOR UPDATE`,
+      [req.auth.sub]
+    );
+
+    const existing = existingResult.rows[0] || null;
+    const existingExpiresAtMillis = existing?.expires_at
+      ? new Date(existing.expires_at).getTime()
+      : 0;
+    // Aktiflik kararı yalnızca PostgreSQL NOW() ile verilir; Render instance saati
+    // veya telefon saati kilidin sonucunu değiştirmez.
+    const existingIsActive = Boolean(existing) && existing.is_active === true;
+    const ownsExistingLease = Boolean(
+      existingIsActive &&
+      currentLeaseId &&
+      String(existing.lease_id || "").toLowerCase() === currentLeaseId
+    );
+
+    if (existingIsActive && !ownsExistingLease) {
+      await client.query("COMMIT");
+      res.status(409).json({
+        ok: false,
+        code: "GAME_ALREADY_ACTIVE",
+        message: "Bu hesap şu anda başka bir cihazda oyun oynuyor. Diğer cihazdaki oyundan çıkıp tekrar deneyin.",
+        expiresAtMillis: existingExpiresAtMillis,
+      });
+      return;
+    }
+
+    const leaseId = ownsExistingLease ? String(existing.lease_id) : requestedLeaseId;
+    const leaseResult = await client.query(
+      `INSERT INTO player_game_sessions
+       (player_id, lease_id, device_id, game_key, acquired_at, heartbeat_at, expires_at, protocol_version)
+       VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW() + ($5 * INTERVAL '1 second'), $6)
+       ON CONFLICT (player_id) DO UPDATE SET
+         lease_id = EXCLUDED.lease_id,
+         device_id = EXCLUDED.device_id,
+         game_key = EXCLUDED.game_key,
+         acquired_at = CASE
+           WHEN player_game_sessions.lease_id = EXCLUDED.lease_id
+             THEN player_game_sessions.acquired_at
+           ELSE NOW()
+         END,
+         heartbeat_at = NOW(),
+         expires_at = NOW() + ($5 * INTERVAL '1 second'),
+         protocol_version = EXCLUDED.protocol_version
+       RETURNING lease_id, device_id, game_key, expires_at, protocol_version`,
+      [req.auth.sub, leaseId, deviceId, gameKey, GAMEPLAY_LEASE_TTL_SECONDS, protocolVersion]
+    );
+
+    await client.query("COMMIT");
+    const lease = leaseResult.rows[0];
+    res.json({
+      ok: true,
+      leaseId: lease.lease_id,
+      gameKey: lease.game_key,
+      expiresAtMillis: new Date(lease.expires_at).getTime(),
+      heartbeatIntervalMillis: 20_000,
+      protocolVersion: Number(lease.protocol_version || 2),
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("game-session acquire error:", error);
+    res.status(500).json({ ok: false, code: "GAME_SESSION_ERROR", message: "Oyun cihaz oturumu başlatılamadı." });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/game-session/heartbeat", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const leaseId = normalizeGameplayLeaseId(req.body.leaseId);
+  if (!leaseId) {
+    res.status(400).json({ ok: false, code: "INVALID_GAME_SESSION", message: "Geçerli oyun oturumu gerekli." });
+    return;
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE player_game_sessions
+       SET heartbeat_at = NOW(),
+           expires_at = NOW() + ($3 * INTERVAL '1 second')
+       WHERE player_id = $1
+         AND lease_id = $2
+         AND expires_at > NOW()
+       RETURNING expires_at`,
+      [req.auth.sub, leaseId, GAMEPLAY_LEASE_TTL_SECONDS]
+    );
+    if (result.rowCount === 0) {
+      res.status(409).json({
+        ok: false,
+        code: "GAME_SESSION_LOST",
+        message: "Bu cihazın oyun oturumu sona erdi. Oyun kapatılacak.",
+      });
+      return;
+    }
+    res.json({ ok: true, expiresAtMillis: new Date(result.rows[0].expires_at).getTime() });
+  } catch (error) {
+    console.error("game-session heartbeat error:", error);
+    res.status(500).json({ ok: false, code: "GAME_SESSION_ERROR", message: "Oyun oturumu yenilenemedi." });
+  }
+});
+
+app.post("/game-session/release", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const leaseId = normalizeGameplayLeaseId(req.body.leaseId);
+  if (!leaseId) {
+    res.json({ ok: true, released: false });
+    return;
+  }
+  try {
+    const result = await pool.query(
+      `DELETE FROM player_game_sessions
+       WHERE player_id = $1 AND lease_id = $2`,
+      [req.auth.sub, leaseId]
+    );
+    res.json({ ok: true, released: result.rowCount > 0 });
+  } catch (error) {
+    console.error("game-session release error:", error);
+    res.status(500).json({ ok: false, code: "GAME_SESSION_ERROR", message: "Oyun oturumu bırakılamadı." });
+  }
+});
+
 app.get("/player/state", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   const playerId = req.auth.sub;
@@ -2640,7 +2919,7 @@ app.get("/player/state", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/game/hundred/start", requireAuth, async (req, res) => {
+app.post("/game/hundred/start", requireAuth, requireGameplayLease, async (req, res) => {
   if (!requireDatabase(res)) return;
   const fresh = req.body.fresh === true;
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
@@ -2760,7 +3039,7 @@ app.post("/game/tournament/reset", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/game/bot/start", requireAuth, async (req, res) => {
+app.post("/game/bot/start", requireAuth, requireGameplayLease, async (req, res) => {
   if (!requireDatabase(res)) return;
   const tournamentMode = req.body.mode === "tournament";
   const matchMode = safeText(req.body.matchMode, "quick", 32);
@@ -2893,7 +3172,7 @@ app.post("/game/bot/start", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/game/challenges/start", requireAuth, async (req, res) => {
+app.post("/game/challenges/start", requireAuth, requireGameplayLease, async (req, res) => {
   if (!requireDatabase(res)) return;
   const mode = safeText(req.body.mode, "", 32);
   if (mode !== "infinite") {
@@ -2963,7 +3242,7 @@ app.post("/game/challenges/start", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/game/challenges/complete", requireAuth, async (req, res) => {
+app.post("/game/challenges/complete", requireAuth, requireGameplayLease, async (req, res) => {
   if (!requireDatabase(res)) return;
   const challengeId = safeText(req.body.challengeId, "", 128);
   if (!challengeId) {
@@ -3183,7 +3462,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
 
 
 
-app.post("/game/bot/resolve", requireAuth, async (req, res) => {
+app.post("/game/bot/resolve", requireAuth, requireGameplayLease, async (req, res) => {
   if (!requireDatabase(res)) return;
   const challengeId = safeText(req.body.challengeId, "", 128);
   if (!challengeId) {
@@ -5124,6 +5403,14 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
     });
     return null;
   }
+  const gameSessionId = normalizeGameplayLeaseId(payload?.gameSessionId);
+  if (!gameSessionId) {
+    socket.emit(errorEvent, {
+      code: "GAME_SESSION_REQUIRED",
+      message: "Bu cihaz için aktif oyun oturumu bulunamadı.",
+    });
+    return null;
+  }
   if (!pool) {
     socket.emit(errorEvent, { code: "DATABASE_REQUIRED", message: "Sunucu veritabanı hazır değil." });
     return null;
@@ -5132,6 +5419,24 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
   try {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, session.sub);
+    const leaseResult = await client.query(
+      `UPDATE player_game_sessions
+       SET heartbeat_at = NOW(),
+           expires_at = NOW() + ($3 * INTERVAL '1 second')
+       WHERE player_id = $1
+         AND lease_id = $2
+         AND expires_at > NOW()
+       RETURNING lease_id`,
+      [session.sub, gameSessionId, GAMEPLAY_LEASE_TTL_SECONDS]
+    );
+    if (leaseResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      socket.emit(errorEvent, {
+        code: "GAME_SESSION_LOST",
+        message: "Bu cihazın oyun oturumu sona erdi veya başka cihazdaki oturum etkin.",
+      });
+      return null;
+    }
     const result = await client.query(
       `SELECT p.username, p.country, g.tournament_stage, s.general_score
        FROM players p
@@ -5141,6 +5446,8 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       [session.sub]
     );
     await client.query("COMMIT");
+    socket.data.playerId = safePlayerId(session.sub, session.sub);
+    socket.data.gameSessionId = gameSessionId;
     const row = result.rows[0] || {};
     return {
       player: safePlayer({ id: session.sub, name: row.username, country: row.country }, session.sub),
@@ -5520,13 +5827,20 @@ io.on("connection", (socket) => {
 
   socket.on(
     "resume_match",
-    (payload = {}) => {
+    async (payload = {}) => {
       const roomId = String(
         payload.roomId || ""
       ).trim();
 
       const player = authenticatedSocketPlayer(socket, payload, "resume_error");
       if (!player) return;
+
+      const resumeGameSessionId = normalizeGameplayLeaseId(payload?.gameSessionId);
+      if (resumeGameSessionId) {
+        socket.data.playerId = player.id;
+        socket.data.gameSessionId = resumeGameSessionId;
+        if (!(await socketHasActiveGameplayLease(socket, player.id, "resume_error"))) return;
+      }
 
       const room =
         realtimeRooms.get(roomId);
@@ -6047,7 +6361,7 @@ io.on("connection", (socket) => {
 
   socket.on(
     "player_finished",
-    (payload = {}) => {
+    async (payload = {}) => {
       const roomId = String(payload.roomId || "").trim();
       const room = realtimeRooms.get(roomId);
       const active = activeRooms.get(socket.id);
@@ -6055,6 +6369,7 @@ io.on("connection", (socket) => {
       const participant = getParticipant(room, playerId);
 
       if (!room || !participant || room.resolved || participant.isBot) return;
+      if (!(await socketHasActiveGameplayLease(socket, participant.playerId, "match_error"))) return;
       if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
       if (Date.now() < Number(room.startsAtMillis || room.createdAt || 0)) {
         socket.emit("match_error", { code: "MATCH_NOT_STARTED", message: "Hazırlık geri sayımı henüz tamamlanmadı." });
