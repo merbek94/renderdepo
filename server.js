@@ -1193,7 +1193,6 @@ const GAME_RIGHT_MAX = 10;
 const GAME_RIGHT_REFILL_MS = 10 * 60 * 1000;
 const BOT_FALLBACK_MIN_WAIT_MS = 20 * 1000;
 const USERNAME_CHANGE_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
-const OPEN_TABLE_MIN_SCORE = 1_000;
 const MULTI_ROUND_MIN_SCORE_EXCLUSIVE = 2_000;
 
 function normalizeRoundCount(value) {
@@ -1203,12 +1202,6 @@ function normalizeRoundCount(value) {
 function assertRoundCountEligibility(roundCountValue, generalScore, stakePoints = 0) {
   const roundCount = normalizeRoundCount(roundCountValue);
   const score = Math.max(0, Number(generalScore || 0));
-  if (score < OPEN_TABLE_MIN_SCORE) {
-    const error = new Error("Masa açmak için en az 1.000 genel puan gerekir.");
-    error.statusCode = 409;
-    error.publicCode = "OPEN_TABLE_SCORE_REQUIRED";
-    throw error;
-  }
   if (roundCount > 1 && score <= MULTI_ROUND_MIN_SCORE_EXCLUSIVE) {
     const error = new Error("2 veya 3 ellik masa açmak/oynamak için 2.000 puandan fazla puan gerekir.");
     error.statusCode = 409;
@@ -1311,12 +1304,6 @@ function minimumOpenTableStake(availableScore, difficulty) {
 }
 
 function assertOpenTableStake(stakePoints, availableScore, difficulty) {
-  if (Number(availableScore || 0) < OPEN_TABLE_MIN_SCORE) {
-    const error = new Error("Masa açmak için en az 1.000 genel puan gerekir.");
-    error.statusCode = 409;
-    error.publicCode = "OPEN_TABLE_SCORE_REQUIRED";
-    throw error;
-  }
   const minimum = minimumOpenTableStake(availableScore, difficulty);
   const requested = Math.floor(Number(stakePoints || 0));
   if (!Number.isFinite(requested) || requested < minimum) {
