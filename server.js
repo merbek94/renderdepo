@@ -327,6 +327,18 @@ async function initDatabase() {
     ALTER TABLE players
       ADD COLUMN IF NOT EXISTS username_last_changed_at TIMESTAMPTZ;
 
+    CREATE TABLE IF NOT EXISTS guest_credentials (
+      guest_id TEXT PRIMARY KEY,
+      secret_hash TEXT NOT NULL,
+      linked_player_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      linked_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_guest_credentials_linked_player
+      ON guest_credentials (linked_player_id);
+
     CREATE TABLE IF NOT EXISTS secure_game_challenges (
       challenge_id TEXT PRIMARY KEY,
       player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
@@ -1711,7 +1723,7 @@ async function applyTournamentOutcomeInTransaction(client, playerId, won, reques
        (player_id, month_key, general_score, infinite_score, updated_at)
        VALUES ($1, $2, $3, 0, NOW())
        ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = LEAST(player_monthly_scores.general_score + EXCLUDED.general_score, 2000000000),
+         general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
          updated_at = NOW()`,
       [playerId, monthKey, awardedScore]
     );
@@ -1769,7 +1781,7 @@ async function addPositiveGeneralAndXpInTransaction(client, playerId, generalDel
        (player_id, month_key, general_score, infinite_score, updated_at)
        VALUES ($1, $2, $3, 0, NOW())
        ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = LEAST(player_monthly_scores.general_score + EXCLUDED.general_score, 2000000000),
+         general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
          updated_at = NOW()`,
       [playerId, monthKey, safeGeneral]
     );
@@ -2180,6 +2192,241 @@ async function ensureAuthenticatedPlayer(client, playerId) {
 }
 
 
+function normalizeGuestId(value) {
+  const guestId = safeText(value, "", 64).toLowerCase();
+  return /^guest_[a-f0-9]{32}$/.test(guestId) ? guestId : "";
+}
+
+function normalizeGuestSecret(value) {
+  const secret = safeText(value, "", 128).toLowerCase();
+  return /^[a-f0-9]{64}$/.test(secret) ? secret : "";
+}
+
+function hashGuestSecret(secret) {
+  if (!SESSION_SECRET) throw new Error("SESSION_SECRET tanımlı değil.");
+  return crypto.createHmac("sha256", SESSION_SECRET).update(String(secret)).digest("hex");
+}
+
+function constantTimeHexEquals(left, right) {
+  try {
+    const leftBuffer = Buffer.from(String(left || ""), "hex");
+    const rightBuffer = Buffer.from(String(right || ""), "hex");
+    return leftBuffer.length > 0 &&
+      leftBuffer.length === rightBuffer.length &&
+      crypto.timingSafeEqual(leftBuffer, rightBuffer);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function authenticateGuestPlayer(client, guestIdRaw, guestSecretRaw) {
+  const guestId = normalizeGuestId(guestIdRaw);
+  const guestSecret = normalizeGuestSecret(guestSecretRaw);
+  if (!guestId || !guestSecret) {
+    const error = new Error("Geçerli misafir kimliği gerekli.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const expectedHash = hashGuestSecret(guestSecret);
+  let credential = await client.query(
+    `SELECT guest_id, secret_hash, linked_player_id
+     FROM guest_credentials
+     WHERE guest_id = $1
+     FOR UPDATE`,
+    [guestId]
+  );
+
+  if (credential.rowCount === 0) {
+    await ensureAuthenticatedPlayer(client, guestId);
+    await client.query(
+      `INSERT INTO guest_credentials (guest_id, secret_hash, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (guest_id) DO NOTHING`,
+      [guestId, expectedHash]
+    );
+    credential = await client.query(
+      `SELECT guest_id, secret_hash, linked_player_id
+       FROM guest_credentials
+       WHERE guest_id = $1
+       FOR UPDATE`,
+      [guestId]
+    );
+  }
+
+  const row = credential.rows[0];
+  if (!row || !constantTimeHexEquals(row.secret_hash, expectedHash)) {
+    const error = new Error("Misafir kimliği doğrulanamadı.");
+    error.statusCode = 401;
+    throw error;
+  }
+
+  if (row.linked_player_id) {
+    await ensureAuthenticatedPlayer(client, row.linked_player_id);
+    return String(row.linked_player_id);
+  }
+
+  await ensureAuthenticatedPlayer(client, guestId);
+  await client.query(
+    `UPDATE guest_credentials SET updated_at = NOW() WHERE guest_id = $1`,
+    [guestId]
+  );
+  return guestId;
+}
+
+async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw, playGamesPlayerId) {
+  const guestId = normalizeGuestId(guestIdRaw);
+  const guestSecret = normalizeGuestSecret(guestSecretRaw);
+  if (!guestId || !guestSecret || !playGamesPlayerId || guestId === playGamesPlayerId) {
+    return { migrated: false, reason: "NO_GUEST" };
+  }
+
+  const credentialResult = await client.query(
+    `SELECT guest_id, secret_hash, linked_player_id
+     FROM guest_credentials
+     WHERE guest_id = $1
+     FOR UPDATE`,
+    [guestId]
+  );
+  const credential = credentialResult.rows[0];
+  if (!credential) return { migrated: false, reason: "GUEST_NOT_ON_SERVER" };
+
+  const expectedHash = hashGuestSecret(guestSecret);
+  if (!constantTimeHexEquals(credential.secret_hash, expectedHash)) {
+    return { migrated: false, reason: "GUEST_SECRET_MISMATCH" };
+  }
+
+  if (credential.linked_player_id) {
+    return {
+      migrated: credential.linked_player_id === playGamesPlayerId,
+      reason: credential.linked_player_id === playGamesPlayerId ? "ALREADY_LINKED" : "LINKED_TO_OTHER_ACCOUNT",
+    };
+  }
+
+  await ensureAuthenticatedPlayer(client, playGamesPlayerId);
+  const guestPlayer = await client.query(
+    `SELECT player_id FROM players WHERE player_id = $1 FOR UPDATE`,
+    [guestId]
+  );
+
+  if (guestPlayer.rowCount === 0) {
+    await client.query(
+      `UPDATE guest_credentials
+       SET linked_player_id = $2, linked_at = NOW(), updated_at = NOW()
+       WHERE guest_id = $1`,
+      [guestId, playGamesPlayerId]
+    );
+    return { migrated: false, reason: "EMPTY_GUEST_LINKED" };
+  }
+
+  // Kullanıcı tarafından seçilmiş misafir profilini, PGS hedefinde henüz kullanıcı adı
+  // belirlenmediyse taşı. PGS tarafında zaten kullanıcı tarafından belirlenmiş profil varsa onu koru.
+  await client.query(
+    `UPDATE players AS target
+     SET username = CASE
+           WHEN NOT target.username_user_set AND guest.username_user_set THEN guest.username
+           ELSE target.username
+         END,
+         country = CASE
+           WHEN NOT target.username_user_set AND guest.username_user_set THEN guest.country
+           ELSE target.country
+         END,
+         username_user_set = target.username_user_set OR guest.username_user_set,
+         username_change_count = GREATEST(target.username_change_count, guest.username_change_count),
+         username_last_changed_at = GREATEST(target.username_last_changed_at, guest.username_last_changed_at),
+         updated_at = NOW()
+     FROM players AS guest
+     WHERE target.player_id = $2 AND guest.player_id = $1`,
+    [guestId, playGamesPlayerId]
+  );
+
+  // Puan ve XP misafir hesabında da yalnızca sunucunun doğruladığı oyun sonuçlarıyla oluşur.
+  // Bu nedenle iki ayrık geçmişi toplamak güvenlidir; Int üst sınırında kırpılır.
+  await client.query(
+    `UPDATE player_scores AS target
+     SET general_score = LEAST(target.general_score::bigint + guest.general_score::bigint, 2000000000)::integer,
+         infinite_score = LEAST(target.infinite_score::bigint + guest.infinite_score::bigint, 2000000000)::integer,
+         updated_at = NOW()
+     FROM player_scores AS guest
+     WHERE target.player_id = $2 AND guest.player_id = $1`,
+    [guestId, playGamesPlayerId]
+  );
+
+  await client.query(
+    `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
+     SELECT $2, month_key, general_score, infinite_score, NOW()
+     FROM player_monthly_scores
+     WHERE player_id = $1
+     ON CONFLICT (player_id, month_key) DO UPDATE SET
+       general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
+       infinite_score = LEAST(player_monthly_scores.infinite_score::bigint + EXCLUDED.infinite_score::bigint, 2000000000)::integer,
+       updated_at = NOW()`,
+    [guestId, playGamesPlayerId]
+  );
+
+  await client.query(
+    `UPDATE player_progress AS target
+     SET total_xp = LEAST(target.total_xp::bigint + guest.total_xp::bigint, 2000000000)::integer,
+         infinite_run_score = GREATEST(target.infinite_run_score, guest.infinite_run_score),
+         infinite_next_stage = GREATEST(target.infinite_next_stage, guest.infinite_next_stage),
+         tournament_stage = GREATEST(target.tournament_stage, guest.tournament_stage),
+         tournament_rights = GREATEST(target.tournament_rights, guest.tournament_rights),
+         tournament_bank = GREATEST(target.tournament_bank, guest.tournament_bank),
+         tournament_completed = target.tournament_completed OR guest.tournament_completed,
+         hundred_active = target.hundred_active OR guest.hundred_active,
+         hundred_stage = GREATEST(target.hundred_stage, guest.hundred_stage),
+         game_rights = GREATEST(target.game_rights, guest.game_rights),
+         game_rights_refill_at = LEAST(target.game_rights_refill_at, guest.game_rights_refill_at),
+         diamond_balance = LEAST(target.diamond_balance::bigint + guest.diamond_balance::bigint, 2000000000)::integer,
+         level_reward_claimed_through = GREATEST(target.level_reward_claimed_through, guest.level_reward_claimed_through),
+         bot_fallback_game_key = COALESCE(target.bot_fallback_game_key, guest.bot_fallback_game_key),
+         bot_fallback_difficulty = COALESCE(target.bot_fallback_difficulty, guest.bot_fallback_difficulty),
+         bot_fallback_eligible_at = COALESCE(target.bot_fallback_eligible_at, guest.bot_fallback_eligible_at),
+         two_player_finish_count = LEAST(target.two_player_finish_count::bigint + guest.two_player_finish_count::bigint, 2000000000)::integer,
+         two_player_finish_total_ms = LEAST(target.two_player_finish_total_ms::numeric + guest.two_player_finish_total_ms::numeric, 9223372036854775807)::bigint,
+         updated_at = NOW()
+     FROM player_progress AS guest
+     WHERE target.player_id = $2 AND guest.player_id = $1`,
+    [guestId, playGamesPlayerId]
+  );
+
+  // Tamamlanmamış güvenli challenge'lar ve görev geçmişleri de hedef hesaba bağlanır.
+  await client.query(
+    `UPDATE secure_game_challenges SET player_id = $2 WHERE player_id = $1`,
+    [guestId, playGamesPlayerId]
+  );
+
+  await client.query(
+    `INSERT INTO player_task_events (player_id, source_key, event_type, game_key, multiplayer, won, occurred_at)
+     SELECT $2, source_key, event_type, game_key, multiplayer, won, occurred_at
+     FROM player_task_events
+     WHERE player_id = $1
+     ON CONFLICT (player_id, source_key) DO NOTHING`,
+    [guestId, playGamesPlayerId]
+  );
+
+  await client.query(
+    `INSERT INTO player_task_claims
+       (player_id, period_type, period_key, task_code, reward_score, reward_diamonds, claimed_at)
+     SELECT $2, period_type, period_key, task_code, reward_score, reward_diamonds, claimed_at
+     FROM player_task_claims
+     WHERE player_id = $1
+     ON CONFLICT (player_id, period_type, period_key, task_code) DO NOTHING`,
+    [guestId, playGamesPlayerId]
+  );
+
+  // Kopyalama tamamlandıktan sonra eski guest player satırı silinir; FK'li eski satırlar cascade olur.
+  await client.query(`DELETE FROM players WHERE player_id = $1`, [guestId]);
+  await client.query(
+    `UPDATE guest_credentials
+     SET linked_player_id = $2, linked_at = NOW(), updated_at = NOW()
+     WHERE guest_id = $1`,
+    [guestId, playGamesPlayerId]
+  );
+
+  return { migrated: true, reason: "MIGRATED" };
+}
+
 async function applyAuthoritativeScoreDelta(playerId, generalDelta, infiniteDelta, xpDelta) {
   if (!pool || !playerId) return null;
   const client = await pool.connect();
@@ -2282,19 +2529,65 @@ async function awardRealtimeRoom(room, winner, loser) {
   ]);
 }
 
+app.post("/auth/guest", async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const guestId = normalizeGuestId(req.body.guestId);
+  const guestSecret = normalizeGuestSecret(req.body.guestSecret);
+  if (!guestId || !guestSecret) {
+    res.status(400).json({ ok: false, code: "INVALID_GUEST", message: "Geçerli misafir kimliği gerekli." });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const playerId = await authenticateGuestPlayer(client, guestId, guestSecret);
+    await client.query("COMMIT");
+    const sessionToken = createSessionToken(playerId);
+    res.json({
+      ok: true,
+      playerId,
+      guest: playerId.startsWith("guest_"),
+      sessionToken,
+      expiresAtMillis: Date.now() + SESSION_TTL_SECONDS * 1000,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("guest auth error:", error.message);
+    res.status(Number(error.statusCode || 500)).json({
+      ok: false,
+      code: "GUEST_AUTH_FAILED",
+      message: error.statusCode === 401 ? "Misafir kimliği doğrulanamadı." : "Misafir oturumu kurulamadı.",
+    });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/auth/play-games", async (req, res) => {
   const authCode = safeText(req.body.authCode, "", 4096);
+  const guestId = normalizeGuestId(req.body.guestId);
+  const guestSecret = normalizeGuestSecret(req.body.guestSecret);
   if (!authCode) {
     res.status(400).json({ ok: false, message: "Play Games yetkilendirme kodu gerekli." });
     return;
   }
   try {
     const playerId = await exchangePlayGamesAuthCode(authCode);
+    let guestMigration = { migrated: false, reason: "NO_GUEST" };
     if (pool) {
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
         await ensureAuthenticatedPlayer(client, playerId);
+        if (guestId && guestSecret) {
+          guestMigration = await migrateGuestPlayerToPlayGames(
+            client,
+            guestId,
+            guestSecret,
+            playerId
+          );
+        }
         await client.query("COMMIT");
       } catch (error) {
         await client.query("ROLLBACK");
@@ -2308,6 +2601,8 @@ app.post("/auth/play-games", async (req, res) => {
       ok: true,
       playerId,
       sessionToken,
+      guestMigrated: Boolean(guestMigration.migrated),
+      guestMigrationReason: guestMigration.reason,
       expiresAtMillis: Date.now() + SESSION_TTL_SECONDS * 1000,
     });
   } catch (error) {
@@ -2821,7 +3116,7 @@ app.post("/game/challenges/complete", requireAuth, async (req, res) => {
         `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
          VALUES ($1, $2, $3, $4, NOW())
          ON CONFLICT (player_id, month_key) DO UPDATE SET
-           general_score = LEAST(player_monthly_scores.general_score + EXCLUDED.general_score, 2000000000),
+           general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
            infinite_score = GREATEST(player_monthly_scores.infinite_score, EXCLUDED.infinite_score),
            updated_at = NOW()`,
         [req.auth.sub, monthKey, rewards.generalDelta, infiniteRunScore]
@@ -4806,7 +5101,7 @@ function authenticatedSocketPlayer(socket, payload, errorEvent = "match_error") 
   if (!session) {
     socket.emit(errorEvent, {
       code: "AUTH_REQUIRED",
-      message: "Play Games oturumu doğrulanamadı. Ana ekrana dönüp tekrar deneyin.",
+      message: "Oyuncu oturumu doğrulanamadı. Ana ekrana dönüp tekrar deneyin.",
     });
     return null;
   }
@@ -4825,7 +5120,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
   if (!session) {
     socket.emit(errorEvent, {
       code: "AUTH_REQUIRED",
-      message: "Play Games oturumu doğrulanamadı. Ana ekrana dönüp tekrar deneyin.",
+      message: "Oyuncu oturumu doğrulanamadı. Ana ekrana dönüp tekrar deneyin.",
     });
     return null;
   }
