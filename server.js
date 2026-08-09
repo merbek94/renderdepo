@@ -1975,6 +1975,21 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId) {
   });
 }
 
+async function readTwoPlayerFinishProfile(playerId) {
+  if (!pool || !playerId) return normalizeTwoPlayerFinishProfile({});
+  const result = await pool.query(
+    `SELECT two_player_finish_count, two_player_finish_total_ms
+     FROM player_progress
+     WHERE player_id = $1`,
+    [playerId]
+  );
+  const row = result.rows[0] || {};
+  return normalizeTwoPlayerFinishProfile({
+    finishCount: row.two_player_finish_count,
+    finishTotalMs: row.two_player_finish_total_ms,
+  });
+}
+
 async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs) {
   const parsedElapsedMs = Number(elapsedMs);
   if (!Number.isFinite(parsedElapsedMs) || parsedElapsedMs <= 0) return;
@@ -2012,20 +2027,24 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs) {
 }
 
 function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
-  const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
-  const roll = secureRandomInt(0, 10000);
-  if (roll < 560) {
-    return { finishMs: null, leaveMs: secureRandomInt(0, 120) * 1000 };
-  }
-  if (roll < 560 + cannotFinishBps) {
-    return { finishMs: null, leaveMs: null };
-  }
-
   const profile = normalizeTwoPlayerFinishProfile(finishProfile);
+
+  // İlk 5 tamamlanmış ikili oyun, mevcut kalibrasyon davranışını korur.
+  // 5 oyundan sonra ise bot HER oyunda oyuncunun ortalama bitirme süresinin
+  // ±4 saniye aralığında bitirir; artık bu aşamada "bitirememe/ayrılma" zarı yoktur.
   if (
     profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
     profile.averageFinishMs === null
   ) {
+    const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
+    const roll = secureRandomInt(0, 10000);
+    if (roll < 560) {
+      return { finishMs: null, leaveMs: secureRandomInt(0, 120) * 1000 };
+    }
+    if (roll < 560 + cannotFinishBps) {
+      return { finishMs: null, leaveMs: null };
+    }
+
     return {
       finishMs: secureRandomInt(
         BOT_CALIBRATION_MIN_FINISH_MS,
@@ -2631,9 +2650,26 @@ async function awardRealtimeRoom(room, winner, loser) {
   const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
   if (winnerSocket && winnerState) winnerSocket.emit("authoritative_reward", winnerState);
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
-  if (realWinner?.totalElapsedMs != null) {
+  const finishSamples = roomParticipants(room)
+    .filter((participant) => !participant.isBot)
+    .map((participant) => {
+      const verifiedRounds = Array.isArray(participant.verifiedRoundElapsedMs)
+        ? participant.verifiedRoundElapsedMs.filter((value) => Number.isFinite(Number(value)) && Number(value) > 0)
+        : [];
+      if (verifiedRounds.length === 0) return null;
+      const averageRoundMs = Math.round(
+        verifiedRounds.reduce((sum, value) => sum + Number(value), 0) / verifiedRounds.length
+      );
+      return { playerId: participant.playerId, averageRoundMs };
+    })
+    .filter(Boolean);
+
+  for (const sample of finishSamples) {
     try {
-      await recordTwoPlayerFinishTime(realWinner.playerId, realWinner.totalElapsedMs);
+      // 2/3 ellik maç da profile yalnızca 1 oyun olarak eklenir; süre, o maçta
+      // oyuncunun gerçekten çözdüğü ellerin ortalamasıdır. Böylece ±4 sn kuralı
+      // tek elli ve çok elli maçlarda aynı zaman ölçeğinde kalır.
+      await recordTwoPlayerFinishTime(sample.playerId, sample.averageRoundMs);
     } catch (error) {
       console.error("two-player finish average update error:", error);
     }
@@ -4737,7 +4773,34 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
 
   const botParticipant = roomParticipants(room).find((participant) => participant.isBot);
   if (botParticipant) {
-    const botElapsedMs = secureRandomInt(15_000, Math.min(95_000, REALTIME_MATCH_LIMIT_MS - 1) + 1);
+    const profile = normalizeTwoPlayerFinishProfile(room.botFinishProfile || {});
+    let botElapsedMs;
+
+    if (
+      profile.finishCount >= BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES &&
+      profile.averageFinishMs !== null
+    ) {
+      const averageFinishMs = Math.max(
+        BOT_MIN_FINISH_MS,
+        Math.min(profile.averageFinishMs, BOT_MAX_FINISH_MS)
+      );
+      const minimumFinishMs = Math.max(
+        BOT_MIN_FINISH_MS,
+        averageFinishMs - BOT_AVERAGE_VARIANCE_MS
+      );
+      const maximumFinishMs = Math.min(
+        BOT_MAX_FINISH_MS,
+        averageFinishMs + BOT_AVERAGE_VARIANCE_MS
+      );
+      botElapsedMs = secureRandomInt(minimumFinishMs, maximumFinishMs + 1);
+    } else {
+      // İlk 5 oyun için hazır oda botlarının mevcut 15-95 sn davranışı korunur.
+      botElapsedMs = secureRandomInt(
+        15_000,
+        Math.min(95_000, REALTIME_MATCH_LIMIT_MS - 1) + 1
+      );
+    }
+
     room.botFinishHandle = setTimeout(() => {
       registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
     }, safePrepareMs + botElapsedMs);
@@ -4753,6 +4816,12 @@ function registerRealtimeRoundFinish(room, participant, elapsedMs) {
   participant.elapsedMs = safeElapsedMs;
   participant.roundElapsedMs = safeElapsedMs;
   participant.finishedRoundIndex = room.roundIndex;
+  if (!participant.isBot) {
+    if (!Array.isArray(participant.verifiedRoundElapsedMs)) {
+      participant.verifiedRoundElapsedMs = [];
+    }
+    participant.verifiedRoundElapsedMs.push(safeElapsedMs);
+  }
   clearParticipantAwayState(room, participant.playerId);
 
   const opponent = getOpponentParticipant(room, participant.playerId);
@@ -4851,7 +4920,8 @@ function createRealtimeRoom(
   matchMode = "quick",
   prepareMs = 0,
   roundCountValue = 1,
-  suppliedPuzzles = null
+  suppliedPuzzles = null,
+  botFinishProfile = null
 ) {
   const roomId = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -4883,6 +4953,7 @@ function createRealtimeRoom(
     awardedAt: null,
     deadlineHandle: null,
     botFinishHandle: null,
+    botFinishProfile: normalizeTwoPlayerFinishProfile(botFinishProfile || {}),
 
     participants: {
       [player.id]: {
@@ -4902,6 +4973,7 @@ function createRealtimeRoom(
         finishedRoundIndex: null,
         roundWins: 0,
         totalElapsedMs: 0,
+        verifiedRoundElapsedMs: [],
         tournamentStage: tournamentStage == null ? null : Math.max(1, Math.min(Number(tournamentStage || 1), 8)),
       },
 
@@ -4922,6 +4994,7 @@ function createRealtimeRoom(
         finishedRoundIndex: null,
         roundWins: 0,
         totalElapsedMs: 0,
+        verifiedRoundElapsedMs: [],
         tournamentStage: opponentTournamentStage == null ? null : Math.max(1, Math.min(Number(opponentTournamentStage || 1), 8)),
       },
     },
@@ -5645,10 +5718,11 @@ io.on("connection", (socket) => {
         }
         generatedLobbyBots.delete(listingId);
         const botPuzzles = Array.from({ length: botTable.roundCount }, () => generateSecurePuzzle(botTable.difficulty));
+        const botFinishProfile = await readTwoPlayerFinishProfile(player.id);
         const room = createRealtimeRoom(
           socket, player, null, botTable.player, "target_number", botTable.difficulty,
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
-          botTable.roundCount, botPuzzles
+          botTable.roundCount, botPuzzles, botFinishProfile
         );
         socket.emit("match_found", {
           roomId: room.roomId,
