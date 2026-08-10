@@ -4774,21 +4774,20 @@ function registerRealtimeRoundFinish(room, participant, elapsedMs) {
     roundCount: room.roundCount,
   });
 
-  const participants = roomParticipants(room);
-  if (room.roundCount !== 2) {
-    const unfinishedOpponent = getOpponentParticipant(room, participant.playerId);
-    if (unfinishedOpponent && unfinishedOpponent.finishedRoundIndex !== room.roundIndex) {
-      unfinishedOpponent.finishedAt = Date.now();
-      unfinishedOpponent.elapsedMs = REALTIME_MATCH_LIMIT_MS;
-      unfinishedOpponent.roundElapsedMs = REALTIME_MATCH_LIMIT_MS;
-      unfinishedOpponent.finishedRoundIndex = room.roundIndex;
-    }
-    resolveRealtimeRound(room);
-  } else if (participants.every((item) => item.finishedRoundIndex === room.roundIndex)) {
-    // İki ellik maçta 1-1 ihtimali bulunduğu için her iki oyuncunun gerçek
-    // bitirme süresi alınır ve toplam süre beraberlik bozucu olarak kullanılır.
-    resolveRealtimeRound(room);
+  // Her el bir yarış olarak çalışır: doğru sonucu ilk gönderen oyuncu eli anında kazanır.
+  // Özellikle 2 elli maçlarda daha önce 1-1 beraberliğini gerçek toplam süreyle çözmek
+  // için ikinci oyuncunun da bitirmesi bekleniyordu. Bu bekleme kaldırıldı.
+  // Eli henüz bitirmemiş rakibe o el için süre limiti yazılır; böylece 1-1 durumda
+  // beraberlik bozucu toplam süre hesabı yine deterministik kalır ve kazanan ellerdeki
+  // gerçek bitirme hızlarını karşılaştırır.
+  const unfinishedOpponent = getOpponentParticipant(room, participant.playerId);
+  if (unfinishedOpponent && unfinishedOpponent.finishedRoundIndex !== room.roundIndex) {
+    unfinishedOpponent.finishedAt = Date.now();
+    unfinishedOpponent.elapsedMs = REALTIME_MATCH_LIMIT_MS;
+    unfinishedOpponent.roundElapsedMs = REALTIME_MATCH_LIMIT_MS;
+    unfinishedOpponent.finishedRoundIndex = room.roundIndex;
   }
+  resolveRealtimeRound(room);
 }
 
 function resolveRealtimeRound(room) {
