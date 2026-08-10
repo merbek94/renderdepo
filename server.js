@@ -2011,6 +2011,41 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs) {
   }
 }
 
+function createTwoPlayerBotFinishMs(finishProfile = {}, maxFinishMs = BOT_MAX_FINISH_MS) {
+  const profile = normalizeTwoPlayerFinishProfile(finishProfile);
+  const safeMaxFinishMs = Math.max(
+    BOT_MIN_FINISH_MS,
+    Math.min(Number(maxFinishMs || BOT_MAX_FINISH_MS), BOT_MAX_FINISH_MS)
+  );
+
+  // İlk 5 normal ikili oyun bot için kalibrasyon oyunlarıdır.
+  // 6. oyundan itibaren tek/2/3 elli bütün bot maçlarında aynı profil kullanılır:
+  // bot, oyuncunun ikili oyun bitirme ortalamasının -4 / +4 saniye aralığında bitirir.
+  if (
+    profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
+    profile.averageFinishMs === null
+  ) {
+    const calibrationMinMs = Math.min(BOT_CALIBRATION_MIN_FINISH_MS, safeMaxFinishMs);
+    const calibrationMaxMs = Math.min(BOT_CALIBRATION_MAX_FINISH_MS, safeMaxFinishMs);
+    return secureRandomInt(calibrationMinMs, calibrationMaxMs + 1);
+  }
+
+  const averageFinishMs = Math.max(
+    BOT_MIN_FINISH_MS,
+    Math.min(profile.averageFinishMs, safeMaxFinishMs)
+  );
+  const minimumFinishMs = Math.max(
+    BOT_MIN_FINISH_MS,
+    averageFinishMs - BOT_AVERAGE_VARIANCE_MS
+  );
+  const maximumFinishMs = Math.min(
+    safeMaxFinishMs,
+    averageFinishMs + BOT_AVERAGE_VARIANCE_MS
+  );
+
+  return secureRandomInt(minimumFinishMs, maximumFinishMs + 1);
+}
+
 function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
   const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
   const roll = secureRandomInt(0, 10000);
@@ -2021,35 +2056,8 @@ function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
     return { finishMs: null, leaveMs: null };
   }
 
-  const profile = normalizeTwoPlayerFinishProfile(finishProfile);
-  if (
-    profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
-    profile.averageFinishMs === null
-  ) {
-    return {
-      finishMs: secureRandomInt(
-        BOT_CALIBRATION_MIN_FINISH_MS,
-        BOT_CALIBRATION_MAX_FINISH_MS + 1
-      ),
-      leaveMs: null,
-    };
-  }
-
-  const averageFinishMs = Math.max(
-    BOT_MIN_FINISH_MS,
-    Math.min(profile.averageFinishMs, BOT_MAX_FINISH_MS)
-  );
-  const minimumFinishMs = Math.max(
-    BOT_MIN_FINISH_MS,
-    averageFinishMs - BOT_AVERAGE_VARIANCE_MS
-  );
-  const maximumFinishMs = Math.min(
-    BOT_MAX_FINISH_MS,
-    averageFinishMs + BOT_AVERAGE_VARIANCE_MS
-  );
-
   return {
-    finishMs: secureRandomInt(minimumFinishMs, maximumFinishMs + 1),
+    finishMs: createTwoPlayerBotFinishMs(finishProfile),
     leaveMs: null,
   };
 }
@@ -4737,7 +4745,10 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
 
   const botParticipant = roomParticipants(room).find((participant) => participant.isBot);
   if (botParticipant) {
-    const botElapsedMs = secureRandomInt(15_000, Math.min(95_000, REALTIME_MATCH_LIMIT_MS - 1) + 1);
+    const botElapsedMs = createTwoPlayerBotFinishMs(
+      room.botFinishProfile || {},
+      Math.max(BOT_MIN_FINISH_MS, REALTIME_MATCH_LIMIT_MS - 1)
+    );
     room.botFinishHandle = setTimeout(() => {
       registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
     }, safePrepareMs + botElapsedMs);
@@ -4851,7 +4862,8 @@ function createRealtimeRoom(
   matchMode = "quick",
   prepareMs = 0,
   roundCountValue = 1,
-  suppliedPuzzles = null
+  suppliedPuzzles = null,
+  botFinishProfile = null
 ) {
   const roomId = typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -4883,6 +4895,11 @@ function createRealtimeRoom(
     awardedAt: null,
     deadlineHandle: null,
     botFinishHandle: null,
+    // Hazır oda botlarında ilk 5 oyun sonrası ±4 saniye kuralı için
+    // oyuncunun sunucuda tutulan ikili oyun bitirme profili odaya taşınır.
+    botFinishProfile: opponentPlayer.isBot === true
+      ? normalizeTwoPlayerFinishProfile(botFinishProfile || {})
+      : null,
 
     participants: {
       [player.id]: {
@@ -5425,7 +5442,8 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       return null;
     }
     const result = await client.query(
-      `SELECT p.username, p.country, g.tournament_stage, s.general_score
+      `SELECT p.username, p.country, g.tournament_stage, s.general_score,
+              g.two_player_finish_count, g.two_player_finish_total_ms
        FROM players p
        JOIN player_progress g ON g.player_id = p.player_id
        JOIN player_scores s ON s.player_id = p.player_id
@@ -5440,6 +5458,10 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       player: safePlayer({ id: session.sub, name: row.username, country: row.country }, session.sub),
       tournamentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
       generalScore: Math.max(0, Number(row.general_score || 0)),
+      twoPlayerFinishProfile: normalizeTwoPlayerFinishProfile({
+        finishCount: row.two_player_finish_count,
+        finishTotalMs: row.two_player_finish_total_ms,
+      }),
     };
   } catch (error) {
     await client.query("ROLLBACK");
@@ -5648,7 +5670,7 @@ io.on("connection", (socket) => {
         const room = createRealtimeRoom(
           socket, player, null, botTable.player, "target_number", botTable.difficulty,
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
-          botTable.roundCount, botPuzzles
+          botTable.roundCount, botPuzzles, identity.twoPlayerFinishProfile
         );
         socket.emit("match_found", {
           roomId: room.roomId,
