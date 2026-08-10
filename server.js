@@ -4173,7 +4173,23 @@ function randomStakeForGroup(group, difficulty) {
   const maximum = group.maxScore == null
     ? Math.min(2_000_000_000, Math.max(minimum, minimum * secureRandomInt(2, 15)))
     : Math.max(minimum, group.maxScore);
-  return randomStakeWithNaturalEnding(minimum, maximum);
+
+  if (maximum <= minimum) return minimum;
+
+  // Hazır odalardaki botların büyük çoğunluğunu salonun alt puan sınırına yakın tut.
+  // Kapalı aralıklı salonlarda alt band, toplam puan aralığının ilk 1/6'sıdır.
+  // Örn. Efsane Salon: 200.000 - 2.000.000 => alt bant 200.000 - 500.000.
+  // Botların %75'i bu alt banttan, %25'i ise kalan üst aralıktan seçilir.
+  const preferredMaximum = group.maxScore == null
+    ? Math.min(maximum, minimum + Math.max(1, Math.floor(minimum * 1.5)))
+    : Math.min(maximum, minimum + Math.max(1, Math.ceil((maximum - minimum) / 6)));
+
+  const shouldUseLowerBand = preferredMaximum >= maximum || secureRandomInt(0, 100) < 75;
+  if (shouldUseLowerBand) {
+    return randomStakeWithNaturalEnding(minimum, preferredMaximum);
+  }
+
+  return randomStakeWithNaturalEnding(preferredMaximum + 1, maximum);
 }
 
 function emitRoomLobbyChanged(difficulty) {
