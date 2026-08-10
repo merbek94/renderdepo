@@ -5622,6 +5622,91 @@ io.on("connection", (socket) => {
   );
 
   socket.on(
+    "start_open_table_bot",
+    async (payload = {}) => {
+      expireOldOpenTables();
+      const identity = await authenticatedSocketPlayerFromDatabase(socket, payload, "match_error");
+      if (!identity) return;
+
+      const listingId = safeText(payload.listingId, "", 128);
+      const table = publicOpenTables.get(listingId);
+      if (
+        !table ||
+        table.ownerSocketId !== socket.id ||
+        table.player.id !== identity.player.id
+      ) {
+        socket.emit("match_error", {
+          code: "ROOM_NOT_FOUND",
+          message: "Açık masa artık uygun değil.",
+        });
+        return;
+      }
+
+      try {
+        assertRoundCountEligibility(table.roundCount, identity.generalScore, table.stakePoints);
+        await consumeGameRightsForPlayers(
+          [identity.player.id],
+          table.difficulty,
+          table.stakePoints
+        );
+      } catch (error) {
+        socket.emit("match_error", {
+          code: error.publicCode || "NO_GAME_RIGHT",
+          message: error.message || "Oyun başlatılamadı.",
+        });
+        return;
+      }
+
+      publicOpenTables.delete(listingId);
+      emitRoomLobbyChanged(table.difficulty);
+      await clearBotFallbackEligibilityForPlayers([identity.player.id]);
+
+      const usedNames = new Set([identity.player.name]);
+      const botIdentity = createLobbyBotIdentity(usedNames);
+      const botPlayer = {
+        id: `bot_${crypto.randomBytes(12).toString("hex")}`,
+        name: botIdentity.name,
+        country: botIdentity.country,
+        isBot: true,
+      };
+
+      const room = createRealtimeRoom(
+        socket,
+        identity.player,
+        null,
+        botPlayer,
+        "target_number",
+        table.difficulty,
+        table.puzzle,
+        null,
+        null,
+        table.stakePoints,
+        "open_table",
+        TWO_PLAYER_PREPARE_MS,
+        table.roundCount,
+        table.puzzles,
+        identity.twoPlayerFinishProfile
+      );
+
+      socket.emit("match_found", {
+        roomId: room.roomId,
+        opponent: {
+          name: botPlayer.name,
+          country: botPlayer.country,
+          matchKey: matchmakingPlayerKey(botPlayer.id),
+        },
+        puzzle: room.puzzle,
+        stakePoints: room.stakePoints,
+        matchMode: "open_table",
+        startsAtMillis: room.startsAtMillis,
+        roundCount: room.roundCount,
+        roundIndex: room.roundIndex,
+        isBot: true,
+      });
+    }
+  );
+
+  socket.on(
     "join_match",
     async (payload = {}) => {
       const gameKey = normalizeMatchGameKey(payload.gameKey);
