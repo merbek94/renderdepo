@@ -1813,6 +1813,28 @@ async function addPositiveGeneralAndXpInTransaction(client, playerId, generalDel
   }
 }
 
+const HUNDRED_ELIMINATION_REWARDS = [
+  20,   // 1. aşamada elenirse
+  50,   // 2. aşamada elenirse
+  100,  // 3. aşamada elenirse
+  200,  // 4. aşamada elenirse
+  350,  // 5. aşamada elenirse
+  600,  // 6. aşamada elenirse
+  900,  // 7. aşamada elenirse
+  1300, // 8. aşamada elenirse
+  1800, // 9. aşamada elenirse
+  2500, // 10. aşamada elenirse
+  3500, // 11. aşamada elenirse
+  5000, // 12. aşamada elenirse
+];
+
+const HUNDRED_WIN_REWARD = 10_000;
+
+function hundredEliminationReward(stageValue) {
+  const stage = Math.max(1, Math.min(Number(stageValue || 1), HUNDRED_ELIMINATION_REWARDS.length));
+  return HUNDRED_ELIMINATION_REWARDS[stage - 1];
+}
+
 async function completeHundredStageInTransaction(client, playerId, stageValue) {
   await ensureAuthenticatedPlayer(client, playerId);
   const locked = await client.query(
@@ -1835,7 +1857,7 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
   let nextStage = currentStage + 1;
   let runCompleted = false;
   if (currentStage >= 12) {
-    generalDelta = 240;
+    generalDelta = HUNDRED_WIN_REWARD;
     xpDelta = 480;
     nextStage = 0;
     runCompleted = true;
@@ -1901,7 +1923,7 @@ async function forfeitHundredRunInTransaction(client, playerId) {
     multiplayer: true,
     won: false,
   });
-  const generalDelta = stage * 20;
+  const generalDelta = hundredEliminationReward(stage);
   const xpDelta = stage * 40;
   await addPositiveGeneralAndXpInTransaction(client, playerId, generalDelta, xpDelta);
   await client.query(
