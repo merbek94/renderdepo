@@ -1901,8 +1901,8 @@ async function forfeitHundredRunInTransaction(client, playerId) {
     multiplayer: true,
     won: false,
   });
-  const generalDelta = stage * 10;
-  const xpDelta = stage * 20;
+  const generalDelta = stage * 20;
+  const xpDelta = stage * 40;
   await addPositiveGeneralAndXpInTransaction(client, playerId, generalDelta, xpDelta);
   await client.query(
     `UPDATE player_progress SET
