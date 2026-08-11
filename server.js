@@ -1975,12 +1975,14 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId) {
   });
 }
 
-async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs) {
+async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs, roundCountValue = 1) {
   const parsedElapsedMs = Number(elapsedMs);
   if (!Number.isFinite(parsedElapsedMs) || parsedElapsedMs <= 0) return;
+  const roundCount = normalizeRoundCount(roundCountValue);
+  const averagePerRoundElapsedMs = parsedElapsedMs / roundCount;
   const safeElapsedMs = Math.max(
     1,
-    Math.min(Math.floor(parsedElapsedMs), 2 * 60 * 1000)
+    Math.min(Math.floor(averagePerRoundElapsedMs), 2 * 60 * 1000)
   );
   await client.query(
     `UPDATE player_progress
@@ -1995,13 +1997,13 @@ async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedM
   );
 }
 
-async function recordTwoPlayerFinishTime(playerId, elapsedMs) {
+async function recordTwoPlayerFinishTime(playerId, elapsedMs, roundCountValue = 1) {
   if (!pool || !playerId) return;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, playerId);
-    await recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs);
+    await recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedMs, roundCountValue);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -2641,7 +2643,11 @@ async function awardRealtimeRoom(room, winner, loser) {
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
   if (realWinner?.totalElapsedMs != null) {
     try {
-      await recordTwoPlayerFinishTime(realWinner.playerId, realWinner.totalElapsedMs);
+      await recordTwoPlayerFinishTime(
+        realWinner.playerId,
+        realWinner.totalElapsedMs,
+        room.roundCount
+      );
     } catch (error) {
       console.error("two-player finish average update error:", error);
     }
