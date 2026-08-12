@@ -505,7 +505,7 @@ async function cleanupOldMonthlyLeaderboardScores() {
   const activeMonthKey = currentMonthKey();
   const result = await pool.query(
     `DELETE FROM player_monthly_scores
-     WHERE month_key <> $1`,
+     WHERE month_key < $1`,
     [activeMonthKey]
   );
 
@@ -1304,8 +1304,10 @@ function assertRoundCountEligibility(roundCountValue, generalScore, stakePoints 
   return roundCount;
 }
 
-async function normalizeGameRightsInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
+async function normalizeGameRightsInTransaction(client, playerId, playerAlreadyEnsured = false) {
+  if (!playerAlreadyEnsured) {
+    await ensureAuthenticatedPlayer(client, playerId);
+  }
   const result = await client.query(
     `SELECT game_rights, game_rights_refill_at
      FROM player_progress WHERE player_id = $1 FOR UPDATE`,
@@ -1321,12 +1323,17 @@ async function normalizeGameRightsInTransaction(client, playerId) {
   const nextAnchor = remaining >= GAME_RIGHT_MAX
     ? now
     : anchor + refillCount * GAME_RIGHT_REFILL_MS;
-  await client.query(
-    `UPDATE player_progress SET game_rights = $2,
-       game_rights_refill_at = TO_TIMESTAMP($3 / 1000.0), updated_at = NOW()
-     WHERE player_id = $1`,
-    [playerId, remaining, nextAnchor]
-  );
+
+  // Tasarruf: hak gerçekten değişmediyse PostgreSQL'e UPDATE gönderme.
+  if (remaining !== stored) {
+    await client.query(
+      `UPDATE player_progress SET game_rights = $2,
+         game_rights_refill_at = TO_TIMESTAMP($3 / 1000.0), updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, remaining, nextAnchor]
+    );
+  }
+
   return {
     remainingRights: remaining,
     maxRights: GAME_RIGHT_MAX,
@@ -1459,7 +1466,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
   const entry = await assertTwoPlayerEntryScoreInTransaction(
     client, playerId, difficulty, wagerPoints, allowAutomatic
   );
-  const state = await normalizeGameRightsInTransaction(client, playerId);
+  const state = await normalizeGameRightsInTransaction(client, playerId, true);
   if (state.remainingRights <= 0) {
     const error = new Error("İki oyunculu oyun hakkın kalmadı.");
     error.statusCode = 409;
@@ -1500,7 +1507,7 @@ async function consumeGameRightsForPlayers(playerIds, difficulty, wagerPoints = 
 
 async function refundGameRightInTransaction(client, playerId) {
   await ensureAuthenticatedPlayer(client, playerId);
-  const state = await normalizeGameRightsInTransaction(client, playerId);
+  const state = await normalizeGameRightsInTransaction(client, playerId, true);
   const refunded = Math.min(GAME_RIGHT_MAX, state.remainingRights + 1);
   const anchor = refunded >= GAME_RIGHT_MAX
     ? Date.now()
@@ -1672,7 +1679,7 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
     const monthKey = currentMonthKey();
     await client.query(
       `UPDATE player_scores
-       SET general_score = LEAST(general_score + $2, 2000000000),
+       SET general_score = LEAST(general_score::bigint + $2::bigint, 2000000000)::integer,
            updated_at = NOW()
        WHERE player_id = $1`,
       [playerId, generalDelta]
@@ -1683,9 +1690,9 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
        VALUES ($1, $2, $3, 0, NOW())
        ON CONFLICT (player_id, month_key) DO UPDATE SET
          general_score = LEAST(
-           player_monthly_scores.general_score + EXCLUDED.general_score,
+           player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint,
            2000000000
-         ),
+         )::integer,
          updated_at = NOW()`,
       [playerId, monthKey, generalDelta]
     );
@@ -1707,10 +1714,12 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
   };
 }
 
-async function normalizeHundredDailyAccessInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
+async function normalizeHundredDailyAccessInTransaction(client, playerId, playerAlreadyEnsured = false) {
+  if (!playerAlreadyEnsured) {
+    await ensureAuthenticatedPlayer(client, playerId);
+  }
   const result = await client.query(
-    `SELECT hundred_active, hundred_daily_key, hundred_daily_base_used,
+    `SELECT hundred_active, hundred_stage, hundred_daily_key, hundred_daily_base_used,
             hundred_daily_ad_used, hundred_rewarded_rights
      FROM player_progress
      WHERE player_id = $1
@@ -1747,6 +1756,8 @@ async function normalizeHundredDailyAccessInTransaction(client, playerId) {
   const baseRightsRemaining = baseUsed ? 0 : HUNDRED_DAILY_BASE_RIGHTS;
   const active = row.hundred_active === true;
   return {
+    active,
+    stage: Math.max(0, Math.min(Number(row.hundred_stage || 0), 12)),
     dayKey: dailyKey,
     baseRightsRemaining,
     rewardedRightsRemaining: rewardedRights,
@@ -1758,27 +1769,23 @@ async function normalizeHundredDailyAccessInTransaction(client, playerId) {
 }
 
 async function grantHundredRewardedRightInTransaction(client, playerId) {
-  const access = await normalizeHundredDailyAccessInTransaction(client, playerId);
-  const activeResult = await client.query(
-    `SELECT hundred_active, hundred_daily_base_used, hundred_daily_ad_used, hundred_rewarded_rights
-     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-    [playerId]
-  );
-  const row = activeResult.rows[0] || {};
-  if (row.hundred_active === true) {
+  await ensureAuthenticatedPlayer(client, playerId);
+  // normalizeHundred... satırı zaten FOR UPDATE ile kilitliyor; aynı satırı ikinci kez SELECT etme.
+  const access = await normalizeHundredDailyAccessInTransaction(client, playerId, true);
+  if (access.active) {
     const error = new Error("Aktif 100 kişilik oyun varken reklam hakkı alınamaz.");
     error.statusCode = 409;
     error.publicCode = "HUNDRED_RUN_ACTIVE";
     throw error;
   }
-  if (row.hundred_daily_base_used !== true) {
+  if (access.baseRightsRemaining > 0) {
     const error = new Error("Önce bugünkü ücretsiz 100 kişilik oyun hakkını kullanmalısınız.");
     error.statusCode = 409;
     error.publicCode = "HUNDRED_FREE_RIGHT_AVAILABLE";
     throw error;
   }
-  if (row.hundred_daily_ad_used === true) {
-    if (Number(row.hundred_rewarded_rights || 0) > 0) {
+  if (access.rewardedAdUsedToday) {
+    if (access.rewardedRightsRemaining > 0) {
       return readAuthoritativePlayerState(client, playerId);
     }
     const error = new Error("Bugün reklam izleyerek alınabilecek ek 100 kişilik oyun hakkını kullandınız.");
@@ -1845,37 +1852,169 @@ async function enterTournamentInTransaction(client, playerId) {
 }
 
 async function readAuthoritativePlayerState(client, playerId) {
-  const levelRewardSettlement = await settleLevelMilestoneRewardsInTransaction(client, playerId);
-  const hundredAccess = await normalizeHundredDailyAccessInTransaction(client, playerId);
-  const result = await client.query(
-    `SELECT s.general_score, s.infinite_score,
-            p.total_xp, p.infinite_run_score, p.infinite_next_stage,
-            p.diamond_balance, p.level_reward_claimed_through,
-            p.tournament_stage, p.tournament_rights,
-            p.tournament_bank, p.tournament_completed,
-            p.tournament_tickets, p.tournament_entry_active,
-            p.hundred_active, p.hundred_stage,
-            p.game_rights, p.game_rights_refill_at,
-            pl.username, pl.country, pl.username_user_set,
-            pl.username_change_count, pl.username_last_changed_at,
-            pl.updated_at AS profile_updated_at
-     FROM player_scores s
-     JOIN player_progress p ON p.player_id = s.player_id
-     JOIN players pl ON pl.player_id = s.player_id
-     WHERE s.player_id = $1`,
-    [playerId]
-  );
+  async function loadStateRow() {
+    return client.query(
+      `SELECT s.general_score, s.infinite_score,
+              p.total_xp, p.infinite_run_score, p.infinite_next_stage,
+              p.diamond_balance, p.level_reward_claimed_through,
+              p.tournament_stage, p.tournament_rights,
+              p.tournament_bank, p.tournament_completed,
+              p.tournament_tickets, p.tournament_entry_active,
+              p.hundred_active, p.hundred_stage,
+              p.hundred_daily_key, p.hundred_daily_base_used,
+              p.hundred_daily_ad_used, p.hundred_rewarded_rights,
+              p.game_rights, p.game_rights_refill_at,
+              pl.username, pl.country, pl.username_user_set,
+              pl.username_change_count, pl.username_last_changed_at,
+              pl.updated_at AS profile_updated_at
+       FROM player_scores s
+       JOIN player_progress p ON p.player_id = s.player_id
+       JOIN players pl ON pl.player_id = s.player_id
+       WHERE s.player_id = $1
+       FOR UPDATE OF p`,
+      [playerId]
+    );
+  }
+
+  // Mevcut oyuncuda doğrudan tek SELECT. Eksik/eski kayıtta yalnızca gerektiğinde ensure çalışır.
+  let result = await loadStateRow();
+  if (result.rowCount === 0) {
+    await ensureAuthenticatedPlayer(client, playerId);
+    result = await loadStateRow();
+  }
   const row = result.rows[0] || {};
-  const gameRights = await normalizeGameRightsInTransaction(client, playerId);
+  const now = Date.now();
+
+  // Seviye kilometre taşı ödüllerini mevcut progress satırından hesapla; ayrı SELECT yapma.
+  const totalXp = Math.max(0, Math.min(Number(row.total_xp || 0), 2_000_000_000));
+  const currentLevel = playerLevelForTotalXp(totalXp);
+  const eligibleThroughLevel = Math.min(1000, Math.floor(currentLevel / 10) * 10);
+  const claimedThroughLevel = Math.max(
+    0,
+    Math.min(1000, Math.floor(Number(row.level_reward_claimed_through || 0) / 10) * 10)
+  );
+  let levelGeneralDelta = 0;
+  let levelDiamondDelta = 0;
+  const levelSettlementNeeded = eligibleThroughLevel > claimedThroughLevel;
+  if (levelSettlementNeeded) {
+    for (let level = claimedThroughLevel + 10; level <= eligibleThroughLevel; level += 10) {
+      const reward = levelMilestoneReward(level);
+      if (!reward) continue;
+      levelGeneralDelta += reward.generalScore;
+      levelDiamondDelta += reward.diamonds;
+    }
+  }
+
+  // 100 kişilik günlük hakları aynı progress satırından normalize et.
+  const todayKey = currentUtcDayKey();
+  const storedHundredDayKey = String(row.hundred_daily_key || "");
+  const hundredResetNeeded = storedHundredDayKey !== todayKey;
+  const hundredDayKey = hundredResetNeeded ? todayKey : storedHundredDayKey;
+  const hundredBaseUsed = hundredResetNeeded ? false : row.hundred_daily_base_used === true;
+  const hundredAdUsed = hundredResetNeeded ? false : row.hundred_daily_ad_used === true;
+  const hundredRewardedRights = hundredResetNeeded
+    ? 0
+    : Math.max(0, Math.min(Number(row.hundred_rewarded_rights || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
+  const hundredBaseRightsRemaining = hundredBaseUsed ? 0 : HUNDRED_DAILY_BASE_RIGHTS;
+  const hundredActive = row.hundred_active === true;
+
+  // İki oyunculu hakları aynı satırdan hesapla. Hak artmadıysa UPDATE yapılmayacak.
+  const storedGameRights = Math.max(
+    0,
+    Math.min(Number(row.game_rights ?? GAME_RIGHT_MAX), GAME_RIGHT_MAX)
+  );
+  const storedGameRightsAnchor = new Date(row.game_rights_refill_at || now).getTime();
+  const gameRightsElapsed = Math.max(0, now - storedGameRightsAnchor);
+  const gameRightsRefillCount = storedGameRights >= GAME_RIGHT_MAX
+    ? 0
+    : Math.floor(gameRightsElapsed / GAME_RIGHT_REFILL_MS);
+  const gameRightsRemaining = Math.min(GAME_RIGHT_MAX, storedGameRights + gameRightsRefillCount);
+  const calculatedGameRightsAnchor = gameRightsRemaining >= GAME_RIGHT_MAX
+    ? now
+    : storedGameRightsAnchor + gameRightsRefillCount * GAME_RIGHT_REFILL_MS;
+  const gameRightsChanged = gameRightsRemaining !== storedGameRights;
+
+  // Seviye puanı iki leaderboard tablosuna tek PostgreSQL çağrısında yazılır.
+  if (levelGeneralDelta > 0) {
+    const monthKey = currentMonthKey();
+    await client.query(
+      `WITH updated_score AS (
+         UPDATE player_scores
+         SET general_score = LEAST(general_score + $2, 2000000000),
+             updated_at = NOW()
+         WHERE player_id = $1
+         RETURNING player_id
+       )
+       INSERT INTO player_monthly_scores
+         (player_id, month_key, general_score, infinite_score, updated_at)
+       VALUES ($1, $3, $2, 0, NOW())
+       ON CONFLICT (player_id, month_key) DO UPDATE SET
+         general_score = LEAST(
+           player_monthly_scores.general_score + EXCLUDED.general_score,
+           2000000000
+         ),
+         updated_at = NOW()`,
+      [playerId, levelGeneralDelta, monthKey]
+    );
+  }
+
+  // Aynı player_progress satırına ait tüm bakım işlerini tek UPDATE'te birleştir.
+  const progressMaintenanceNeeded =
+    levelSettlementNeeded || hundredResetNeeded || gameRightsChanged;
+  if (progressMaintenanceNeeded) {
+    const persistedGameRightsAnchor = gameRightsChanged
+      ? calculatedGameRightsAnchor
+      : storedGameRightsAnchor;
+    await client.query(
+      `UPDATE player_progress SET
+         diamond_balance = LEAST(diamond_balance + $2, 2000000000),
+         level_reward_claimed_through = $3,
+         hundred_daily_key = $4,
+         hundred_daily_base_used = $5,
+         hundred_daily_ad_used = $6,
+         hundred_rewarded_rights = $7,
+         game_rights = $8,
+         game_rights_refill_at = TO_TIMESTAMP($9 / 1000.0),
+         updated_at = NOW()
+       WHERE player_id = $1`,
+      [
+        playerId,
+        levelSettlementNeeded ? levelDiamondDelta : 0,
+        levelSettlementNeeded ? eligibleThroughLevel : claimedThroughLevel,
+        hundredDayKey,
+        hundredBaseUsed,
+        hundredAdUsed,
+        hundredRewardedRights,
+        gameRightsRemaining,
+        persistedGameRightsAnchor,
+      ]
+    );
+  }
+
+  const levelRewardSettlement = {
+    claimedThroughLevel: levelSettlementNeeded ? eligibleThroughLevel : claimedThroughLevel,
+    generalDelta: levelGeneralDelta,
+    diamondDelta: levelDiamondDelta,
+  };
+
+  const gameRights = {
+    remainingRights: gameRightsRemaining,
+    maxRights: GAME_RIGHT_MAX,
+    lastRefillTimeMillis: calculatedGameRightsAnchor,
+    millisUntilNextRight: gameRightsRemaining >= GAME_RIGHT_MAX
+      ? 0
+      : Math.max(0, GAME_RIGHT_REFILL_MS - (now - calculatedGameRightsAnchor)),
+  };
+
   return {
-    generalScore: Number(row.general_score || 0),
+    generalScore: Math.min(2_000_000_000, Number(row.general_score || 0) + levelGeneralDelta),
     infiniteScore: Number(row.infinite_score || 0),
-    totalXp: Number(row.total_xp || 0),
-    diamondBalance: Math.max(0, Number(row.diamond_balance || 0)),
-    levelRewardClaimedThrough: Math.max(
-      0,
-      Math.min(1000, Number(row.level_reward_claimed_through || 0))
+    totalXp,
+    diamondBalance: Math.min(
+      2_000_000_000,
+      Math.max(0, Number(row.diamond_balance || 0)) + levelDiamondDelta
     ),
+    levelRewardClaimedThrough: levelRewardSettlement.claimedThroughLevel,
     levelRewardSettlement,
     runScore: Number(row.infinite_run_score || 0),
     infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
@@ -1897,15 +2036,17 @@ async function readAuthoritativePlayerState(client, playerId) {
       entryActive: row.tournament_entry_active === true,
     },
     hundred: {
-      active: row.hundred_active === true,
+      active: hundredActive,
       stage: Math.max(0, Math.min(Number(row.hundred_stage || 0), 12)),
-      dailyBaseRightsRemaining: hundredAccess.baseRightsRemaining,
-      rewardedRightsRemaining: hundredAccess.rewardedRightsRemaining,
-      rewardedAdUsedToday: hundredAccess.rewardedAdUsedToday,
-      rewardedAdAvailable: hundredAccess.rewardedAdAvailable,
-      canStart: hundredAccess.canStart,
-      nextResetAtMillis: hundredAccess.nextResetAtMillis,
-      dayKey: hundredAccess.dayKey,
+      dailyBaseRightsRemaining: hundredBaseRightsRemaining,
+      rewardedRightsRemaining: hundredRewardedRights,
+      rewardedAdUsedToday: hundredAdUsed,
+      rewardedAdAvailable:
+        !hundredActive && hundredBaseUsed && !hundredAdUsed && hundredRewardedRights <= 0,
+      canStart:
+        !hundredActive && (hundredBaseRightsRemaining + hundredRewardedRights > 0),
+      nextResetAtMillis: nextUtcDayStartMillis(),
+      dayKey: hundredDayKey,
     },
     gameRights,
   };
@@ -2474,6 +2615,18 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw) {
 }
 
 async function ensureAuthenticatedPlayer(client, playerId) {
+  // Normal kullanıcıda üç INSERT denemek yerine tek hafif SELECT ile satırların tam olduğunu doğrula.
+  const existing = await client.query(
+    `SELECT 1
+     FROM players pl
+     JOIN player_scores s ON s.player_id = pl.player_id
+     JOIN player_progress p ON p.player_id = pl.player_id
+     WHERE pl.player_id = $1
+     LIMIT 1`,
+    [playerId]
+  );
+  if (existing.rowCount > 0) return false;
+
   const fallbackUsername = `Oyuncu_${String(playerId).slice(-8)}`;
   await client.query(
     `INSERT INTO players (player_id, username, country, created_at, updated_at)
@@ -2481,13 +2634,19 @@ async function ensureAuthenticatedPlayer(client, playerId) {
      ON CONFLICT (player_id) DO NOTHING`,
     [playerId, fallbackUsername]
   );
-  await ensurePlayerScoreRow(client, playerId);
+  await client.query(
+    `INSERT INTO player_scores (player_id)
+     VALUES ($1)
+     ON CONFLICT (player_id) DO NOTHING`,
+    [playerId]
+  );
   await client.query(
     `INSERT INTO player_progress (player_id, total_xp, updated_at)
      VALUES ($1, 0, NOW())
      ON CONFLICT (player_id) DO NOTHING`,
     [playerId]
   );
+  return true;
 }
 
 function normalizeGameplayDeviceId(value) {
@@ -3212,13 +3371,14 @@ app.post("/game/hundred/start", requireAuth, requireGameplayLease, async (req, r
   try {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, req.auth.sub);
-    const access = await normalizeHundredDailyAccessInTransaction(client, req.auth.sub);
-    const beforeStart = await client.query(
-      `SELECT hundred_active, hundred_stage, hundred_daily_base_used, hundred_rewarded_rights
-       FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-      [req.auth.sub]
-    );
-    const before = beforeStart.rows[0] || {};
+    const access = await normalizeHundredDailyAccessInTransaction(client, req.auth.sub, true);
+    // normalizeHundred... aynı progress satırını FOR UPDATE ile zaten okudu/kilitledi.
+    const before = {
+      hundred_active: access.active,
+      hundred_stage: access.stage,
+      hundred_daily_base_used: access.baseRightsRemaining <= 0,
+      hundred_rewarded_rights: access.rewardedRightsRemaining,
+    };
 
     if (fresh) {
       if (before.hundred_active === true) {
@@ -3256,18 +3416,17 @@ app.post("/game/hundred/start", requireAuth, requireGameplayLease, async (req, r
       }
     }
 
-    const locked = await client.query(
-      `SELECT hundred_active, hundred_stage
-       FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-      [req.auth.sub]
-    );
-    const progress = locked.rows[0] || {};
-    if (progress.hundred_active !== true) {
+    // access satırı transaction başında FOR UPDATE ile okundu. Fresh başlangıçta az önce
+    // stage=1 yazdık; devam oyununda da access.stage zaten kilitli satırdan geldi.
+    const activeAfterStart = fresh ? true : access.active;
+    if (!activeAfterStart) {
       const error = new Error("100 kişilik oyun aktif değil.");
       error.statusCode = 409;
       throw error;
     }
-    const stage = Math.max(1, Math.min(Number(progress.hundred_stage || 1), 12));
+    const stage = fresh
+      ? 1
+      : Math.max(1, Math.min(Number(access.stage || 1), 12));
     const difficulty = hundredDifficultyForStage(stage);
     const puzzle = generateSecurePuzzle(difficulty);
     await client.query(
@@ -6901,6 +7060,8 @@ setInterval(() => {
   cleanupLeaderboardResponseCache();
 }, LEADERBOARD_SERVER_CACHE_CLEANUP_INTERVAL_MS).unref();
 
+// Aylık tablo ayda bir eskir; saatlik tam tablo kontrolü gereksiz DB yükü oluşturur.
+// Başlangıçta initDatabase() zaten bir kez temizler, sonrasında günlük kontrol yeterlidir.
 setInterval(() => {
   cleanupOldMonthlyLeaderboardScores().catch((error) => {
     console.error("Eski aylık leaderboard temizleme hatası:", {
@@ -6908,7 +7069,7 @@ setInterval(() => {
       code: error.code,
     });
   });
-}, 60 * 60_000).unref();
+}, 24 * 60 * 60_000).unref();
 
 const PORT = Number(
   process.env.PORT || 10000
