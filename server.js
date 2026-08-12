@@ -484,27 +484,33 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
 
-    -- Eski leaderboard indeksleri yeni sıralama kriterlerini tam karşılamıyordu.
+    -- Leaderboard eşitlik sırası artık ortak updated_at alanlarına bağlı değildir.
+    -- Böylece bir skor türündeki hareket, başka bir skor tablosundaki eşitlik sırasını
+    -- değiştirmez ve indeksler daha küçük / daha ucuz tutulur.
     DROP INDEX IF EXISTS idx_player_scores_general;
     DROP INDEX IF EXISTS idx_player_scores_infinite;
     DROP INDEX IF EXISTS idx_monthly_scores_month_general;
     DROP INDEX IF EXISTS idx_monthly_scores_month_infinite;
+    DROP INDEX IF EXISTS idx_player_scores_general_v2;
+    DROP INDEX IF EXISTS idx_player_scores_infinite_v2;
+    DROP INDEX IF EXISTS idx_player_scores_month_general_v3;
+    DROP INDEX IF EXISTS idx_player_scores_month_infinite_v3;
     DROP INDEX IF EXISTS idx_players_country;
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_general_v2
-      ON player_scores (general_score DESC, updated_at ASC, player_id ASC)
+    CREATE INDEX IF NOT EXISTS idx_player_scores_general_v3
+      ON player_scores (general_score DESC, player_id ASC)
       WHERE general_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite_v2
-      ON player_scores (infinite_score DESC, updated_at ASC, player_id ASC)
+    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite_v3
+      ON player_scores (infinite_score DESC, player_id ASC)
       WHERE infinite_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_month_general_v3
-      ON player_scores (monthly_key, monthly_general_score DESC, monthly_updated_at ASC, player_id ASC)
+    CREATE INDEX IF NOT EXISTS idx_player_scores_month_general_v4
+      ON player_scores (monthly_key, monthly_general_score DESC, player_id ASC)
       WHERE monthly_general_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_month_infinite_v3
-      ON player_scores (monthly_key, monthly_infinite_score DESC, monthly_updated_at ASC, player_id ASC)
+    CREATE INDEX IF NOT EXISTS idx_player_scores_month_infinite_v4
+      ON player_scores (monthly_key, monthly_infinite_score DESC, player_id ASC)
       WHERE monthly_infinite_score > 0;
 
     CREATE INDEX IF NOT EXISTS idx_players_country_player_v2
@@ -2985,7 +2991,9 @@ async function applyAuthoritativeScoreDelta(playerId, generalDelta, infiniteDelt
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, playerId);
+    // Gerçek zamanlı oda katılımcısı odaya alınmadan önce imzalı session token ve
+    // gameplay lease doğrulanır; oyuncunun DB satırları da o aşamada garanti edilir.
+    // Buradaki ikinci ensureAuthenticatedPlayer() her ödülde gereksiz bir SELECT idi.
     await applyLeaderboardScoreDeltaInTransaction(
       client,
       playerId,
@@ -4374,7 +4382,6 @@ async function queryLeaderboardTopRows({ scoreType, period, scope, country, mont
   const scoreColumn = period === "month"
     ? (scoreType === "infinite" ? "monthly_infinite_score" : "monthly_general_score")
     : (scoreType === "infinite" ? "infinite_score" : "general_score");
-  const updatedAtColumn = period === "month" ? "monthly_updated_at" : "updated_at";
   const values = [];
   const conditions = [`s.${scoreColumn} > 0`];
 
@@ -4398,7 +4405,6 @@ async function queryLeaderboardTopRows({ scoreType, period, scope, country, mont
      WHERE ${conditions.join(" AND ")}
      ORDER BY
        s.${scoreColumn} DESC,
-       s.${updatedAtColumn} ASC,
        s.player_id ASC
      LIMIT 50`,
     values
