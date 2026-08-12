@@ -490,11 +490,33 @@ async function initDatabase() {
       ON players (LOWER(username));
   `);
 
+  await cleanupOldMonthlyLeaderboardScores();
+
   console.log("PostgreSQL leaderboard tabloları hazır.");
 }
 
 function currentMonthKey() {
   return new Date().toISOString().slice(0, 7);
+}
+
+async function cleanupOldMonthlyLeaderboardScores() {
+  if (!pool) return 0;
+
+  const activeMonthKey = currentMonthKey();
+  const result = await pool.query(
+    `DELETE FROM player_monthly_scores
+     WHERE month_key <> $1`,
+    [activeMonthKey]
+  );
+
+  if (result.rowCount > 0) {
+    console.log("Eski aylık leaderboard kayıtları temizlendi:", {
+      activeMonthKey,
+      deletedRows: result.rowCount,
+    });
+  }
+
+  return result.rowCount;
 }
 
 
@@ -4208,8 +4230,43 @@ const LEADERBOARD_SERVER_CACHE_TTL_MS = Math.max(
   10_000,
   Math.min(5 * 60_000, Number(process.env.LEADERBOARD_CACHE_TTL_MS || 60_000) || 60_000)
 );
+const LEADERBOARD_SERVER_CACHE_MAX_ENTRIES = Math.max(
+  16,
+  Math.min(2_000, Number(process.env.LEADERBOARD_CACHE_MAX_ENTRIES || 128) || 128)
+);
+const LEADERBOARD_SERVER_CACHE_CLEANUP_INTERVAL_MS = Math.max(
+  10_000,
+  Math.min(60_000, LEADERBOARD_SERVER_CACHE_TTL_MS)
+);
 const leaderboardResponseCache = new Map();
 const leaderboardRequestsInFlight = new Map();
+
+function cleanupLeaderboardResponseCache(now = Date.now()) {
+  for (const [key, entry] of leaderboardResponseCache) {
+    if (now - entry.createdAtMillis >= LEADERBOARD_SERVER_CACHE_TTL_MS) {
+      leaderboardResponseCache.delete(key);
+    }
+  }
+
+  while (leaderboardResponseCache.size > LEADERBOARD_SERVER_CACHE_MAX_ENTRIES) {
+    const oldestKey = leaderboardResponseCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    leaderboardResponseCache.delete(oldestKey);
+  }
+}
+
+function setLeaderboardResponseCacheEntry(key, rows) {
+  cleanupLeaderboardResponseCache();
+
+  // Map ekleme sırasını LRU sırası olarak kullan: güncellenen anahtar en sona taşınır.
+  leaderboardResponseCache.delete(key);
+  leaderboardResponseCache.set(key, {
+    createdAtMillis: Date.now(),
+    rows,
+  });
+
+  cleanupLeaderboardResponseCache();
+}
 
 function leaderboardServerCacheKey({ scoreType, period, scope, country, monthKey }) {
   return [
@@ -4265,9 +4322,18 @@ async function queryLeaderboardTopRows({ scoreType, period, scope, country, mont
 async function loadLeaderboardRowsCached(args) {
   const key = leaderboardServerCacheKey(args);
   const now = Date.now();
+  cleanupLeaderboardResponseCache(now);
+
   const cached = leaderboardResponseCache.get(key);
   if (cached && now - cached.createdAtMillis < LEADERBOARD_SERVER_CACHE_TTL_MS) {
+    // LRU: kullanılan anahtarı Map'in sonuna taşı. TTL ise oluşturulma zamanına göre devam eder.
+    leaderboardResponseCache.delete(key);
+    leaderboardResponseCache.set(key, cached);
     return cached.rows;
+  }
+
+  if (cached) {
+    leaderboardResponseCache.delete(key);
   }
 
   // Aynı cache boşluğunda yüzlerce eşzamanlı istek gelirse yalnızca bir DB sorgusu çalışsın.
@@ -4276,10 +4342,7 @@ async function loadLeaderboardRowsCached(args) {
 
   const request = queryLeaderboardTopRows(args)
     .then((rows) => {
-      leaderboardResponseCache.set(key, {
-        createdAtMillis: Date.now(),
-        rows,
-      });
+      setLeaderboardResponseCacheEntry(key, rows);
       return rows;
     })
     .finally(() => {
@@ -6833,6 +6896,19 @@ setInterval(() => {
   expireOldOpenTables();
   expireResolvedRooms();
 }, 60_000).unref();
+
+setInterval(() => {
+  cleanupLeaderboardResponseCache();
+}, LEADERBOARD_SERVER_CACHE_CLEANUP_INTERVAL_MS).unref();
+
+setInterval(() => {
+  cleanupOldMonthlyLeaderboardScores().catch((error) => {
+    console.error("Eski aylık leaderboard temizleme hatası:", {
+      message: error.message,
+      code: error.code,
+    });
+  });
+}, 60 * 60_000).unref();
 
 const PORT = Number(
   process.env.PORT || 10000
