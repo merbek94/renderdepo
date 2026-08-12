@@ -267,17 +267,41 @@ async function initDatabase() {
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
       general_score INTEGER NOT NULL DEFAULT 0 CHECK (general_score >= 0),
       infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
+      monthly_key TEXT NOT NULL DEFAULT '',
+      monthly_general_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
+      monthly_infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0),
+      monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS player_monthly_scores (
-      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
-      month_key TEXT NOT NULL,
-      general_score INTEGER NOT NULL DEFAULT 0 CHECK (general_score >= 0),
-      infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (player_id, month_key)
-    );
+    ALTER TABLE player_scores
+      ADD COLUMN IF NOT EXISTS monthly_key TEXT NOT NULL DEFAULT '';
+    ALTER TABLE player_scores
+      ADD COLUMN IF NOT EXISTS monthly_general_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
+    ALTER TABLE player_scores
+      ADD COLUMN IF NOT EXISTS monthly_infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
+    ALTER TABLE player_scores
+      ADD COLUMN IF NOT EXISTS monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    -- Eski ayrı aylık leaderboard tablosunu yalnızca bir kez yeni player_scores
+    -- kolonlarına taşı. Sonrasında aylık ve genel skor aynı satırda tutulur.
+    DO $monthly_migration$
+    BEGIN
+      IF to_regclass('public.player_monthly_scores') IS NOT NULL THEN
+        EXECUTE $monthly_sql$
+          UPDATE player_scores AS target
+          SET monthly_key = legacy.month_key,
+              monthly_general_score = legacy.general_score,
+              monthly_infinite_score = legacy.infinite_score,
+              monthly_updated_at = legacy.updated_at
+          FROM player_monthly_scores AS legacy
+          WHERE legacy.player_id = target.player_id
+            AND legacy.month_key = TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM')
+        $monthly_sql$;
+        EXECUTE 'DROP TABLE player_monthly_scores';
+      END IF;
+    END
+    $monthly_migration$;
 
     CREATE TABLE IF NOT EXISTS player_progress (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
@@ -475,13 +499,13 @@ async function initDatabase() {
       ON player_scores (infinite_score DESC, updated_at ASC, player_id ASC)
       WHERE infinite_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_general_v2
-      ON player_monthly_scores (month_key, general_score DESC, updated_at ASC, player_id ASC)
-      WHERE general_score > 0;
+    CREATE INDEX IF NOT EXISTS idx_player_scores_month_general_v3
+      ON player_scores (monthly_key, monthly_general_score DESC, monthly_updated_at ASC, player_id ASC)
+      WHERE monthly_general_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_infinite_v2
-      ON player_monthly_scores (month_key, infinite_score DESC, updated_at ASC, player_id ASC)
-      WHERE infinite_score > 0;
+    CREATE INDEX IF NOT EXISTS idx_player_scores_month_infinite_v3
+      ON player_scores (monthly_key, monthly_infinite_score DESC, monthly_updated_at ASC, player_id ASC)
+      WHERE monthly_infinite_score > 0;
 
     CREATE INDEX IF NOT EXISTS idx_players_country_player_v2
       ON players (country, player_id);
@@ -490,8 +514,6 @@ async function initDatabase() {
       ON players (LOWER(username));
   `);
 
-  await cleanupOldMonthlyLeaderboardScores();
-
   console.log("PostgreSQL leaderboard tabloları hazır.");
 }
 
@@ -499,24 +521,72 @@ function currentMonthKey() {
   return new Date().toISOString().slice(0, 7);
 }
 
-async function cleanupOldMonthlyLeaderboardScores() {
-  if (!pool) return 0;
-
-  const activeMonthKey = currentMonthKey();
-  const result = await pool.query(
-    `DELETE FROM player_monthly_scores
-     WHERE month_key < $1`,
-    [activeMonthKey]
+/**
+ * Genel ve mevcut-ay skorlarını tek player_scores UPDATE'i ile değiştirir.
+ * Ay değişmişse aylık sayaçlar önce sıfır kabul edilir; böylece ayrı aylık tablo
+ * ve günlük eski-ay temizleme işi gerekmez.
+ */
+async function applyLeaderboardScoreDeltaInTransaction(
+  client,
+  playerId,
+  generalDelta = 0,
+  infiniteDelta = 0
+) {
+  const monthKey = currentMonthKey();
+  return client.query(
+    `UPDATE player_scores
+     SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+         infinite_score = GREATEST(0, LEAST(infinite_score::bigint + $3::bigint, 2000000000))::integer,
+         monthly_general_score = CASE
+           WHEN monthly_key = $4 THEN
+             GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+           ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+         END,
+         monthly_infinite_score = CASE
+           WHEN monthly_key = $4 THEN
+             GREATEST(0, LEAST(monthly_infinite_score::bigint + $3::bigint, 2000000000))::integer
+           ELSE GREATEST(0, LEAST($3::bigint, 2000000000))::integer
+         END,
+         monthly_key = $4,
+         monthly_updated_at = NOW(),
+         updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, generalDelta, infiniteDelta, monthKey]
   );
+}
 
-  if (result.rowCount > 0) {
-    console.log("Eski aylık leaderboard kayıtları temizlendi:", {
-      activeMonthKey,
-      deletedRows: result.rowCount,
-    });
-  }
-
-  return result.rowCount;
+/**
+ * Sonsuz modda toplam sonsuz skor bir yüksek-skor değeridir; artış değildir.
+ * Genel puanı eklerken hem tüm-zamanlar hem mevcut-ay sonsuz yüksek skorunu
+ * tek player_scores UPDATE'i içinde GREATEST ile korur.
+ */
+async function applyLeaderboardGeneralDeltaAndInfiniteHighScoreInTransaction(
+  client,
+  playerId,
+  generalDelta,
+  infiniteHighScore
+) {
+  const monthKey = currentMonthKey();
+  return client.query(
+    `UPDATE player_scores
+     SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+         infinite_score = GREATEST(infinite_score, GREATEST(0, LEAST($3::bigint, 2000000000))::integer),
+         monthly_general_score = CASE
+           WHEN monthly_key = $4 THEN
+             GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+           ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+         END,
+         monthly_infinite_score = CASE
+           WHEN monthly_key = $4 THEN
+             GREATEST(monthly_infinite_score, GREATEST(0, LEAST($3::bigint, 2000000000))::integer)
+           ELSE GREATEST(0, LEAST($3::bigint, 2000000000))::integer
+         END,
+         monthly_key = $4,
+         monthly_updated_at = NOW(),
+         updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, generalDelta, infiniteHighScore, monthKey]
+  );
 }
 
 
@@ -923,12 +993,20 @@ async function mergeLegacyPlayerIntoStablePlayer(
          player_id,
          general_score,
          infinite_score,
+         monthly_key,
+         monthly_general_score,
+         monthly_infinite_score,
+         monthly_updated_at,
          updated_at
        )
      SELECT
        $2,
        general_score,
        infinite_score,
+       monthly_key,
+       monthly_general_score,
+       monthly_infinite_score,
+       monthly_updated_at,
        updated_at
      FROM player_scores
      WHERE player_id = $1
@@ -942,45 +1020,34 @@ async function mergeLegacyPlayerIntoStablePlayer(
          player_scores.infinite_score,
          EXCLUDED.infinite_score
        ),
+       monthly_key = CASE
+         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN player_scores.monthly_key
+         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_key
+         ELSE player_scores.monthly_key
+       END,
+       monthly_general_score = CASE
+         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN
+           GREATEST(player_scores.monthly_general_score, EXCLUDED.monthly_general_score)
+         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_general_score
+         ELSE player_scores.monthly_general_score
+       END,
+       monthly_infinite_score = CASE
+         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN
+           GREATEST(player_scores.monthly_infinite_score, EXCLUDED.monthly_infinite_score)
+         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_infinite_score
+         ELSE player_scores.monthly_infinite_score
+       END,
+       monthly_updated_at = CASE
+         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN
+           GREATEST(player_scores.monthly_updated_at, EXCLUDED.monthly_updated_at)
+         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_updated_at
+         ELSE player_scores.monthly_updated_at
+       END,
        updated_at = GREATEST(
          player_scores.updated_at,
          EXCLUDED.updated_at
        )`,
-    [legacyPlayerId, stablePlayerId]
-  );
-
-  await client.query(
-    `INSERT INTO player_monthly_scores
-       (
-         player_id,
-         month_key,
-         general_score,
-         infinite_score,
-         updated_at
-       )
-     SELECT
-       $2,
-       month_key,
-       general_score,
-       infinite_score,
-       updated_at
-     FROM player_monthly_scores
-     WHERE player_id = $1
-     ON CONFLICT (player_id, month_key)
-     DO UPDATE SET
-       general_score = GREATEST(
-         player_monthly_scores.general_score,
-         EXCLUDED.general_score
-       ),
-       infinite_score = GREATEST(
-         player_monthly_scores.infinite_score,
-         EXCLUDED.infinite_score
-       ),
-       updated_at = GREATEST(
-         player_monthly_scores.updated_at,
-         EXCLUDED.updated_at
-       )`,
-    [legacyPlayerId, stablePlayerId]
+    [legacyPlayerId, stablePlayerId, currentMonthKey()]
   );
 
   // Eski oyuncu silinince ona bağlı eski skor satırları
@@ -1676,26 +1743,7 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
   }
 
   if (generalDelta > 0) {
-    const monthKey = currentMonthKey();
-    await client.query(
-      `UPDATE player_scores
-       SET general_score = LEAST(general_score::bigint + $2::bigint, 2000000000)::integer,
-           updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, generalDelta]
-    );
-    await client.query(
-      `INSERT INTO player_monthly_scores
-         (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES ($1, $2, $3, 0, NOW())
-       ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = LEAST(
-           player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint,
-           2000000000
-         )::integer,
-         updated_at = NOW()`,
-      [playerId, monthKey, generalDelta]
-    );
+    await applyLeaderboardScoreDeltaInTransaction(client, playerId, generalDelta, 0);
   }
 
   await client.query(
@@ -1934,28 +1982,9 @@ async function readAuthoritativePlayerState(client, playerId) {
     : storedGameRightsAnchor + gameRightsRefillCount * GAME_RIGHT_REFILL_MS;
   const gameRightsChanged = gameRightsRemaining !== storedGameRights;
 
-  // Seviye puanı iki leaderboard tablosuna tek PostgreSQL çağrısında yazılır.
+  // Seviye puanı genel + mevcut-ay kolonlarına tek player_scores UPDATE'i ile yazılır.
   if (levelGeneralDelta > 0) {
-    const monthKey = currentMonthKey();
-    await client.query(
-      `WITH updated_score AS (
-         UPDATE player_scores
-         SET general_score = LEAST(general_score + $2, 2000000000),
-             updated_at = NOW()
-         WHERE player_id = $1
-         RETURNING player_id
-       )
-       INSERT INTO player_monthly_scores
-         (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES ($1, $3, $2, 0, NOW())
-       ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = LEAST(
-           player_monthly_scores.general_score + EXCLUDED.general_score,
-           2000000000
-         ),
-         updated_at = NOW()`,
-      [playerId, levelGeneralDelta, monthKey]
-    );
+    await applyLeaderboardScoreDeltaInTransaction(client, playerId, levelGeneralDelta, 0);
   }
 
   // Aynı player_progress satırına ait tüm bakım işlerini tek UPDATE'te birleştir.
@@ -2118,23 +2147,7 @@ async function applyTournamentOutcomeInTransaction(client, playerId, won, reques
   );
 
   if (awardedScore > 0) {
-    const monthKey = currentMonthKey();
-    await client.query(
-      `UPDATE player_scores SET
-         general_score = LEAST(general_score + $2, 2000000000),
-         updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, awardedScore]
-    );
-    await client.query(
-      `INSERT INTO player_monthly_scores
-       (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES ($1, $2, $3, 0, NOW())
-       ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
-         updated_at = NOW()`,
-      [playerId, monthKey, awardedScore]
-    );
+    await applyLeaderboardScoreDeltaInTransaction(client, playerId, awardedScore, 0);
   }
 
   const state = await readAuthoritativePlayerState(client, playerId);
@@ -2177,22 +2190,7 @@ async function addPositiveGeneralAndXpInTransaction(client, playerId, generalDel
   const safeGeneral = Math.max(0, Math.min(Number(generalDelta || 0), 2_000_000_000));
   const safeXp = Math.max(0, Math.min(Number(xpDelta || 0), 2_000_000_000));
   if (safeGeneral > 0) {
-    const monthKey = currentMonthKey();
-    await client.query(
-      `UPDATE player_scores SET
-         general_score = LEAST(general_score + $2, 2000000000), updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, safeGeneral]
-    );
-    await client.query(
-      `INSERT INTO player_monthly_scores
-       (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES ($1, $2, $3, 0, NOW())
-       ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
-         updated_at = NOW()`,
-      [playerId, monthKey, safeGeneral]
-    );
+    await applyLeaderboardScoreDeltaInTransaction(client, playerId, safeGeneral, 0);
   }
   if (safeXp > 0) {
     await client.query(
@@ -2562,20 +2560,7 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
     };
   } else {
     const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
-    const monthKey = currentMonthKey();
-    await client.query(
-      `UPDATE player_scores SET general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)),
-         updated_at = NOW() WHERE player_id = $1`,
-      [playerId, rewards.generalDelta]
-    );
-    await client.query(
-      `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES ($1, $2, GREATEST($3, 0), 0, NOW())
-       ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = GREATEST(0, LEAST(player_monthly_scores.general_score + $3, 2000000000)),
-         updated_at = NOW()`,
-      [playerId, monthKey, rewards.generalDelta]
-    );
+    await applyLeaderboardScoreDeltaInTransaction(client, playerId, rewards.generalDelta, 0);
     const state = await readAuthoritativePlayerState(client, playerId);
     response = {
       ok: true,
@@ -2898,26 +2883,27 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
 
   // Puan ve XP misafir hesabında da yalnızca sunucunun doğruladığı oyun sonuçlarıyla oluşur.
   // Bu nedenle iki ayrık geçmişi toplamak güvenlidir; Int üst sınırında kırpılır.
+  const migrationMonthKey = currentMonthKey();
   await client.query(
     `UPDATE player_scores AS target
      SET general_score = LEAST(target.general_score::bigint + guest.general_score::bigint, 2000000000)::integer,
          infinite_score = LEAST(target.infinite_score::bigint + guest.infinite_score::bigint, 2000000000)::integer,
+         monthly_general_score = LEAST(
+           (CASE WHEN target.monthly_key = $3 THEN target.monthly_general_score ELSE 0 END)::bigint +
+           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_general_score ELSE 0 END)::bigint,
+           2000000000
+         )::integer,
+         monthly_infinite_score = LEAST(
+           (CASE WHEN target.monthly_key = $3 THEN target.monthly_infinite_score ELSE 0 END)::bigint +
+           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_infinite_score ELSE 0 END)::bigint,
+           2000000000
+         )::integer,
+         monthly_key = $3,
+         monthly_updated_at = NOW(),
          updated_at = NOW()
      FROM player_scores AS guest
      WHERE target.player_id = $2 AND guest.player_id = $1`,
-    [guestId, playGamesPlayerId]
-  );
-
-  await client.query(
-    `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
-     SELECT $2, month_key, general_score, infinite_score, NOW()
-     FROM player_monthly_scores
-     WHERE player_id = $1
-     ON CONFLICT (player_id, month_key) DO UPDATE SET
-       general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
-       infinite_score = LEAST(player_monthly_scores.infinite_score::bigint + EXCLUDED.infinite_score::bigint, 2000000000)::integer,
-       updated_at = NOW()`,
-    [guestId, playGamesPlayerId]
+    [guestId, playGamesPlayerId, migrationMonthKey]
   );
 
   // Günlük 100 kişilik hakları iki hesap için de bugüne normalize et; böylece eski günün
@@ -3000,23 +2986,11 @@ async function applyAuthoritativeScoreDelta(playerId, generalDelta, infiniteDelt
   try {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, playerId);
-    const monthKey = currentMonthKey();
-    await client.query(
-      `UPDATE player_scores SET
-         general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)),
-         infinite_score = GREATEST(0, LEAST(infinite_score + $3, 2000000000)),
-         updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, generalDelta, infiniteDelta]
-    );
-    await client.query(
-      `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
-       VALUES ($1, $2, GREATEST($3, 0), GREATEST($4, 0), NOW())
-       ON CONFLICT (player_id, month_key) DO UPDATE SET
-         general_score = GREATEST(0, LEAST(player_monthly_scores.general_score + $3, 2000000000)),
-         infinite_score = GREATEST(0, LEAST(player_monthly_scores.infinite_score + $4, 2000000000)),
-         updated_at = NOW()`,
-      [playerId, monthKey, generalDelta, infiniteDelta]
+    await applyLeaderboardScoreDeltaInTransaction(
+      client,
+      playerId,
+      generalDelta,
+      infiniteDelta
     );
     await client.query(
       `UPDATE player_progress SET
@@ -3890,7 +3864,6 @@ app.post("/game/challenges/complete", requireAuth, requireGameplayLease, async (
       return;
     }
 
-    const monthKey = currentMonthKey();
     await ensureAuthenticatedPlayer(client, req.auth.sub);
 
     let infiniteRunScore = 0;
@@ -3906,38 +3879,18 @@ app.post("/game/challenges/complete", requireAuth, requireGameplayLease, async (
         [req.auth.sub, rewards.xpDelta, rewards.infiniteDelta, Number(challenge.stage)]
       );
       infiniteRunScore = Number(progressUpdate.rows[0]?.infinite_run_score || 0);
-      await client.query(
-        `UPDATE player_scores
-         SET general_score = LEAST(general_score + $2, 2000000000),
-             infinite_score = GREATEST(infinite_score, $3),
-             updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.generalDelta, infiniteRunScore]
-      );
-      await client.query(
-        `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
-         VALUES ($1, $2, $3, $4, NOW())
-         ON CONFLICT (player_id, month_key) DO UPDATE SET
-           general_score = LEAST(player_monthly_scores.general_score::bigint + EXCLUDED.general_score::bigint, 2000000000)::integer,
-           infinite_score = GREATEST(player_monthly_scores.infinite_score, EXCLUDED.infinite_score),
-           updated_at = NOW()`,
-        [req.auth.sub, monthKey, rewards.generalDelta, infiniteRunScore]
+      await applyLeaderboardGeneralDeltaAndInfiniteHighScoreInTransaction(
+        client,
+        req.auth.sub,
+        rewards.generalDelta,
+        infiniteRunScore
       );
     } else {
-      await client.query(
-        `UPDATE player_scores
-         SET general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)),
-             updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.generalDelta]
-      );
-      await client.query(
-        `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
-         VALUES ($1, $2, GREATEST($3, 0), 0, NOW())
-         ON CONFLICT (player_id, month_key) DO UPDATE SET
-           general_score = GREATEST(0, LEAST(player_monthly_scores.general_score + $3, 2000000000)),
-           updated_at = NOW()`,
-        [req.auth.sub, monthKey, rewards.generalDelta]
+      await applyLeaderboardScoreDeltaInTransaction(
+        client,
+        req.auth.sub,
+        rewards.generalDelta,
+        0
       );
       await client.query(
         `UPDATE player_progress
@@ -4053,21 +4006,11 @@ app.post("/game/bot/resolve", requireAuth, requireGameplayLease, async (req, res
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, outcome.won === true, challenge.wager_points);
       await ensureAuthenticatedPlayer(client, req.auth.sub);
-      const monthKey = currentMonthKey();
-      await client.query(
-        `UPDATE player_scores
-         SET general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)),
-             updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.generalDelta]
-      );
-      await client.query(
-        `INSERT INTO player_monthly_scores (player_id, month_key, general_score, infinite_score, updated_at)
-         VALUES ($1, $2, GREATEST($3, 0), 0, NOW())
-         ON CONFLICT (player_id, month_key) DO UPDATE SET
-           general_score = GREATEST(0, LEAST(player_monthly_scores.general_score + $3, 2000000000)),
-           updated_at = NOW()`,
-        [req.auth.sub, monthKey, rewards.generalDelta]
+      await applyLeaderboardScoreDeltaInTransaction(
+        client,
+        req.auth.sub,
+        rewards.generalDelta,
+        0
       );
       await client.query(
         `UPDATE player_progress
@@ -4156,21 +4099,11 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
       await ensureAuthenticatedPlayer(client, req.auth.sub);
-      const monthKey = currentMonthKey();
-      await client.query(
-        `UPDATE player_scores SET
-           general_score = GREATEST(0, LEAST(general_score + $2, 2000000000)), updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.generalDelta]
-      );
-      await client.query(
-        `INSERT INTO player_monthly_scores
-         (player_id, month_key, general_score, infinite_score, updated_at)
-         VALUES ($1, $2, GREATEST($3, 0), 0, NOW())
-         ON CONFLICT (player_id, month_key) DO UPDATE SET
-           general_score = GREATEST(0, LEAST(player_monthly_scores.general_score + $3, 2000000000)),
-           updated_at = NOW()`,
-        [req.auth.sub, monthKey, rewards.generalDelta]
+      await applyLeaderboardScoreDeltaInTransaction(
+        client,
+        req.auth.sub,
+        rewards.generalDelta,
+        0
       );
       const state = await readAuthoritativePlayerState(client, req.auth.sub);
       response = {
@@ -4438,14 +4371,16 @@ function leaderboardServerCacheKey({ scoreType, period, scope, country, monthKey
 }
 
 async function queryLeaderboardTopRows({ scoreType, period, scope, country, monthKey }) {
-  const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
-  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
+  const scoreColumn = period === "month"
+    ? (scoreType === "infinite" ? "monthly_infinite_score" : "monthly_general_score")
+    : (scoreType === "infinite" ? "infinite_score" : "general_score");
+  const updatedAtColumn = period === "month" ? "monthly_updated_at" : "updated_at";
   const values = [];
   const conditions = [`s.${scoreColumn} > 0`];
 
   if (period === "month") {
     values.push(monthKey);
-    conditions.push(`s.month_key = $${values.length}`);
+    conditions.push(`s.monthly_key = $${values.length}`);
   }
 
   if (scope === "country") {
@@ -4458,12 +4393,12 @@ async function queryLeaderboardTopRows({ scoreType, period, scope, country, mont
        p.username,
        p.country,
        s.${scoreColumn} AS score
-     FROM ${tableName} s
+     FROM player_scores s
      JOIN players p ON p.player_id = s.player_id
      WHERE ${conditions.join(" AND ")}
      ORDER BY
        s.${scoreColumn} DESC,
-       s.updated_at ASC,
+       s.${updatedAtColumn} ASC,
        s.player_id ASC
      LIMIT 50`,
     values
@@ -7060,16 +6995,6 @@ setInterval(() => {
   cleanupLeaderboardResponseCache();
 }, LEADERBOARD_SERVER_CACHE_CLEANUP_INTERVAL_MS).unref();
 
-// Aylık tablo ayda bir eskir; saatlik tam tablo kontrolü gereksiz DB yükü oluşturur.
-// Başlangıçta initDatabase() zaten bir kez temizler, sonrasında günlük kontrol yeterlidir.
-setInterval(() => {
-  cleanupOldMonthlyLeaderboardScores().catch((error) => {
-    console.error("Eski aylık leaderboard temizleme hatası:", {
-      message: error.message,
-      code: error.code,
-    });
-  });
-}, 24 * 60 * 60_000).unref();
 
 const PORT = Number(
   process.env.PORT || 10000
