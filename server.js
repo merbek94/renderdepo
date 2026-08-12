@@ -7,16 +7,18 @@ const { Pool } = require("pg");
 
 const app = express();
 
-app.use((req, res, next) => {
-  console.log(
-    "HTTP request:",
-    req.method,
-    req.url,
-    "ua:",
-    req.headers["user-agent"] || "-"
-  );
-  next();
-});
+if (process.env.ENABLE_HTTP_REQUEST_LOGS === "true") {
+  app.use((req, res, next) => {
+    console.log(
+      "HTTP request:",
+      req.method,
+      req.url,
+      "ua:",
+      req.headers["user-agent"] || "-"
+    );
+    next();
+  });
+}
 
 app.use(express.json({ limit: "64kb" }));
 
@@ -458,20 +460,31 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_general
-      ON player_scores (general_score DESC);
+    -- Eski leaderboard indeksleri yeni sıralama kriterlerini tam karşılamıyordu.
+    DROP INDEX IF EXISTS idx_player_scores_general;
+    DROP INDEX IF EXISTS idx_player_scores_infinite;
+    DROP INDEX IF EXISTS idx_monthly_scores_month_general;
+    DROP INDEX IF EXISTS idx_monthly_scores_month_infinite;
+    DROP INDEX IF EXISTS idx_players_country;
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite
-      ON player_scores (infinite_score DESC);
+    CREATE INDEX IF NOT EXISTS idx_player_scores_general_v2
+      ON player_scores (general_score DESC, updated_at ASC, player_id ASC)
+      WHERE general_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_general
-      ON player_monthly_scores (month_key, general_score DESC);
+    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite_v2
+      ON player_scores (infinite_score DESC, updated_at ASC, player_id ASC)
+      WHERE infinite_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_infinite
-      ON player_monthly_scores (month_key, infinite_score DESC);
+    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_general_v2
+      ON player_monthly_scores (month_key, general_score DESC, updated_at ASC, player_id ASC)
+      WHERE general_score > 0;
 
-    CREATE INDEX IF NOT EXISTS idx_players_country
-      ON players (country);
+    CREATE INDEX IF NOT EXISTS idx_monthly_scores_month_infinite_v2
+      ON player_monthly_scores (month_key, infinite_score DESC, updated_at ASC, player_id ASC)
+      WHERE infinite_score > 0;
+
+    CREATE INDEX IF NOT EXISTS idx_players_country_player_v2
+      ON players (country, player_id);
 
     CREATE INDEX IF NOT EXISTS idx_players_username_lower
       ON players (LOWER(username));
@@ -4191,162 +4204,111 @@ app.post(
   }
 );
 
+const LEADERBOARD_SERVER_CACHE_TTL_MS = Math.max(
+  10_000,
+  Math.min(5 * 60_000, Number(process.env.LEADERBOARD_CACHE_TTL_MS || 60_000) || 60_000)
+);
+const leaderboardResponseCache = new Map();
+const leaderboardRequestsInFlight = new Map();
+
+function leaderboardServerCacheKey({ scoreType, period, scope, country, monthKey }) {
+  return [
+    scoreType,
+    period,
+    scope,
+    scope === "country" ? country : "*",
+    period === "month" ? monthKey : "*",
+  ].join("|");
+}
+
+async function queryLeaderboardTopRows({ scoreType, period, scope, country, monthKey }) {
+  const scoreColumn = scoreType === "infinite" ? "infinite_score" : "general_score";
+  const tableName = period === "month" ? "player_monthly_scores" : "player_scores";
+  const values = [];
+  const conditions = [`s.${scoreColumn} > 0`];
+
+  if (period === "month") {
+    values.push(monthKey);
+    conditions.push(`s.month_key = $${values.length}`);
+  }
+
+  if (scope === "country") {
+    values.push(country);
+    conditions.push(`p.country = $${values.length}`);
+  }
+
+  const result = await pool.query(
+    `SELECT
+       p.username,
+       p.country,
+       s.${scoreColumn} AS score
+     FROM ${tableName} s
+     JOIN players p ON p.player_id = s.player_id
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY
+       s.${scoreColumn} DESC,
+       s.updated_at ASC,
+       s.player_id ASC
+     LIMIT 50`,
+    values
+  );
+
+  // Sorgu zaten yalnızca ilk 50 satırı döndürdüğü için pahalı ROW_NUMBER() gerekmez.
+  return result.rows.map((row, index) => ({
+    rank: index + 1,
+    username: row.username,
+    country: row.country,
+    score: Number(row.score),
+  }));
+}
+
+async function loadLeaderboardRowsCached(args) {
+  const key = leaderboardServerCacheKey(args);
+  const now = Date.now();
+  const cached = leaderboardResponseCache.get(key);
+  if (cached && now - cached.createdAtMillis < LEADERBOARD_SERVER_CACHE_TTL_MS) {
+    return cached.rows;
+  }
+
+  // Aynı cache boşluğunda yüzlerce eşzamanlı istek gelirse yalnızca bir DB sorgusu çalışsın.
+  const existingRequest = leaderboardRequestsInFlight.get(key);
+  if (existingRequest) return existingRequest;
+
+  const request = queryLeaderboardTopRows(args)
+    .then((rows) => {
+      leaderboardResponseCache.set(key, {
+        createdAtMillis: Date.now(),
+        rows,
+      });
+      return rows;
+    })
+    .finally(() => {
+      if (leaderboardRequestsInFlight.get(key) === request) {
+        leaderboardRequestsInFlight.delete(key);
+      }
+    });
+
+  leaderboardRequestsInFlight.set(key, request);
+  return request;
+}
+
 app.get("/leaderboard", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
 
-  const scoreType =
-    req.query.scoreType === "infinite"
-      ? "infinite"
-      : "general";
-
-  const period =
-    req.query.period === "month"
-      ? "month"
-      : "all";
-
-  const scope =
-    req.query.scope === "country"
-      ? "country"
-      : "world";
-
+  const scoreType = req.query.scoreType === "infinite" ? "infinite" : "general";
+  const period = req.query.period === "month" ? "month" : "all";
+  const scope = req.query.scope === "country" ? "country" : "world";
   const country = safeCountry(req.query.country);
-
-  const playerId = req.auth.sub;
-
   const monthKey = currentMonthKey();
 
-  const scoreColumn =
-    scoreType === "infinite"
-      ? "infinite_score"
-      : "general_score";
-
-  const tableName =
-    period === "month"
-      ? "player_monthly_scores"
-      : "player_scores";
-
-  function buildWhere(includeCountry) {
-    const values = [];
-
-    const conditions = [
-      `s.${scoreColumn} > 0`,
-    ];
-
-    if (period === "month") {
-      values.push(monthKey);
-
-      conditions.push(
-        `s.month_key = $${values.length}`
-      );
-    }
-
-    if (includeCountry) {
-      values.push(country);
-
-      conditions.push(
-        `p.country = $${values.length}`
-      );
-    }
-
-    return {
-      values,
-      whereSql: conditions.join(" AND "),
-    };
-  }
-
-  async function getMyRank(includeCountry) {
-    if (!playerId) return null;
-
-    const built = buildWhere(includeCountry);
-
-    const values = [
-      ...built.values,
-      playerId,
-    ];
-
-    const playerParamIndex = values.length;
-
-    const sql = `
-      WITH ranked AS (
-        SELECT
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY
-              s.${scoreColumn} DESC,
-              s.updated_at ASC,
-              p.username ASC
-          ) AS position
-        FROM ${tableName} s
-        JOIN players p
-          ON p.player_id = s.player_id
-        WHERE ${built.whereSql}
-      )
-      SELECT
-        position,
-        score
-      FROM ranked
-      WHERE player_id = $${playerParamIndex}
-      LIMIT 1
-    `;
-
-    const result = await pool.query(
-      sql,
-      values
-    );
-
-    const row = result.rows[0];
-
-    if (!row) return null;
-
-    return {
-      rank: Number(row.position),
-      score: Number(row.score),
-    };
-  }
-
   try {
-    const listBuilt = buildWhere(
-      scope === "country"
-    );
-
-    const listSql = `
-      WITH ranked AS (
-        SELECT
-          p.player_id,
-          p.username,
-          p.country,
-          s.${scoreColumn} AS score,
-          ROW_NUMBER() OVER (
-            ORDER BY
-              s.${scoreColumn} DESC,
-              s.updated_at ASC,
-              p.username ASC
-          ) AS position
-        FROM ${tableName} s
-        JOIN players p
-          ON p.player_id = s.player_id
-        WHERE ${listBuilt.whereSql}
-      )
-      SELECT
-        position,
-        username,
-        country,
-        score
-      FROM ranked
-      ORDER BY position ASC
-      LIMIT 50
-    `;
-
-    const listResult = await pool.query(
-      listSql,
-      listBuilt.values
-    );
-
-    const myWorld = await getMyRank(false);
-    const myCountry = await getMyRank(true);
+    const rows = await loadLeaderboardRowsCached({
+      scoreType,
+      period,
+      scope,
+      country,
+      monthKey,
+    });
 
     res.json({
       ok: true,
@@ -4355,21 +4317,7 @@ app.get("/leaderboard", requireAuth, async (req, res) => {
       scope,
       country,
       monthKey,
-      myWorldRank: myWorld
-        ? myWorld.rank
-        : null,
-      myCountryRank: myCountry
-        ? myCountry.rank
-        : null,
-      myScore: myWorld
-        ? myWorld.score
-        : 0,
-      rows: listResult.rows.map((row) => ({
-        rank: Number(row.position),
-        username: row.username,
-        country: row.country,
-        score: Number(row.score),
-      })),
+      rows,
     });
   } catch (error) {
     console.error("leaderboard get error:", {
