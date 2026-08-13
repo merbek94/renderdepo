@@ -33,9 +33,25 @@ const PLAY_GAMES_APP_ID = process.env.PLAY_GAMES_APP_ID || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 24 * 60 * 60);
 const GAMEPLAY_LEASE_TTL_SECONDS = Math.max(
-  45,
-  Math.min(300, Number(process.env.GAMEPLAY_LEASE_TTL_SECONDS || 75) || 75)
+  120,
+  Math.min(600, Number(process.env.GAMEPLAY_LEASE_TTL_SECONDS || 180) || 180)
 );
+const GAMEPLAY_HEARTBEAT_INTERVAL_MS = Math.max(
+  30_000,
+  Math.min(120_000, Number(process.env.GAMEPLAY_HEARTBEAT_INTERVAL_MS || 60_000) || 60_000)
+);
+const DATA_RETENTION_CLEANUP_INTERVAL_MS = Math.max(
+  60 * 60 * 1000,
+  Number(process.env.DATA_RETENTION_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000) || 6 * 60 * 60 * 1000
+);
+const CHALLENGE_RETENTION_HOURS = Math.max(24, Number(process.env.CHALLENGE_RETENTION_HOURS || 48) || 48);
+const TASK_EVENT_RETENTION_DAYS = Math.max(90, Number(process.env.TASK_EVENT_RETENTION_DAYS || 400) || 400);
+const TASK_CLAIM_RETENTION_DAYS = Math.max(120, Number(process.env.TASK_CLAIM_RETENTION_DAYS || 400) || 400);
+const ENABLE_SOCKET_LOGS = process.env.ENABLE_SOCKET_LOGS === "true";
+
+function socketLog(...args) {
+  if (ENABLE_SOCKET_LOGS) console.log(...args);
+}
 
 function assertSecurityEnvironment() {
   const missing = [];
@@ -226,6 +242,11 @@ async function initDatabase() {
   }
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_schema_migrations (
+      migration_key TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS players (
       player_id TEXT PRIMARY KEY,
       username TEXT NOT NULL,
@@ -260,8 +281,9 @@ async function initDatabase() {
     ALTER TABLE player_game_sessions
       ALTER COLUMN protocol_version SET DEFAULT 2;
 
-    CREATE INDEX IF NOT EXISTS idx_player_game_sessions_expires_at
-      ON player_game_sessions (expires_at);
+    -- expires_at her heartbeat'te değiştiği için bu indeks write amplification oluşturuyordu.
+    -- Lease doğrulamaları player_id PRIMARY KEY + lease_id ile yapıldığından indeks gerekli değil.
+    DROP INDEX IF EXISTS idx_player_game_sessions_expires_at;
 
     CREATE TABLE IF NOT EXISTS player_scores (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
@@ -312,7 +334,7 @@ async function initDatabase() {
       tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3),
       tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
       tournament_completed BOOLEAN NOT NULL DEFAULT FALSE,
-      tournament_tickets INTEGER NOT NULL DEFAULT 0 CHECK (tournament_tickets >= 0),
+      tournament_tickets INTEGER NOT NULL DEFAULT 0 CHECK (tournament_tickets BETWEEN 0 AND 9999),
       tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE,
       hundred_active BOOLEAN NOT NULL DEFAULT FALSE,
       hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12),
@@ -354,35 +376,32 @@ async function initDatabase() {
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE;
 
-    -- Deploy öncesinde gerçekten başlamış/eski bir turnuva serisi varsa, yeni bilet sistemi
-    -- devreye girerken o seriyi yarıda kesme. Boş durumdaki kullanıcılar yeni seri için 5 bilet öder.
-    UPDATE player_progress
-      SET tournament_entry_active = TRUE
-      WHERE tournament_entry_active = FALSE
-        AND tournament_completed = FALSE
-        AND (tournament_stage > 1 OR tournament_bank > 0 OR tournament_rights < 3);
-
-    UPDATE player_progress
-      SET tournament_entry_active = FALSE
-      WHERE tournament_completed = TRUE;
-
-    UPDATE player_progress
-      SET tournament_tickets = LEAST(GREATEST(tournament_tickets, 0), 9999);
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_tournament_tickets_check_v1;
-    ALTER TABLE player_progress
-      ADD CONSTRAINT player_progress_tournament_tickets_check_v1
-      CHECK (tournament_tickets BETWEEN 0 AND 9999);
-
-    UPDATE player_progress
-      SET tournament_stage = LEAST(GREATEST(tournament_stage, 1), 8);
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check;
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check_v2;
-    ALTER TABLE player_progress
-      ADD CONSTRAINT player_progress_tournament_stage_check_v2
-      CHECK (tournament_stage BETWEEN 1 AND 8);
+    -- Eski sürüm verisini dönüştüren pahalı bakım yalnızca bir kez çalışır.
+    DO $progress_migration$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM app_schema_migrations
+        WHERE migration_key = 'progress_tournament_v3'
+      ) THEN
+        UPDATE player_progress
+          SET tournament_entry_active = TRUE
+          WHERE tournament_entry_active = FALSE
+            AND tournament_completed = FALSE
+            AND (tournament_stage > 1 OR tournament_bank > 0 OR tournament_rights < 3);
+        UPDATE player_progress
+          SET tournament_entry_active = FALSE
+          WHERE tournament_completed = TRUE;
+        UPDATE player_progress
+          SET tournament_tickets = LEAST(GREATEST(tournament_tickets, 0), 9999)
+          WHERE tournament_tickets < 0 OR tournament_tickets > 9999;
+        UPDATE player_progress
+          SET tournament_stage = LEAST(GREATEST(tournament_stage, 1), 8)
+          WHERE tournament_stage < 1 OR tournament_stage > 8;
+        INSERT INTO app_schema_migrations (migration_key) VALUES ('progress_tournament_v3')
+          ON CONFLICT (migration_key) DO NOTHING;
+      END IF;
+    END
+    $progress_migration$;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS hundred_active BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_progress
@@ -395,13 +414,20 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS hundred_daily_ad_used BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0;
-    UPDATE player_progress
-      SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 1);
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-    ALTER TABLE player_progress
-      ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v1
-      CHECK (hundred_rewarded_rights BETWEEN 0 AND 1);
+    DO $hundred_rights_migration$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM app_schema_migrations
+        WHERE migration_key = 'hundred_rewarded_rights_v2'
+      ) THEN
+        UPDATE player_progress
+          SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 1)
+          WHERE hundred_rewarded_rights < 0 OR hundred_rewarded_rights > 1;
+        INSERT INTO app_schema_migrations (migration_key) VALUES ('hundred_rewarded_rights_v2')
+          ON CONFLICT (migration_key) DO NOTHING;
+      END IF;
+    END
+    $hundred_rights_migration$;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS game_rights INTEGER NOT NULL DEFAULT 10;
     ALTER TABLE player_progress
@@ -483,6 +509,14 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
+
+    -- Retention temizliği için çok küçük BRIN indeksleri; B-tree kadar write amplification oluşturmaz.
+    CREATE INDEX IF NOT EXISTS idx_task_events_occurred_brin
+      ON player_task_events USING BRIN (occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_task_claims_claimed_brin
+      ON player_task_claims USING BRIN (claimed_at);
+    CREATE INDEX IF NOT EXISTS idx_secure_challenges_created_brin
+      ON secure_game_challenges USING BRIN (created_at);
 
     -- Leaderboard eşitlik sırası artık ortak updated_at alanlarına bağlı değildir.
     -- Böylece bir skor türündeki hareket, başka bir skor tablosundaki eşitlik sırasını
@@ -809,7 +843,12 @@ async function claimTaskRewardInTransaction(client, playerId, periodType, taskCo
         [playerId, rewardDiamonds]
       );
     }
+    // Aynı transaction içinde Task Center'ı ikinci kez SELECT etmemek için
+    // az önce hesaplanan state'i bellekte claimed olarak işaretle.
+    if (isMaster) periodState.masterClaimed = true;
+    else if (task) task.claimed = true;
   }
+  return taskCenter;
 }
 
 function timestampMillis(value) {
@@ -2667,17 +2706,16 @@ async function requireGameplayLease(req, res, next) {
   }
 
   try {
-    // Geçerli bir oyun isteği de heartbeat sayılır. Böylece kısa ağ gecikmelerinde
-    // aktif oyunun kilidi gereksiz yere düşmez.
+    // Normal oyun API çağrısı artık PostgreSQL'e heartbeat UPDATE'i yazmaz.
+    // Düzenli /game-session/heartbeat çağrısı TTL'yi yeniler; oyun istekleri yalnızca doğrular.
     const result = await pool.query(
-      `UPDATE player_game_sessions
-       SET heartbeat_at = NOW(),
-           expires_at = NOW() + ($3 * INTERVAL '1 second')
+      `SELECT lease_id, device_id, game_key, expires_at
+       FROM player_game_sessions
        WHERE player_id = $1
          AND lease_id = $2
          AND expires_at > NOW()
-       RETURNING lease_id, device_id, game_key, expires_at`,
-      [req.auth.sub, leaseId, GAMEPLAY_LEASE_TTL_SECONDS]
+       LIMIT 1`,
+      [req.auth.sub, leaseId]
     );
     if (result.rowCount === 0) {
       res.status(409).json({
@@ -2714,14 +2752,13 @@ async function socketHasActiveGameplayLease(socket, playerId, errorEvent = "matc
   }
   try {
     const result = await pool.query(
-      `UPDATE player_game_sessions
-       SET heartbeat_at = NOW(),
-           expires_at = NOW() + ($3 * INTERVAL '1 second')
+      `SELECT lease_id
+       FROM player_game_sessions
        WHERE player_id = $1
          AND lease_id = $2
          AND expires_at > NOW()
-       RETURNING lease_id`,
-      [playerId, leaseId, GAMEPLAY_LEASE_TTL_SECONDS]
+       LIMIT 1`,
+      [playerId, leaseId]
     );
     if (result.rowCount === 0) {
       socket.emit(errorEvent, {
@@ -3254,7 +3291,7 @@ app.post("/game-session/acquire", requireAuth, async (req, res) => {
       leaseId: lease.lease_id,
       gameKey: lease.game_key,
       expiresAtMillis: new Date(lease.expires_at).getTime(),
-      heartbeatIntervalMillis: 20_000,
+      heartbeatIntervalMillis: GAMEPLAY_HEARTBEAT_INTERVAL_MS,
       protocolVersion: Number(lease.protocol_version || 2),
     });
   } catch (error) {
@@ -4207,8 +4244,7 @@ app.post("/tasks/claim", requireAuth, async (req, res) => {
   try {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, req.auth.sub);
-    await claimTaskRewardInTransaction(client, req.auth.sub, periodType, taskCode);
-    const taskCenter = await readTaskCenterState(client, req.auth.sub);
+    const taskCenter = await claimTaskRewardInTransaction(client, req.auth.sub, periodType, taskCode);
     const state = await readAuthoritativePlayerState(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({ ok: true, taskCenter, ...state });
@@ -4516,7 +4552,7 @@ const io = new Server(server, {
   pingTimeout: 20_000,
 
   allowRequest: (req, callback) => {
-    console.log(
+    socketLog(
       "Socket.IO handshake request:",
       req.url,
       "origin:",
@@ -4532,7 +4568,6 @@ const activeRooms = new Map();
 const realtimeRooms = new Map();
 const privateRooms = new Map();
 const publicOpenTables = new Map();
-const generatedLobbyBots = new Map();
 
 const TWO_PLAYER_ROOM_GROUPS = [
   { id: "acemi", title: "Acemi Masaları", subtitle: "10 - 100", minScore: 10, maxScore: 100 },
@@ -4606,11 +4641,17 @@ function generatedRoomRoundCount(groupIndex, currentMultiRoomCount, targetCount)
   return currentMultiRoomCount < desiredMultiRoomCount ? secureRandomInt(2, 4) : 1;
 }
 
-function expireGeneratedLobbyBots() {
-  const now = Date.now();
-  for (const [listingId, bot] of generatedLobbyBots.entries()) {
-    if (now - Number(bot.createdAt || 0) > 3 * 60 * 1000) generatedLobbyBots.delete(listingId);
-  }
+function parseStatelessLobbyBotListing(listingId, difficulty) {
+  const match = /^bot:([a-z0-9_-]{1,24}):(\d{1,10}):([1-3])(?::[a-z0-9_-]{1,24})?$/i.exec(String(listingId || ""));
+  if (!match) return null;
+  const group = TWO_PLAYER_ROOM_GROUPS.find((item) => item.id === match[1]);
+  if (!group) return null;
+  const stakePoints = Math.max(0, Math.min(Number(match[2] || 0), 2_000_000_000));
+  const roundCount = normalizeRoundCount(Number(match[3] || 1));
+  const minimum = Math.max(group.minScore, minimumTwoPlayerStake(difficulty));
+  if (stakePoints < minimum) return null;
+  if (group.maxScore != null && stakePoints > group.maxScore) return null;
+  return { group, difficulty: secureDifficulty(difficulty), stakePoints, roundCount };
 }
 
 function randomStakeForGroup(group, difficulty) {
@@ -4990,7 +5031,7 @@ async function resolveRoomByGameDeadline(roomId) {
     console.error("realtime game deadline reward error:", error);
   }
 
-  console.log("Realtime match deadline reached:", roomId, room.gameKey);
+  socketLog("Realtime match deadline reached:", roomId, room.gameKey);
 }
 
 function resolveRoomByAwayTimeout(
@@ -5065,7 +5106,7 @@ function resolveRoomByAwayTimeout(
     );
   }
 
-  console.log(
+  socketLog(
     "Reconnect timeout loss:",
     roomId,
     loserPlayerId
@@ -5745,39 +5786,26 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", async (req, res) => {
-  if (!pool) {
-    res.json({
-      ok: true,
-      database: false,
-    });
+// Render health check bu endpoint'i sık çağırabilir; PostgreSQL'e dokunmadan
+// yalnızca Node prosesinin ayakta olduğunu bildirir.
+app.get("/health", (req, res) => {
+  res.json({ ok: true, databaseConfigured: Boolean(pool) });
+});
 
+// Veritabanını gerçekten sınamak gerektiğinde ayrı endpoint kullanılır.
+app.get("/health/db", async (req, res) => {
+  if (!pool) {
+    res.status(503).json({ ok: false, database: false });
     return;
   }
-
   try {
     await pool.query("SELECT 1");
-
-    res.json({
-      ok: true,
-      database: true,
-    });
+    res.json({ ok: true, database: true });
   } catch (error) {
-    console.error(
-      "health database error:",
-      {
-        message: error.message,
-        code: error.code,
-        detail: error.detail,
-      }
-    );
-
-    res.status(500).json({
-      ok: false,
-      database: false,
-      message:
-        "Database bağlantısı başarısız.",
+    console.error("health database error:", {
+      message: error.message, code: error.code, detail: error.detail,
     });
+    res.status(500).json({ ok: false, database: false, message: "Database bağlantısı başarısız." });
   }
 });
 
@@ -5802,7 +5830,7 @@ app.get(
 io.engine.on(
   "connection_error",
   (err) => {
-    console.log(
+    socketLog(
       "Engine.IO connection_error:",
       {
         code: err.code,
@@ -5829,7 +5857,7 @@ io.engine.on(
 io.engine.on(
   "connection",
   (rawSocket) => {
-    console.log(
+    socketLog(
       "Engine.IO connected:",
       rawSocket.id,
       "transport:",
@@ -5884,14 +5912,13 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, session.sub);
     const leaseResult = await client.query(
-      `UPDATE player_game_sessions
-       SET heartbeat_at = NOW(),
-           expires_at = NOW() + ($3 * INTERVAL '1 second')
+      `SELECT lease_id
+       FROM player_game_sessions
        WHERE player_id = $1
          AND lease_id = $2
          AND expires_at > NOW()
-       RETURNING lease_id`,
-      [session.sub, gameSessionId, GAMEPLAY_LEASE_TTL_SECONDS]
+       LIMIT 1`,
+      [session.sub, gameSessionId]
     );
     if (leaseResult.rowCount === 0) {
       await client.query("ROLLBACK");
@@ -5940,8 +5967,8 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
 app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   expireOldOpenTables();
-  expireGeneratedLobbyBots();
   const difficulty = secureDifficulty(req.query.difficulty);
+  const clientGeneratesBots = String(req.query.clientBots || "") === "1";
   try {
     const scoreResult = await pool.query(
       `SELECT general_score FROM player_scores WHERE player_id = $1`,
@@ -5953,7 +5980,6 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
       .sort((a, b) => a.createdAt - b.createdAt);
 
     const usedListings = new Set();
-    const usedLobbyBotNames = new Set(realTables.map((table) => table.player.name));
     const groups = TWO_PLAYER_ROOM_GROUPS.map((group, groupIndex) => {
       const normalTargetCount = roomTargetCount(groupIndex);
       const realCandidates = realTables.filter((table) => {
@@ -5961,8 +5987,8 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         return table.stakePoints >= group.minScore &&
           (group.maxScore == null || table.stakePoints <= group.maxScore);
       });
-      // Üst salonlarda gerçek masa sayısı normal bot hedefini aşarsa bütün gerçek
-      // masaları göster; ancak tek salonda görünen toplam masa sayısı 10'u geçmesin.
+      // Sunucu artık yapay bot odalarını RAM'de saklamaz ve JSON ile taşımaz.
+      // Yalnız gerçek masaları + istemcinin görsel olarak dolduracağı hedef oda sayısını gönderir.
       const targetCount = groupIndex >= 5
         ? Math.min(10, Math.max(normalTargetCount, realCandidates.length))
         : normalTargetCount;
@@ -5976,42 +6002,30 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         roundCount: normalizeRoundCount(table.roundCount),
         isBot: false,
       }));
-      while (rooms.length < targetCount) {
-        const botIdentity = createLobbyBotIdentity(usedLobbyBotNames);
-        const stakePoints = randomStakeForGroup(group, difficulty);
-        const currentMultiRoomCount = rooms
-          .filter((room) => normalizeRoundCount(room.roundCount) > 1)
-          .length;
-        const roundCount = generatedRoomRoundCount(
-          groupIndex,
-          currentMultiRoomCount,
-          targetCount
-        );
-        const listingId = `bot:${group.id}:${crypto.randomBytes(8).toString("hex")}`;
-        generatedLobbyBots.set(listingId, {
-          listingId,
-          player: {
-            id: `bot_${crypto.randomBytes(12).toString("hex")}`,
-            name: botIdentity.name,
-            country: botIdentity.country,
+
+      // Eski Android sürümleri clientBots=1 göndermediği için görsel bot odalarını
+      // stateless descriptor olarak almaya devam eder. Yeni sürüm botları cihazda üretir.
+      if (!clientGeneratesBots) {
+        const usedLobbyBotNames = new Set(realTables.map((table) => table.player.name));
+        while (rooms.length < targetCount) {
+          const botIdentity = createLobbyBotIdentity(usedLobbyBotNames);
+          const stakePoints = randomStakeForGroup(group, difficulty);
+          const currentMultiRoomCount = rooms.filter((room) => normalizeRoundCount(room.roundCount) > 1).length;
+          const roundCount = generatedRoomRoundCount(groupIndex, currentMultiRoomCount, targetCount);
+          const suffix = crypto.randomBytes(6).toString("hex");
+          rooms.push({
+            listingId: `bot:${group.id}:${stakePoints}:${roundCount}:${suffix}`,
+            opponentName: botIdentity.name,
+            opponentCountry: botIdentity.country,
+            stakePoints,
+            roundCount,
             isBot: true,
-          },
-          difficulty,
-          stakePoints,
-          roundCount,
-          createdAt: Date.now(),
-        });
-        rooms.push({
-          listingId,
-          opponentName: botIdentity.name,
-          opponentCountry: botIdentity.country,
-          stakePoints,
-          roundCount,
-          isBot: true,
-        });
+          });
+        }
       }
       return {
         ...group,
+        targetCount,
         eligible: requesterScore >= group.minScore &&
           (group.maxScore == null || requesterScore <= group.maxScore),
         rooms,
@@ -6024,7 +6038,7 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
 });
 
 io.on("connection", (socket) => {
-  console.log(
+  socketLog(
     "Socket connected:",
     socket.id,
     "transport:",
@@ -6034,7 +6048,7 @@ io.on("connection", (socket) => {
   socket.conn.on(
     "upgrade",
     (transport) => {
-      console.log(
+      socketLog(
         "Socket upgraded:",
         socket.id,
         "transport:",
@@ -6208,8 +6222,7 @@ io.on("connection", (socket) => {
       leaveRoomAsCancel(socket);
 
       if (gameKey === "target_number" && listingId.startsWith("bot:")) {
-        expireGeneratedLobbyBots();
-        const botTable = generatedLobbyBots.get(listingId);
+        const botTable = parseStatelessLobbyBotListing(listingId, difficulty);
         if (!botTable) {
           socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen bot masası artık uygun değil." });
           return;
@@ -6225,16 +6238,23 @@ io.on("connection", (socket) => {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
         }
-        generatedLobbyBots.delete(listingId);
+        const usedNames = new Set([player.name]);
+        const botIdentity = createLobbyBotIdentity(usedNames);
+        const botPlayer = {
+          id: `bot_${crypto.randomBytes(12).toString("hex")}`,
+          name: botIdentity.name,
+          country: botIdentity.country,
+          isBot: true,
+        };
         const botPuzzles = Array.from({ length: botTable.roundCount }, () => generateSecurePuzzle(botTable.difficulty));
         const room = createRealtimeRoom(
-          socket, player, null, botTable.player, "target_number", botTable.difficulty,
+          socket, player, null, botPlayer, "target_number", botTable.difficulty,
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
           botTable.roundCount, botPuzzles, identity.twoPlayerFinishProfile
         );
         socket.emit("match_found", {
           roomId: room.roomId,
-          opponent: { name: botTable.player.name, country: botTable.player.country, matchKey: matchmakingPlayerKey(botTable.player.id) },
+          opponent: { name: botPlayer.name, country: botPlayer.country, matchKey: matchmakingPlayerKey(botPlayer.id) },
           puzzle: room.puzzle,
           stakePoints: room.stakePoints,
           matchMode: "ready_room",
@@ -6376,7 +6396,7 @@ io.on("connection", (socket) => {
           puzzle: room.puzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode,
           startsAtMillis: room.startsAtMillis, roundCount: room.roundCount, roundIndex: room.roundIndex, isBot: false
         });
-        console.log("Match found:", room.roomId, key, "stake:", selectedStake);
+        socketLog("Match found:", room.roomId, key, "stake:", selectedStake);
         return;
       }
 
@@ -6553,7 +6573,7 @@ io.on("connection", (socket) => {
         }
       );
 
-      console.log(
+      socketLog(
         "Match resumed:",
         room.roomId,
         participant.playerId,
@@ -6612,7 +6632,7 @@ io.on("connection", (socket) => {
         participant.playerId
       );
 
-      console.log(
+      socketLog(
         "Player backgrounded:",
         roomId,
         participant.playerId
@@ -6683,7 +6703,7 @@ io.on("connection", (socket) => {
         participant.playerId
       );
 
-      console.log(
+      socketLog(
         "Player foregrounded:",
         roomId,
         participant.playerId
@@ -6750,7 +6770,7 @@ io.on("connection", (socket) => {
         }
       );
 
-      console.log(
+      socketLog(
         "Friend room created:",
         roomCode,
         socket.id,
@@ -6916,7 +6936,7 @@ io.on("connection", (socket) => {
         }
       );
 
-      console.log(
+      socketLog(
         "Friend match found:",
         roomCode,
         realtimeRoom.roomId,
@@ -6972,7 +6992,7 @@ io.on("connection", (socket) => {
   socket.on(
     "disconnect",
     (reason) => {
-      console.log(
+      socketLog(
         "Socket disconnected:",
         socket.id,
         reason
@@ -6991,6 +7011,32 @@ io.on("connection", (socket) => {
   );
 });
 
+async function cleanupExpiredPersistentData() {
+  if (!pool) return;
+  try {
+    // Challenge sonucu kısa süre idempotent retry/debug için tutulur; sonra diskten silinir.
+    await pool.query(
+      `DELETE FROM secure_game_challenges
+       WHERE created_at < NOW() - ($1 * INTERVAL '1 hour')
+         AND (completed_at IS NOT NULL OR expires_at < NOW())`,
+      [CHALLENGE_RETENTION_HOURS]
+    );
+    // Görev tabloları sonsuza kadar büyümesin. Uzun retention mevcut görev davranışını korur.
+    await pool.query(
+      `DELETE FROM player_task_events
+       WHERE occurred_at < NOW() - ($1 * INTERVAL '1 day')`,
+      [TASK_EVENT_RETENTION_DAYS]
+    );
+    await pool.query(
+      `DELETE FROM player_task_claims
+       WHERE claimed_at < NOW() - ($1 * INTERVAL '1 day')`,
+      [TASK_CLAIM_RETENTION_DAYS]
+    );
+  } catch (error) {
+    console.error("persistent data cleanup error:", error.message || error);
+  }
+}
+
 setInterval(() => {
   expireOldPrivateRooms();
   expireOldOpenTables();
@@ -7000,6 +7046,10 @@ setInterval(() => {
 setInterval(() => {
   cleanupLeaderboardResponseCache();
 }, LEADERBOARD_SERVER_CACHE_CLEANUP_INTERVAL_MS).unref();
+
+setInterval(() => {
+  cleanupExpiredPersistentData();
+}, DATA_RETENTION_CLEANUP_INTERVAL_MS).unref();
 
 
 const PORT = Number(
@@ -7015,6 +7065,7 @@ initDatabase()
       "0.0.0.0",
       () => {
         console.log(`Target number matchmaking server running on port ${PORT}`);
+        cleanupExpiredPersistentData();
       }
     );
   })
