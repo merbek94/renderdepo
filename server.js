@@ -7,6 +7,11 @@ const { Pool } = require("pg");
 
 const app = express();
 
+const ENABLE_REALTIME_LOGS = process.env.ENABLE_REALTIME_LOGS === "true";
+function realtimeLog(...args) {
+  if (ENABLE_REALTIME_LOGS) console.log(...args);
+}
+
 if (process.env.ENABLE_HTTP_REQUEST_LOGS === "true") {
   app.use((req, res, next) => {
     console.log(
@@ -244,6 +249,13 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS schema_migrations (
       migration_id TEXT PRIMARY KEY,
       applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Ağır cleanup'ların her Render restartında / her instance'ta tekrar çalışmasını önleyen
+    -- çok küçük bakım kilidi. Her iş için yalnız son başarılı claim zamanı tutulur.
+    CREATE TABLE IF NOT EXISTS maintenance_state (
+      task_key TEXT PRIMARY KEY,
+      last_run_at TIMESTAMPTZ NOT NULL DEFAULT TO_TIMESTAMP(0)
     );
 
     CREATE TABLE IF NOT EXISTS player_game_sessions (
@@ -536,20 +548,6 @@ async function initDatabase() {
     ALTER TABLE player_task_state
       ADD COLUMN IF NOT EXISTS recent_sources JSONB NOT NULL DEFAULT '[]'::jsonb;
 
-    CREATE TABLE IF NOT EXISTS player_task_claims (
-      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
-      period_type TEXT NOT NULL CHECK (period_type IN ('daily', 'weekly', 'monthly')),
-      period_key TEXT NOT NULL,
-      task_code TEXT NOT NULL,
-      reward_score INTEGER NOT NULL DEFAULT 0 CHECK (reward_score >= 0),
-      reward_diamonds INTEGER NOT NULL DEFAULT 0 CHECK (reward_diamonds >= 0),
-      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (player_id, period_type, period_key, task_code)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_task_claims_claimed_at
-      ON player_task_claims (claimed_at);
-
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_cleanup
@@ -745,6 +743,7 @@ function emptyTaskAggregatePeriod() {
     wins: 0,
     gameCounts: {},
     multiplayerGameCounts: {},
+    claimed: {},
   };
 }
 
@@ -760,6 +759,18 @@ function safeTaskCountMap(value) {
   return out;
 }
 
+function safeTaskClaimMap(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const out = {};
+  const allowedCodes = new Set([...TASK_DEFINITIONS.map((item) => item.code), "all_complete"]);
+  for (const [rawCode, rawClaimed] of Object.entries(source)) {
+    const code = safeText(rawCode, "", 64).toLowerCase();
+    if (!code || !allowedCodes.has(code) || rawClaimed !== true) continue;
+    out[code] = true;
+  }
+  return out;
+}
+
 function normalizeTaskAggregatePeriod(value) {
   const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   return {
@@ -769,6 +780,7 @@ function normalizeTaskAggregatePeriod(value) {
     wins: Math.max(0, Number(source.wins || 0)),
     gameCounts: safeTaskCountMap(source.gameCounts),
     multiplayerGameCounts: safeTaskCountMap(source.multiplayerGameCounts),
+    claimed: safeTaskClaimMap(source.claimed),
   };
 }
 
@@ -1003,6 +1015,7 @@ function taskPeriodTargetedMutationSql(baseExpression) {
   const base = `(${baseExpression})`;
   const gameCounts = `COALESCE(${base}->'gameCounts', '{}'::jsonb)`;
   const multiplayerGameCounts = `COALESCE(${base}->'multiplayerGameCounts', '{}'::jsonb)`;
+  const claimed = `COALESCE(${base}->'claimed', '{}'::jsonb)`;
   return `jsonb_build_object(
     'login', CASE WHEN $6 = 'login' THEN 1 ELSE COALESCE((${base}->>'login')::bigint, 0) END,
     'games', LEAST(2000000000::bigint,
@@ -1022,7 +1035,8 @@ function taskPeriodTargetedMutationSql(baseExpression) {
         ${multiplayerGameCounts}, ARRAY[$7],
         to_jsonb(LEAST(2000000000::bigint, COALESCE((${multiplayerGameCounts}->>$7)::bigint, 0) + 1)), true)
       ELSE ${multiplayerGameCounts}
-    END
+    END,
+    'claimed', ${claimed}
   )`;
 }
 
@@ -1142,16 +1156,9 @@ function favoriteTaskGameKey(gameTotals) {
     .sort((a, b) => Number(b[1]) - Number(a[1]) || String(a[0]).localeCompare(String(b[0])))[0]?.[0] || null;
 }
 
-async function buildTaskCenterStateFromAggregate(client, playerId, aggregate, now = new Date()) {
+async function buildTaskCenterStateFromAggregate(_client, _playerId, aggregate, now = new Date()) {
   const favoriteGameKey = favoriteTaskGameKey(aggregate.gameTotals);
   const periods = ["daily", "weekly", "monthly"].map((type) => taskPeriodInfo(type, now));
-  const claimsResult = await client.query(
-    `SELECT period_type, period_key, task_code
-     FROM player_task_claims
-     WHERE player_id = $1 AND period_key = ANY($2::text[])`,
-    [playerId, periods.map((item) => item.key)]
-  );
-  const claims = new Set(claimsResult.rows.map((row) => `${row.period_type}:${row.period_key}:${row.task_code}`));
 
   const periodStates = periods.map((period) => {
     const config = TASK_PERIOD_CONFIG[period.type];
@@ -1192,7 +1199,7 @@ async function buildTaskCenterStateFromAggregate(client, playerId, aggregate, no
         secondaryTarget,
         secondaryLabel: secondaryTarget === null ? null : "Favori dışı",
         completed,
-        claimed: claims.has(`${period.type}:${period.key}:${definition.code}`),
+        claimed: state.claimed?.[definition.code] === true,
       };
     });
     const allComplete = tasks.every((task) => task.completed);
@@ -1204,7 +1211,7 @@ async function buildTaskCenterStateFromAggregate(client, playerId, aggregate, no
       tasks,
       allComplete,
       masterRewardDiamonds: config.diamondReward,
-      masterClaimed: claims.has(`${period.type}:${period.key}:all_complete`),
+      masterClaimed: state.claimed?.all_complete === true,
     };
   });
 
@@ -1217,6 +1224,40 @@ async function readTaskCenterState(client, playerId, forUpdate = false) {
     ? await loadTaskAggregateStateForUpdate(client, playerId, now)
     : await readTaskAggregateState(client, playerId, now);
   return buildTaskCenterStateFromAggregate(client, playerId, aggregate, now);
+}
+
+async function readTaskCenterStateReadMostly(playerId) {
+  const now = new Date();
+  const current = await pool.query(
+    `SELECT daily_key, daily_state, weekly_key, weekly_state,
+            monthly_key, monthly_state, game_totals, recent_sources
+     FROM player_task_state
+     WHERE player_id = $1`,
+    [playerId]
+  );
+  if (current.rowCount > 0) {
+    return buildTaskCenterStateFromAggregate(
+      pool,
+      playerId,
+      normalizeTaskAggregateRow(current.rows[0], now),
+      now
+    );
+  }
+
+  // İlk kez görev merkezi açan oyuncuda yalnız bir kere kilitli aggregate satırı oluştur.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const aggregate = await loadTaskAggregateStateForUpdate(client, playerId, now);
+    const state = await buildTaskCenterStateFromAggregate(client, playerId, aggregate, now);
+    await client.query('COMMIT');
+    return state;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function mergeTaskCountMaps(a, b) {
@@ -1237,6 +1278,7 @@ function mergeTaskAggregatePeriod(a, b) {
     wins: Math.min(2_000_000_000, left.wins + right.wins),
     gameCounts: mergeTaskCountMaps(left.gameCounts, right.gameCounts),
     multiplayerGameCounts: mergeTaskCountMaps(left.multiplayerGameCounts, right.multiplayerGameCounts),
+    claimed: { ...safeTaskClaimMap(left.claimed), ...safeTaskClaimMap(right.claimed) },
   };
 }
 
@@ -1270,41 +1312,57 @@ async function claimTaskRewardInTransaction(client, playerId, periodType, taskCo
     error.publicCode = "TASK_NOT_COMPLETE";
     throw error;
   }
+
+  const alreadyClaimed = isMaster ? periodState?.masterClaimed === true : task?.claimed === true;
+  if (alreadyClaimed) return taskCenter;
+
   const rewardScore = isMaster ? 0 : task.rewardScore;
   const rewardDiamonds = isMaster ? periodState.masterRewardDiamonds : 0;
-  const inserted = await client.query(
-    `INSERT INTO player_task_claims
-     (player_id, period_type, period_key, task_code, reward_score, reward_diamonds, claimed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, NOW())
-     ON CONFLICT (player_id, period_type, period_key, task_code) DO NOTHING
-     RETURNING task_code`,
-    [playerId, type, period.key, taskCode, rewardScore, rewardDiamonds]
+  const stateColumn = type === "daily" ? "daily_state" : type === "weekly" ? "weekly_state" : "monthly_state";
+  const keyColumn = type === "daily" ? "daily_key" : type === "weekly" ? "weekly_key" : "monthly_key";
+
+  // player_task_state satırı yukarıdaki FOR UPDATE ile zaten kilitli. Claim idempotency'sini ayrı bir
+  // tarihsel tablo/INSERT yerine aynı aggregate JSON içinde tut; böylece claim SELECT/INSERT/cleanup yoktur.
+  const marked = await client.query(
+    `UPDATE player_task_state
+     SET ${stateColumn} = jsonb_set(
+           COALESCE(${stateColumn}, '{}'::jsonb),
+           '{claimed}',
+           COALESCE(${stateColumn}->'claimed', '{}'::jsonb) || jsonb_build_object($3::text, TRUE),
+           true
+         ),
+         updated_at = NOW()
+     WHERE player_id = $1
+       AND ${keyColumn} = $2
+       AND NOT (COALESCE(${stateColumn}->'claimed', '{}'::jsonb) ? $3)
+     RETURNING player_id`,
+    [playerId, period.key, taskCode]
   );
-  let updatedTaskCenter = taskCenter;
-  if (inserted.rowCount > 0) {
-    if (rewardScore > 0) await addPositiveGeneralAndXpInTransaction(client, playerId, rewardScore, 0);
-    if (rewardDiamonds > 0) {
-      await client.query(
-        `UPDATE player_progress SET diamond_balance = LEAST(diamond_balance + $2, 2000000000), updated_at = NOW()
-         WHERE player_id = $1`,
-        [playerId, rewardDiamonds]
-      );
-    }
-    updatedTaskCenter = {
-      ...taskCenter,
-      periods: taskCenter.periods.map((item) => {
-        if (item.type !== type) return item;
-        if (isMaster) return { ...item, masterClaimed: true };
-        return {
-          ...item,
-          tasks: item.tasks.map((entry) =>
-            entry.code === taskCode ? { ...entry, claimed: true } : entry
-          ),
-        };
-      }),
-    };
+
+  if (marked.rowCount === 0) return taskCenter;
+
+  if (rewardScore > 0) await addPositiveGeneralAndXpInTransaction(client, playerId, rewardScore, 0);
+  if (rewardDiamonds > 0) {
+    await client.query(
+      `UPDATE player_progress SET diamond_balance = LEAST(diamond_balance + $2, 2000000000), updated_at = NOW()
+       WHERE player_id = $1`,
+      [playerId, rewardDiamonds]
+    );
   }
-  return updatedTaskCenter;
+
+  return {
+    ...taskCenter,
+    periods: taskCenter.periods.map((item) => {
+      if (item.type !== type) return item;
+      if (isMaster) return { ...item, masterClaimed: true };
+      return {
+        ...item,
+        tasks: item.tasks.map((entry) =>
+          entry.code === taskCode ? { ...entry, claimed: true } : entry
+        ),
+      };
+    }),
+  };
 }
 
 function timestampMillis(value) {
@@ -2073,16 +2131,33 @@ function normalizedGameRightConsumption(row, difficulty, wagerPoints, allowAutom
 async function consumeGameRightInTransaction(client, playerId, difficulty, wagerPoints = minimumTwoPlayerStake(difficulty), allowAutomatic = false) {
   // Skor + hak aynı kilitli SELECT'te okunur. Önceki sürümde score ve progress ayrı SELECT idi.
   const result = await client.query(
-    `SELECT s.general_score, p.game_rights, p.game_rights_refill_at
+    `SELECT s.general_score, p.game_rights, p.game_rights_refill_at,
+            p.two_player_finish_count, p.two_player_finish_total_ms,
+            p.tournament_stage, p.tournament_rights, p.tournament_bank,
+            p.tournament_completed, p.tournament_tickets, p.tournament_entry_active
      FROM player_scores s
      JOIN player_progress p ON p.player_id = s.player_id
      WHERE s.player_id = $1
      FOR UPDATE OF s, p`,
     [playerId]
   );
+  const lockedRow = result.rows[0] || {};
   const state = normalizedGameRightConsumption(
-    result.rows[0] || {}, difficulty, wagerPoints, allowAutomatic
+    lockedRow, difficulty, wagerPoints, allowAutomatic
   );
+  state.finishProfile = normalizeTwoPlayerFinishProfile({
+    finishCount: lockedRow.two_player_finish_count,
+    finishTotalMs: lockedRow.two_player_finish_total_ms,
+  });
+  state.tournamentResponse = {
+    currentStage: Math.max(1, Math.min(Number(lockedRow.tournament_stage || 1), 8)),
+    remainingRights: Math.max(0, Math.min(Number(lockedRow.tournament_rights ?? 3), 3)),
+    totalScore: Math.max(0, Number(lockedRow.tournament_bank || 0)),
+    completed: lockedRow.tournament_completed === true,
+    tickets: Math.max(0, Number(lockedRow.tournament_tickets || 0)),
+    ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
+    entryActive: lockedRow.tournament_entry_active === true,
+  };
   await client.query(
     `UPDATE player_progress SET game_rights = $2,
        game_rights_refill_at = TO_TIMESTAMP($3 / 1000.0), updated_at = NOW()
@@ -2327,6 +2402,31 @@ function levelMilestoneReward(levelValue) {
   return { level, generalScore: 0, diamonds: Math.floor(level / 10) };
 }
 
+function calculateLevelMilestoneSettlement(totalXpValue, claimedThroughValue) {
+  const currentLevel = playerLevelForTotalXp(totalXpValue);
+  const eligibleThroughLevel = Math.min(1000, Math.floor(currentLevel / 10) * 10);
+  const claimedThroughLevel = Math.max(
+    0,
+    Math.min(1000, Math.floor(Number(claimedThroughValue || 0) / 10) * 10)
+  );
+  if (eligibleThroughLevel <= claimedThroughLevel) {
+    return { claimedThroughLevel, generalDelta: 0, diamondDelta: 0 };
+  }
+  let generalDelta = 0;
+  let diamondDelta = 0;
+  for (let level = claimedThroughLevel + 10; level <= eligibleThroughLevel; level += 10) {
+    const reward = levelMilestoneReward(level);
+    if (!reward) continue;
+    generalDelta += reward.generalScore;
+    diamondDelta += reward.diamonds;
+  }
+  return {
+    claimedThroughLevel: eligibleThroughLevel,
+    generalDelta,
+    diamondDelta,
+  };
+}
+
 async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
   const progressResult = await client.query(
     `SELECT total_xp, level_reward_claimed_through
@@ -2532,7 +2632,7 @@ async function readAuthoritativePlayerState(client, playerId) {
        JOIN player_progress p ON p.player_id = s.player_id
        JOIN players pl ON pl.player_id = s.player_id
        WHERE s.player_id = $1
-       FOR UPDATE OF p`,
+       FOR UPDATE OF s, p`,
       [playerId]
     );
   }
@@ -2694,6 +2794,149 @@ async function readAuthoritativePlayerState(client, playerId) {
   };
 }
 
+async function readAuthoritativePlayerStateReadMostly(playerId) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `SELECT s.general_score, s.infinite_score,
+            p.total_xp, p.infinite_run_score, p.infinite_next_stage,
+            p.diamond_balance, p.level_reward_claimed_through,
+            p.tournament_stage, p.tournament_rights,
+            p.tournament_bank, p.tournament_completed,
+            p.tournament_tickets, p.tournament_entry_active,
+            p.hundred_active, p.hundred_stage,
+            p.hundred_daily_key, p.hundred_daily_base_used,
+            p.hundred_daily_ad_used, p.hundred_rewarded_rights,
+            p.game_rights, p.game_rights_refill_at,
+            pl.username, pl.country, pl.username_user_set,
+            pl.username_change_count, pl.username_last_changed_at,
+            pl.updated_at AS profile_updated_at
+     FROM player_scores s
+     JOIN player_progress p ON p.player_id = s.player_id
+     JOIN players pl ON pl.player_id = s.player_id
+     WHERE s.player_id = $1`,
+    [playerId]
+  );
+
+  // Eksik eski hesap veya gerçekten yazılması gereken bakım varsa yalnız o nadir durumda
+  // eski kilitli/transactional yola düş. Common path tek plain SELECT'tir.
+  if (result.rowCount === 0) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await ensureAuthenticatedPlayer(client, playerId);
+      const state = await readAuthoritativePlayerState(client, playerId);
+      await client.query('COMMIT');
+      return state;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  const row = result.rows[0] || {};
+  const now = Date.now();
+  const totalXp = Math.max(0, Math.min(Number(row.total_xp || 0), 2_000_000_000));
+  const levelSettlement = calculateLevelMilestoneSettlement(
+    totalXp,
+    row.level_reward_claimed_through
+  );
+  const levelSettlementNeeded =
+    levelSettlement.claimedThroughLevel !== Math.max(
+      0,
+      Math.min(1000, Math.floor(Number(row.level_reward_claimed_through || 0) / 10) * 10)
+    );
+
+  const todayKey = currentUtcDayKey();
+  const hundredResetNeeded = String(row.hundred_daily_key || '') !== todayKey;
+  const hundredDayKey = hundredResetNeeded ? todayKey : String(row.hundred_daily_key || '');
+  const hundredBaseUsed = hundredResetNeeded ? false : row.hundred_daily_base_used === true;
+  const hundredAdUsed = hundredResetNeeded ? false : row.hundred_daily_ad_used === true;
+  const hundredRewardedRights = hundredResetNeeded
+    ? 0
+    : Math.max(0, Math.min(Number(row.hundred_rewarded_rights || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
+  const hundredBaseRightsRemaining = hundredBaseUsed ? 0 : HUNDRED_DAILY_BASE_RIGHTS;
+  const hundredActive = row.hundred_active === true;
+
+  const storedGameRights = Math.max(0, Math.min(Number(row.game_rights ?? GAME_RIGHT_MAX), GAME_RIGHT_MAX));
+  const storedGameRightsAnchor = new Date(row.game_rights_refill_at || now).getTime();
+  const gameRightsElapsed = Math.max(0, now - storedGameRightsAnchor);
+  const refillCount = storedGameRights >= GAME_RIGHT_MAX ? 0 : Math.floor(gameRightsElapsed / GAME_RIGHT_REFILL_MS);
+  const gameRightsRemaining = Math.min(GAME_RIGHT_MAX, storedGameRights + refillCount);
+  const gameRightsChanged = gameRightsRemaining !== storedGameRights;
+  const gameRightsAnchor = gameRightsRemaining >= GAME_RIGHT_MAX
+    ? now
+    : storedGameRightsAnchor + refillCount * GAME_RIGHT_REFILL_MS;
+
+  if (levelSettlementNeeded || hundredResetNeeded || gameRightsChanged) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const state = await readAuthoritativePlayerState(client, playerId);
+      await client.query('COMMIT');
+      return state;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  return {
+    generalScore: Number(row.general_score || 0),
+    infiniteScore: Number(row.infinite_score || 0),
+    totalXp,
+    diamondBalance: Math.max(0, Number(row.diamond_balance || 0)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: {
+      claimedThroughLevel: levelSettlement.claimedThroughLevel,
+      generalDelta: 0,
+      diamondDelta: 0,
+    },
+    runScore: Number(row.infinite_run_score || 0),
+    infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
+    profile: {
+      username: safeUsername(row.username || ''),
+      userSet: row.username_user_set === true,
+      changeCountAfterInitial: Math.max(0, Number(row.username_change_count || 0)),
+      lastChangeTimeMillis: timestampMillis(row.username_last_changed_at),
+      updatedAtMillis: timestampMillis(row.profile_updated_at),
+      country: safeCountry(row.country),
+    },
+    tournament: {
+      currentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
+      remainingRights: Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3)),
+      totalScore: Math.max(0, Number(row.tournament_bank || 0)),
+      completed: row.tournament_completed === true,
+      tickets: Math.max(0, Number(row.tournament_tickets || 0)),
+      ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
+      entryActive: row.tournament_entry_active === true,
+    },
+    hundred: {
+      active: hundredActive,
+      stage: Math.max(0, Math.min(Number(row.hundred_stage || 0), 12)),
+      dailyBaseRightsRemaining: hundredBaseRightsRemaining,
+      rewardedRightsRemaining: hundredRewardedRights,
+      rewardedAdUsedToday: hundredAdUsed,
+      rewardedAdAvailable:
+        !hundredActive && hundredBaseUsed && !hundredAdUsed && hundredRewardedRights <= 0,
+      canStart: !hundredActive && (hundredBaseRightsRemaining + hundredRewardedRights > 0),
+      nextResetAtMillis: nextUtcDayStartMillis(),
+      dayKey: hundredDayKey,
+    },
+    gameRights: {
+      remainingRights: gameRightsRemaining,
+      maxRights: GAME_RIGHT_MAX,
+      lastRefillTimeMillis: gameRightsAnchor,
+      millisUntilNextRight: gameRightsRemaining >= GAME_RIGHT_MAX
+        ? 0
+        : Math.max(0, GAME_RIGHT_REFILL_MS - (now - gameRightsAnchor)),
+    },
+  };
+}
+
 async function applyTournamentOutcomeInTransaction(
   client,
   playerId,
@@ -2701,20 +2944,14 @@ async function applyTournamentOutcomeInTransaction(
   requestedStage,
   playerAlreadyEnsured = false
 ) {
-  // Kimlik doğrulanmış oyun yollarında oyuncu satırı zaten vardır; preflight ensure sorgusunu atla.
   void playerAlreadyEnsured;
-  const locked = await client.query(
-    `SELECT tournament_stage, tournament_rights, tournament_bank, tournament_completed,
-            tournament_entry_active
-     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-    [playerId]
-  );
-  const row = locked.rows[0] || {};
-  const currentStage = Math.max(1, Math.min(Number(row.tournament_stage || 1), 8));
-  const remainingRights = Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3));
-  const bank = Math.max(0, Number(row.tournament_bank || 0));
-  const completedBefore = row.tournament_completed === true;
-  const entryActive = row.tournament_entry_active === true;
+  // Turnuva partial SELECT + final full-state SELECT yerine tek authoritative snapshot kullanır.
+  const before = await readAuthoritativePlayerState(client, playerId);
+  const currentStage = Math.max(1, Math.min(Number(before.tournament?.currentStage || 1), 8));
+  const remainingRights = Math.max(0, Math.min(Number(before.tournament?.remainingRights ?? 3), 3));
+  const bank = Math.max(0, Number(before.tournament?.totalScore || 0));
+  const completedBefore = before.tournament?.completed === true;
+  const entryActive = before.tournament?.entryActive === true;
   const stage = Math.max(1, Math.min(Number(requestedStage || currentStage), 8));
   if (stage !== currentStage || completedBefore || remainingRights <= 0 || !entryActive) {
     const error = new Error("Turnuva aşaması sunucu ilerlemesiyle uyuşmuyor.");
@@ -2753,33 +2990,78 @@ async function applyTournamentOutcomeInTransaction(
     }
   }
 
+  const totalXpAfter = Math.min(2_000_000_000, Number(before.totalXp || 0) + xpDelta);
+  const levelSettlement = calculateLevelMilestoneSettlement(
+    totalXpAfter,
+    before.levelRewardClaimedThrough
+  );
+  const persistedGeneralDelta = awardedScore + levelSettlement.generalDelta;
+  const monthKey = currentMonthKey();
+
+  // Turnuva progress + XP/level + skor ödülünü tek DB statement'ında uygula.
   await client.query(
-    `UPDATE player_progress SET
-       tournament_stage = $2,
-       tournament_rights = $3,
-       tournament_bank = $4,
-       tournament_completed = $5,
-       tournament_entry_active = $6,
-       total_xp = LEAST(total_xp + $7, 2000000000),
-       updated_at = NOW()
+    `WITH score_update AS (
+       UPDATE player_scores
+       SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+           monthly_general_score = CASE
+             WHEN monthly_key = $11 THEN
+               GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+             ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+           END,
+           monthly_infinite_score = CASE WHEN monthly_key = $11 THEN monthly_infinite_score ELSE 0 END,
+           monthly_key = $11,
+           monthly_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1 AND $2::bigint <> 0
+       RETURNING player_id
+     )
+     UPDATE player_progress
+     SET tournament_stage = $3,
+         tournament_rights = $4,
+         tournament_bank = $5,
+         tournament_completed = $6,
+         tournament_entry_active = $7,
+         total_xp = $8,
+         diamond_balance = LEAST(diamond_balance + $9, 2000000000),
+         level_reward_claimed_through = $10,
+         updated_at = NOW()
      WHERE player_id = $1`,
-    [playerId, nextStage, nextRights, nextBank, completed, nextEntryActive, xpDelta]
+    [
+      playerId,
+      persistedGeneralDelta,
+      nextStage,
+      nextRights,
+      nextBank,
+      completed,
+      nextEntryActive,
+      totalXpAfter,
+      levelSettlement.diamondDelta,
+      levelSettlement.claimedThroughLevel,
+      monthKey,
+    ]
   );
 
-  if (awardedScore > 0) {
-    await applyLeaderboardScoreDeltaInTransaction(client, playerId, awardedScore, 0);
-  }
-
-  const state = await readAuthoritativePlayerState(client, playerId);
   return {
-    ...state,
+    ...before,
+    generalScore: Math.max(0, Math.min(2_000_000_000,
+      Number(before.generalScore || 0) + persistedGeneralDelta)),
+    totalXp: totalXpAfter,
+    diamondBalance: Math.max(0, Math.min(2_000_000_000,
+      Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: levelSettlement,
     generalDelta: awardedScore,
     infiniteDelta: 0,
     xpDelta,
     awardedScore,
     won,
     tournament: {
-      ...state.tournament,
+      ...before.tournament,
+      currentStage: nextStage,
+      remainingRights: nextRights,
+      totalScore: nextBank,
+      completed,
+      entryActive: nextEntryActive,
       awardedScore,
     },
   };
@@ -2845,15 +3127,11 @@ function hundredEliminationReward(stageValue) {
 }
 
 async function completeHundredStageInTransaction(client, playerId, stageValue) {
-  const locked = await client.query(
-    `SELECT hundred_active, hundred_stage
-     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-    [playerId]
-  );
-  const row = locked.rows[0] || {};
-  const currentStage = Math.max(1, Math.min(Number(row.hundred_stage || 1), 12));
+  // İlk partial SELECT + final full-state SELECT yerine tek authoritative kilitli snapshot kullan.
+  const before = await readAuthoritativePlayerState(client, playerId);
+  const currentStage = Math.max(1, Math.min(Number(before.hundred?.stage || 1), 12));
   const stage = Math.max(1, Math.min(Number(stageValue || currentStage), 12));
-  if (row.hundred_active !== true || stage !== currentStage) {
+  if (before.hundred?.active !== true || stage !== currentStage) {
     const error = new Error("100 kişilik oyun aşaması sunucu durumuyla uyuşmuyor.");
     error.statusCode = 409;
     error.publicCode = "HUNDRED_STATE_MISMATCH";
@@ -2864,25 +3142,86 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
   let xpDelta = 0;
   let nextStage = currentStage + 1;
   let runCompleted = false;
+  let totalXpAfter = Number(before.totalXp || 0);
+  let levelSettlement = {
+    claimedThroughLevel: before.levelRewardClaimedThrough,
+    generalDelta: 0,
+    diamondDelta: 0,
+  };
+
   if (currentStage >= 12) {
     generalDelta = HUNDRED_WIN_REWARD;
     xpDelta = 480;
     nextStage = 0;
     runCompleted = true;
-    await addPositiveGeneralAndXpInTransaction(client, playerId, generalDelta, xpDelta);
+    totalXpAfter = Math.min(2_000_000_000, Number(before.totalXp || 0) + xpDelta);
+    levelSettlement = calculateLevelMilestoneSettlement(
+      totalXpAfter,
+      before.levelRewardClaimedThrough
+    );
   }
 
+  const persistedGeneralDelta = generalDelta + levelSettlement.generalDelta;
+  const monthKey = currentMonthKey();
   await client.query(
-    `UPDATE player_progress SET
-       hundred_active = $2,
-       hundred_stage = $3,
-       updated_at = NOW()
+    `WITH score_update AS (
+       UPDATE player_scores
+       SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+           monthly_general_score = CASE
+             WHEN monthly_key = $8 THEN
+               GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+             ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+           END,
+           monthly_infinite_score = CASE WHEN monthly_key = $8 THEN monthly_infinite_score ELSE 0 END,
+           monthly_key = $8,
+           monthly_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1 AND $2::bigint <> 0
+       RETURNING player_id
+     )
+     UPDATE player_progress
+     SET hundred_active = $3,
+         hundred_stage = $4,
+         total_xp = $5,
+         diamond_balance = LEAST(diamond_balance + $6, 2000000000),
+         level_reward_claimed_through = $7,
+         updated_at = NOW()
      WHERE player_id = $1`,
-    [playerId, !runCompleted, nextStage]
+    [
+      playerId,
+      persistedGeneralDelta,
+      !runCompleted,
+      nextStage,
+      totalXpAfter,
+      levelSettlement.diamondDelta,
+      levelSettlement.claimedThroughLevel,
+      monthKey,
+    ]
   );
-  const state = await readAuthoritativePlayerState(client, playerId);
+
   return {
-    ...state,
+    ...before,
+    generalScore: Math.max(0, Math.min(2_000_000_000,
+      Number(before.generalScore || 0) + persistedGeneralDelta)),
+    totalXp: totalXpAfter,
+    diamondBalance: Math.max(0, Math.min(2_000_000_000,
+      Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: levelSettlement,
+    hundred: {
+      ...before.hundred,
+      active: !runCompleted,
+      stage: nextStage,
+      rewardedAdAvailable: runCompleted
+        ? (before.hundred?.dailyBaseRightsRemaining <= 0 &&
+           before.hundred?.rewardedAdUsedToday !== true &&
+           Number(before.hundred?.rewardedRightsRemaining || 0) <= 0)
+        : false,
+      canStart: runCompleted
+        ? ((Number(before.hundred?.dailyBaseRightsRemaining || 0) +
+            Number(before.hundred?.rewardedRightsRemaining || 0)) > 0)
+        : false,
+    },
     generalDelta,
     infiniteDelta: 0,
     xpDelta,
@@ -2894,16 +3233,10 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
 }
 
 async function forfeitHundredRunInTransaction(client, playerId) {
-  const locked = await client.query(
-    `SELECT hundred_active, hundred_stage
-     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-    [playerId]
-  );
-  const row = locked.rows[0] || {};
-  if (row.hundred_active !== true) {
-    const state = await readAuthoritativePlayerState(client, playerId);
+  const before = await readAuthoritativePlayerState(client, playerId);
+  if (before.hundred?.active !== true) {
     return {
-      ...state,
+      ...before,
       generalDelta: 0,
       infiniteDelta: 0,
       xpDelta: 0,
@@ -2913,7 +3246,7 @@ async function forfeitHundredRunInTransaction(client, playerId) {
       hundredRunCompleted: true,
     };
   }
-  const stage = Math.max(1, Math.min(Number(row.hundred_stage || 1), 12));
+  const stage = Math.max(1, Math.min(Number(before.hundred?.stage || 1), 12));
   const activeChallenge = await client.query(
     `SELECT challenge_id FROM secure_game_challenges
      WHERE player_id = $1 AND mode = 'hundred' AND completed_at IS NULL
@@ -2930,16 +3263,49 @@ async function forfeitHundredRunInTransaction(client, playerId) {
     multiplayer: true,
     won: false,
   });
+
   const generalDelta = hundredEliminationReward(stage);
   const xpDelta = stage * 40;
-  await addPositiveGeneralAndXpInTransaction(client, playerId, generalDelta, xpDelta);
+  const totalXpAfter = Math.min(2_000_000_000, Number(before.totalXp || 0) + xpDelta);
+  const levelSettlement = calculateLevelMilestoneSettlement(
+    totalXpAfter,
+    before.levelRewardClaimedThrough
+  );
+  const persistedGeneralDelta = generalDelta + levelSettlement.generalDelta;
+  const monthKey = currentMonthKey();
+
   await client.query(
-    `UPDATE player_progress SET
-       hundred_active = FALSE,
-       hundred_stage = 0,
-       updated_at = NOW()
+    `WITH score_update AS (
+       UPDATE player_scores
+       SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+           monthly_general_score = CASE
+             WHEN monthly_key = $6 THEN
+               GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+             ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+           END,
+           monthly_infinite_score = CASE WHEN monthly_key = $6 THEN monthly_infinite_score ELSE 0 END,
+           monthly_key = $6,
+           monthly_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1
+       RETURNING player_id
+     )
+     UPDATE player_progress
+     SET hundred_active = FALSE,
+         hundred_stage = 0,
+         total_xp = $3,
+         diamond_balance = LEAST(diamond_balance + $4, 2000000000),
+         level_reward_claimed_through = $5,
+         updated_at = NOW()
      WHERE player_id = $1`,
-    [playerId]
+    [
+      playerId,
+      persistedGeneralDelta,
+      totalXpAfter,
+      levelSettlement.diamondDelta,
+      levelSettlement.claimedThroughLevel,
+      monthKey,
+    ]
   );
   await client.query(
     `UPDATE secure_game_challenges SET
@@ -2949,9 +3315,28 @@ async function forfeitHundredRunInTransaction(client, playerId) {
      WHERE player_id = $1 AND mode = 'hundred' AND completed_at IS NULL`,
     [playerId]
   );
-  const state = await readAuthoritativePlayerState(client, playerId);
+
   return {
-    ...state,
+    ...before,
+    generalScore: Math.max(0, Math.min(2_000_000_000,
+      Number(before.generalScore || 0) + persistedGeneralDelta)),
+    totalXp: totalXpAfter,
+    diamondBalance: Math.max(0, Math.min(2_000_000_000,
+      Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: levelSettlement,
+    hundred: {
+      ...before.hundred,
+      active: false,
+      stage: 0,
+      rewardedAdAvailable:
+        before.hundred?.dailyBaseRightsRemaining <= 0 &&
+        before.hundred?.rewardedAdUsedToday !== true &&
+        Number(before.hundred?.rewardedRightsRemaining || 0) <= 0,
+      canStart:
+        Number(before.hundred?.dailyBaseRightsRemaining || 0) +
+        Number(before.hundred?.rewardedRightsRemaining || 0) > 0,
+    },
     generalDelta,
     infiniteDelta: 0,
     xpDelta,
@@ -3124,6 +3509,140 @@ function twoPlayerBotRewards(difficulty, won, wagerPoints = 0) {
   };
 }
 
+function compactChallengeResult(response) {
+  return {
+    status: "completed",
+    summary: {
+      generalDelta: Number(response?.generalDelta || 0),
+      infiniteDelta: Number(response?.infiniteDelta || 0),
+      xpDelta: Number(response?.xpDelta || 0),
+      won: response?.won === null || response?.won === undefined ? null : response.won === true,
+      outcomeReason: response?.outcomeReason || null,
+      elapsedServerMs: Math.max(0, Number(response?.elapsedServerMs || 0)),
+      awardedScore: Math.max(0, Number(response?.awardedScore || 0)),
+      hundredStage: Math.max(0, Number(response?.hundredStage || 0)),
+      hundredRunCompleted: response?.hundredRunCompleted === true,
+      runScore: Math.max(0, Number(response?.runScore || 0)),
+    },
+  };
+}
+
+async function rebuildStoredChallengeResponseInTransaction(client, playerId, storedResult) {
+  // Eski deploy'larda result.response tam cevap içeriyordu; migration gerektirmeden onu desteklemeye devam et.
+  if (storedResult?.response) return storedResult.response;
+  const summary = storedResult?.summary;
+  if (!summary || storedResult?.status !== "completed") return null;
+  const state = await readAuthoritativePlayerState(client, playerId);
+  return {
+    ok: true,
+    generalDelta: Number(summary.generalDelta || 0),
+    infiniteDelta: Number(summary.infiniteDelta || 0),
+    xpDelta: Number(summary.xpDelta || 0),
+    ...state,
+    runScore: Math.max(0, Number(state.runScore || summary.runScore || 0)),
+    won: summary.won === null || summary.won === undefined ? null : summary.won === true,
+    outcomeReason: summary.outcomeReason || null,
+    elapsedServerMs: Math.max(0, Number(summary.elapsedServerMs || 0)),
+    awardedScore: Math.max(0, Number(summary.awardedScore || 0)),
+    hundredStage: Math.max(0, Number(summary.hundredStage || 0)),
+    hundredRunCompleted: summary.hundredRunCompleted === true,
+  };
+}
+
+function safeTwoPlayerFinishSample(elapsedMs, roundCountValue = 1) {
+  const parsedElapsedMs = Number(elapsedMs);
+  if (!Number.isFinite(parsedElapsedMs) || parsedElapsedMs <= 0) return null;
+  const roundCount = normalizeRoundCount(roundCountValue);
+  return Math.max(1, Math.min(Math.floor(parsedElapsedMs / roundCount), 2 * 60 * 1000));
+}
+
+async function applyTwoPlayerBotRewardsInTransaction(
+  client,
+  playerId,
+  rewards,
+  { finishElapsedMs = null, finishRoundCount = 1 } = {}
+) {
+  // Tek full state kilidi hem mevcut score/progress değerlerini hem de bakım normalizasyonlarını verir.
+  // Sonrasında ayrı finish UPDATE + score UPDATE + XP UPDATE + final full-state SELECT yerine
+  // score/progress değişikliklerini tek CTE statement'ında uygularız.
+  const before = await readAuthoritativePlayerState(client, playerId);
+  const safeXpDelta = Math.max(0, Math.min(Number(rewards?.xpDelta || 0), 2_000_000_000));
+  const totalXpAfter = Math.min(2_000_000_000, Math.max(0, Number(before.totalXp || 0)) + safeXpDelta);
+  const levelSettlement = calculateLevelMilestoneSettlement(
+    totalXpAfter,
+    before.levelRewardClaimedThrough
+  );
+  const gameGeneralDelta = Number(rewards?.generalDelta || 0);
+  const persistedGeneralDelta = gameGeneralDelta + levelSettlement.generalDelta;
+  const finishSampleMs = safeTwoPlayerFinishSample(finishElapsedMs, finishRoundCount);
+
+  const progressNeedsUpdate =
+    safeXpDelta > 0 ||
+    levelSettlement.diamondDelta > 0 ||
+    levelSettlement.claimedThroughLevel !== before.levelRewardClaimedThrough ||
+    finishSampleMs !== null;
+
+  if (persistedGeneralDelta !== 0 || progressNeedsUpdate) {
+    const monthKey = currentMonthKey();
+    // Score + XP/finish/level progress tek PostgreSQL statement/round-trip. Score değişmiyorsa
+    // score_update CTE'si 0 satır, progress değişmiyorsa final UPDATE 0 satır etkiler.
+    await client.query(
+      `WITH score_update AS (
+         UPDATE player_scores
+         SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+             monthly_general_score = CASE
+               WHEN monthly_key = $8 THEN
+                 GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+               ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+             END,
+             monthly_infinite_score = CASE WHEN monthly_key = $8 THEN monthly_infinite_score ELSE 0 END,
+             monthly_key = $8,
+             monthly_updated_at = NOW(),
+             updated_at = NOW()
+         WHERE player_id = $1 AND $2::bigint <> 0
+         RETURNING player_id
+       )
+       UPDATE player_progress
+       SET total_xp = $3,
+           diamond_balance = LEAST(diamond_balance + $4, 2000000000),
+           level_reward_claimed_through = $5,
+           two_player_finish_count = LEAST(
+             two_player_finish_count + CASE WHEN $6::bigint IS NULL THEN 0 ELSE 1 END,
+             2000000000
+           ),
+           two_player_finish_total_ms = LEAST(
+             two_player_finish_total_ms + COALESCE($6::bigint, 0),
+             9223372036854775807::bigint
+           ),
+           updated_at = NOW()
+       WHERE player_id = $1 AND $7::boolean`,
+      [
+        playerId,
+        persistedGeneralDelta,
+        totalXpAfter,
+        levelSettlement.diamondDelta,
+        levelSettlement.claimedThroughLevel,
+        finishSampleMs,
+        progressNeedsUpdate,
+        monthKey,
+      ]
+    );
+  }
+
+  return {
+    ...before,
+    generalScore: Math.max(0, Math.min(2_000_000_000, Number(before.generalScore || 0) + persistedGeneralDelta)),
+    totalXp: totalXpAfter,
+    diamondBalance: Math.max(0, Math.min(2_000_000_000,
+      Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: levelSettlement,
+    generalDelta: gameGeneralDelta,
+    infiniteDelta: 0,
+    xpDelta: safeXpDelta,
+  };
+}
+
 async function settleTwoPlayerBotChallengeAsDrawInTransaction(
   client,
   challenge,
@@ -3155,7 +3674,7 @@ async function settleTwoPlayerBotChallengeAsDrawInTransaction(
     `UPDATE secure_game_challenges
      SET completed_at = NOW(), result = $2::jsonb
      WHERE challenge_id = $1 AND completed_at IS NULL`,
-    [challenge.challenge_id, JSON.stringify({ status: "completed", response })]
+    [challenge.challenge_id, JSON.stringify(compactChallengeResult(response))]
   );
   return response;
 }
@@ -3177,11 +3696,9 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
     };
   } else {
     const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
-    await applyLeaderboardScoreDeltaInTransaction(client, playerId, rewards.generalDelta, 0);
-    const state = await readAuthoritativePlayerState(client, playerId);
+    const state = await applyTwoPlayerBotRewardsInTransaction(client, playerId, rewards);
     response = {
       ok: true,
-      ...rewards,
       ...state,
       won: false,
       outcomeReason: "player_forfeit",
@@ -3199,7 +3716,7 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
   await client.query(
     `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb
      WHERE challenge_id = $1 AND completed_at IS NULL`,
-    [challenge.challenge_id, JSON.stringify({ status: "completed", response })]
+    [challenge.challenge_id, JSON.stringify(compactChallengeResult(response))]
   );
   return response;
 }
@@ -3585,16 +4102,6 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
   // Yeni aggregate görev durumunu da PGS hesabına birleştir. Eski ham event'ler helper içinde
   // yalnızca bir kez içeri alınır; bundan sonra geçmiş taraması yapılmaz.
   await mergeTaskAggregateStateForGuest(client, guestId, playGamesPlayerId);
-
-  await client.query(
-    `INSERT INTO player_task_claims
-       (player_id, period_type, period_key, task_code, reward_score, reward_diamonds, claimed_at)
-     SELECT $2, period_type, period_key, task_code, reward_score, reward_diamonds, claimed_at
-     FROM player_task_claims
-     WHERE player_id = $1
-     ON CONFLICT (player_id, period_type, period_key, task_code) DO NOTHING`,
-    [guestId, playGamesPlayerId]
-  );
 
   // Kopyalama tamamlandıktan sonra eski guest player satırı silinir; FK'li eski satırlar cascade olur.
   await client.query(`DELETE FROM players WHERE player_id = $1`, [guestId]);
@@ -4074,25 +4581,28 @@ app.post("/game-session/release", requireAuth, async (req, res) => {
 app.get("/player/state", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   const playerId = req.auth.sub;
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    // readAuthoritativePlayerState eksik/eski oyuncuda kendi fallback ensure akışını yapar;
-    // normal kullanıcıda fazladan ensure SELECT'i gönderme.
-    // Normal durumda tek authoritative state SELECT'i yeterlidir. Önce ayrı hundred_active
-    // SELECT ... FOR UPDATE yapma; yalnız gerçekten aktif abandoned run varsa forfeit akışına gir.
-    const initialState = await readAuthoritativePlayerState(client, playerId);
-    const shouldSettleAbandonedHundred = initialState.hundred?.active === true;
-    const state = shouldSettleAbandonedHundred
-      ? await forfeitHundredRunInTransaction(client, playerId)
-      : initialState;
-    await client.query("COMMIT");
+    // Common path: transaction/FOR UPDATE olmadan tek SELECT. Hak reset/refill veya seviye ödülü
+    // gerçekten yazılacaksa helper yalnız o durumda kilitli bakım yoluna düşer.
+    const initialState = await readAuthoritativePlayerStateReadMostly(playerId);
+    const shouldSettleAbandonedHundred = initialState?.hundred?.active === true;
+    let state = initialState;
+    if (shouldSettleAbandonedHundred) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        state = await forfeitHundredRunInTransaction(client, playerId);
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
     res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state });
   } catch (error) {
-    await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Oyuncu durumu yüklenemedi.", "player state error:");
-  } finally {
-    client.release();
   }
 });
 
@@ -4162,15 +4672,16 @@ app.post("/game/hundred/start", requireAuth, requireGameplaySession, async (req,
       : Math.max(1, Math.min(Number(access.stage || 1), 12));
     const difficulty = hundredDifficultyForStage(stage);
     const puzzle = generateSecurePuzzle(difficulty);
+    // Eski aktif 100 kişilik challenge'ı kapatma + yenisini eklemeyi tek DB round-trip'te yap.
     await client.query(
-      `UPDATE secure_game_challenges
-       SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
-       WHERE player_id = $1 AND mode = 'hundred' AND completed_at IS NULL`,
-      [req.auth.sub]
-    );
-    await client.query(
-      `INSERT INTO secure_game_challenges
-       (challenge_id, player_id, mode, difficulty, stage, puzzle, expires_at)
+      `WITH superseded AS (
+         UPDATE secure_game_challenges
+         SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
+         WHERE player_id = $2 AND mode = 'hundred' AND completed_at IS NULL
+         RETURNING challenge_id
+       )
+       INSERT INTO secure_game_challenges
+         (challenge_id, player_id, mode, difficulty, stage, puzzle, expires_at)
        VALUES ($1, $2, 'hundred', $3, $4, $5::jsonb,
                NOW() + ($6 * INTERVAL '1 millisecond'))`,
       [challengeId, req.auth.sub, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
@@ -4210,17 +4721,11 @@ app.post("/game/hundred/forfeit", requireAuth, async (req, res) => {
 
 app.post("/game/tournament/state", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
-    await client.query("COMMIT");
+    const state = await readAuthoritativePlayerStateReadMostly(req.auth.sub);
     res.json({ ok: true, ...state });
   } catch (error) {
-    await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Turnuva durumu alınamadı.", "tournament state error:");
-  } finally {
-    client.release();
   }
 });
 
@@ -4311,6 +4816,8 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
     }
 
     let stakePoints = 0;
+    let finishProfile = null;
+    let tournamentResponse = null;
     if (!tournamentMode) {
       // consumeGameRightInTransaction skor + hak satırını aynı SELECT'te kilitler ve generalScore'u döndürür.
       // open_table için ayrı SELECT yok; stake doğrulaması başarısız olursa transaction hak UPDATE'ini rollback eder.
@@ -4325,6 +4832,8 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
         assertOpenTableStake(req.body.wagerPoints, consumed.generalScore, requestedDifficulty);
       }
       stakePoints = consumed.stakePoints;
+      finishProfile = consumed.finishProfile;
+      tournamentResponse = consumed.tournamentResponse;
     }
 
     let stage = 1;
@@ -4368,7 +4877,9 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
 
     if (tournamentMode) {
       const progressResult = await client.query(
-        `SELECT tournament_stage, tournament_rights, tournament_completed, tournament_entry_active
+        `SELECT tournament_stage, tournament_rights, tournament_bank, tournament_completed,
+                tournament_tickets, tournament_entry_active,
+                two_player_finish_count, two_player_finish_total_ms
          FROM player_progress WHERE player_id = $1 FOR UPDATE`,
         [req.auth.sub]
       );
@@ -4384,14 +4895,23 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
       }
       stage = Math.max(1, Math.min(Number(progress.tournament_stage || 1), 8));
       difficulty = "Standard";
+      finishProfile = normalizeTwoPlayerFinishProfile({
+        finishCount: progress.two_player_finish_count,
+        finishTotalMs: progress.two_player_finish_total_ms,
+      });
+      tournamentResponse = {
+        currentStage: stage,
+        remainingRights: Math.max(0, Math.min(Number(progress.tournament_rights ?? 3), 3)),
+        totalScore: Math.max(0, Number(progress.tournament_bank || 0)),
+        completed: progress.tournament_completed === true,
+        tickets: Math.max(0, Number(progress.tournament_tickets || 0)),
+        ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
+        entryActive: progress.tournament_entry_active === true,
+      };
     }
 
     const puzzle = generateSecurePuzzle(difficulty);
-    const finishProfile = await readTwoPlayerFinishProfileInTransaction(
-      client,
-      req.auth.sub
-    );
-    const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile);
+    const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile || {});
     await client.query(
       `INSERT INTO secure_game_challenges
        (challenge_id, player_id, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
@@ -4400,7 +4920,6 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
       [challengeId, req.auth.sub, challengeMode, difficulty, stage,
        JSON.stringify(puzzle), stakePoints, lifetimeMs, JSON.stringify({ status: "active", plan, matchMode })]
     );
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({
       ok: true,
@@ -4412,7 +4931,7 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
       leaveMs: plan.leaveMs,
       stakePoints,
       matchMode,
-      tournament: state.tournament,
+      tournament: tournamentResponse,
       expiresAtMillis: Date.now() + lifetimeMs,
     });
   } catch (error) {
@@ -4515,7 +5034,11 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
     }
     const challenge = result.rows[0];
     if (challenge.completed_at) {
-      const previousResponse = challenge.result?.response;
+      const previousResponse = await rebuildStoredChallengeResponseInTransaction(
+        client,
+        req.auth.sub,
+        challenge.result
+      );
       if (previousResponse) {
         await client.query("COMMIT");
         res.json(previousResponse);
@@ -4538,14 +5061,6 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
     }
     if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators)) {
       const error = new Error("İşlem sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
-    }
-    if (challenge.mode === "two_player_bot") {
-      // Yalnızca sunucuda doğrulanmış normal ikili oyun çözümleri ortalamaya eklenir.
-      await recordTwoPlayerFinishTimeInTransaction(
-        client,
-        req.auth.sub,
-        elapsedServerMs
-      );
     }
     let won = null;
     let outcomeReason = null;
@@ -4579,7 +5094,7 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
       };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
-        [challengeId, JSON.stringify({ status: "completed", response })]
+        [challengeId, JSON.stringify(compactChallengeResult(response))]
       );
       await client.query("COMMIT");
       res.json(response);
@@ -4611,7 +5126,7 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
       };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
-        [challengeId, JSON.stringify({ status: "completed", response })]
+        [challengeId, JSON.stringify(compactChallengeResult(response))]
       );
       await client.query("COMMIT");
       res.json(response);
@@ -4620,6 +5135,7 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
 
 
     let infiniteRunScore = 0;
+    let state;
     if (challenge.mode === "infinite") {
       const progressUpdate = await client.query(
         `UPDATE player_progress
@@ -4638,22 +5154,16 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
         rewards.generalDelta,
         infiniteRunScore
       );
+      state = await readAuthoritativePlayerState(client, req.auth.sub);
     } else {
-      await applyLeaderboardScoreDeltaInTransaction(
+      // Normal bot sonucu: finish profili + XP + level milestone + score değişimini tek hot-path helper'ında
+      // uygula; eski ayrı finish UPDATE + XP UPDATE + final full-state SELECT zinciri yoktur.
+      state = await applyTwoPlayerBotRewardsInTransaction(
         client,
         req.auth.sub,
-        rewards.generalDelta,
-        0
+        rewards,
+        { finishElapsedMs: elapsedServerMs }
       );
-      await client.query(
-        `UPDATE player_progress
-         SET total_xp = LEAST(total_xp + $2, 2000000000), updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.xpDelta]
-      );
-    }
-
-    if (challenge.mode === "two_player_bot") {
       await recordTaskEventInTransaction(client, {
         playerId: req.auth.sub,
         sourceKey: `challenge:${challengeId}`,
@@ -4663,11 +5173,12 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
         won: won === true,
       });
     }
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
     const response = {
       ok: true,
-      ...rewards,
       ...state,
+      generalDelta: Number(rewards.generalDelta || 0),
+      infiniteDelta: Number(rewards.infiniteDelta || 0),
+      xpDelta: Number(rewards.xpDelta || 0),
       runScore: Number(state.runScore || infiniteRunScore || 0),
       won,
       outcomeReason,
@@ -4675,7 +5186,7 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
     };
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
-      [challengeId, JSON.stringify({ status: "completed", response })]
+      [challengeId, JSON.stringify(compactChallengeResult(response))]
     );
     await client.query("COMMIT");
     res.json(response);
@@ -4713,7 +5224,11 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
     }
     const challenge = result.rows[0];
     if (challenge.completed_at) {
-      const previousResponse = challenge.result?.response;
+      const previousResponse = await rebuildStoredChallengeResponseInTransaction(
+        client,
+        req.auth.sub,
+        challenge.result
+      );
       if (previousResponse) {
         await client.query("COMMIT");
         res.json(previousResponse);
@@ -4758,23 +5273,13 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
       );
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, outcome.won === true, challenge.wager_points);
-      await applyLeaderboardScoreDeltaInTransaction(
-        client,
-        req.auth.sub,
-        rewards.generalDelta,
-        0
-      );
-      await client.query(
-        `UPDATE player_progress
-         SET total_xp = LEAST(total_xp + $2, 2000000000), updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.xpDelta]
-      );
-      const state = await readAuthoritativePlayerState(client, req.auth.sub);
+      const state = await applyTwoPlayerBotRewardsInTransaction(client, req.auth.sub, rewards);
       response = {
         ok: true,
-        ...rewards,
         ...state,
+        generalDelta: rewards.generalDelta,
+        infiniteDelta: 0,
+        xpDelta: rewards.xpDelta,
         won: outcome.won,
         outcomeReason: outcome.reason,
         elapsedServerMs,
@@ -4795,7 +5300,7 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
         `UPDATE secure_game_challenges
          SET completed_at = NOW(), result = $2::jsonb
          WHERE challenge_id = $1`,
-        [challengeId, JSON.stringify({ status: "completed", response })]
+        [challengeId, JSON.stringify(compactChallengeResult(response))]
       );
     }
     await client.query("COMMIT");
@@ -4829,10 +5334,20 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       const error = new Error("Bot eşleşmesi bulunamadı."); error.statusCode = 404; throw error;
     }
     const challenge = result.rows[0];
-    if (challenge.completed_at && challenge.result?.response) {
-      await client.query("COMMIT");
-      res.json(challenge.result.response);
-      return;
+    if (challenge.completed_at) {
+      const previousResponse = await rebuildStoredChallengeResponseInTransaction(
+        client,
+        req.auth.sub,
+        challenge.result
+      );
+      if (previousResponse) {
+        await client.query("COMMIT");
+        res.json(previousResponse);
+        return;
+      }
+      const error = new Error("Bu bot eşleşmesi daha önce sonuçlandı.");
+      error.statusCode = 409;
+      throw error;
     }
     const elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime());
     let response;
@@ -4850,17 +5365,13 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       };
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
-      await applyLeaderboardScoreDeltaInTransaction(
-        client,
-        req.auth.sub,
-        rewards.generalDelta,
-        0
-      );
-      const state = await readAuthoritativePlayerState(client, req.auth.sub);
+      const state = await applyTwoPlayerBotRewardsInTransaction(client, req.auth.sub, rewards);
       response = {
         ok: true,
-        ...rewards,
         ...state,
+        generalDelta: rewards.generalDelta,
+        infiniteDelta: 0,
+        xpDelta: rewards.xpDelta,
         won: false,
         outcomeReason: "player_forfeit",
         elapsedServerMs,
@@ -4876,7 +5387,7 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
     });
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
-      [challengeId, JSON.stringify({ status: "completed", response })]
+      [challengeId, JSON.stringify(compactChallengeResult(response))]
     );
     await client.query("COMMIT");
     res.json(response);
@@ -4892,24 +5403,21 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
 
 app.get("/tasks/state", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    const taskCenter = await readTaskCenterState(client, req.auth.sub);
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
-    await client.query("COMMIT");
+    // Claim tablosu kaldırıldığı için görev merkezi common path'te tek task-state SELECT +
+    // tek read-mostly player-state SELECT ile, transaction açmadan yüklenebilir.
+    const taskCenter = await readTaskCenterStateReadMostly(req.auth.sub);
+    const state = await readAuthoritativePlayerStateReadMostly(req.auth.sub);
     res.json({ ok: true, taskCenter, ...state });
   } catch (error) {
-    await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Görevler yüklenemedi.", "task state error:");
-  } finally {
-    client.release();
   }
 });
 
 app.post("/tasks/login", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   const client = await pool.connect();
+  let taskCenter;
   try {
     await client.query("BEGIN");
     const daily = taskPeriodInfo("daily");
@@ -4918,19 +5426,25 @@ app.post("/tasks/login", requireAuth, async (req, res) => {
       sourceKey: `login:${daily.key}`,
       eventType: "login",
     });
-    const taskCenter = await buildTaskCenterStateFromAggregate(
+    taskCenter = await buildTaskCenterStateFromAggregate(
       client,
       req.auth.sub,
       aggregate || taskAggregateSkeleton()
     );
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
     await client.query("COMMIT");
-    res.json({ ok: true, taskCenter, ...state });
   } catch (error) {
     await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Günlük giriş görevi kaydedilemedi.", "task login error:");
+    return;
   } finally {
     client.release();
+  }
+
+  try {
+    const state = await readAuthoritativePlayerStateReadMostly(req.auth.sub);
+    res.json({ ok: true, taskCenter, ...state });
+  } catch (error) {
+    sendLeaderboardError(res, error, "Günlük giriş görevi kaydedildi ancak oyuncu durumu yüklenemedi.", "task login state error:");
   }
 });
 
@@ -5766,7 +6280,7 @@ async function resolveRoomByGameDeadline(roomId) {
     console.error("realtime game deadline reward error:", error);
   }
 
-  console.log("Realtime match deadline reached:", roomId, room.gameKey);
+  realtimeLog("Realtime match deadline reached:", roomId, room.gameKey);
 }
 
 function resolveRoomByAwayTimeout(
@@ -5841,7 +6355,7 @@ function resolveRoomByAwayTimeout(
     );
   }
 
-  console.log(
+  realtimeLog(
     "Reconnect timeout loss:",
     roomId,
     loserPlayerId
@@ -6565,7 +7079,7 @@ app.get(
 io.engine.on(
   "connection_error",
   (err) => {
-    console.log(
+    realtimeLog(
       "Engine.IO connection_error:",
       {
         code: err.code,
@@ -6592,7 +7106,7 @@ io.engine.on(
 io.engine.on(
   "connection",
   (rawSocket) => {
-    console.log(
+    realtimeLog(
       "Engine.IO connected:",
       rawSocket.id,
       "transport:",
@@ -6787,7 +7301,7 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
 });
 
 io.on("connection", (socket) => {
-  console.log(
+  realtimeLog(
     "Socket connected:",
     socket.id,
     "transport:",
@@ -6820,7 +7334,7 @@ io.on("connection", (socket) => {
   socket.conn.on(
     "upgrade",
     (transport) => {
-      console.log(
+      realtimeLog(
         "Socket upgraded:",
         socket.id,
         "transport:",
@@ -7196,7 +7710,7 @@ io.on("connection", (socket) => {
           puzzle: room.puzzle, stakePoints: selectedStake, matchMode: opponent.matchMode || matchMode,
           startsAtMillis: room.startsAtMillis, roundCount: room.roundCount, roundIndex: room.roundIndex, isBot: false
         });
-        console.log("Match found:", room.roomId, key, "stake:", selectedStake);
+        realtimeLog("Match found:", room.roomId, key, "stake:", selectedStake);
         return;
       }
 
@@ -7373,7 +7887,7 @@ io.on("connection", (socket) => {
         }
       );
 
-      console.log(
+      realtimeLog(
         "Match resumed:",
         room.roomId,
         participant.playerId,
@@ -7432,7 +7946,7 @@ io.on("connection", (socket) => {
         participant.playerId
       );
 
-      console.log(
+      realtimeLog(
         "Player backgrounded:",
         roomId,
         participant.playerId
@@ -7503,7 +8017,7 @@ io.on("connection", (socket) => {
         participant.playerId
       );
 
-      console.log(
+      realtimeLog(
         "Player foregrounded:",
         roomId,
         participant.playerId
@@ -7570,7 +8084,7 @@ io.on("connection", (socket) => {
         }
       );
 
-      console.log(
+      realtimeLog(
         "Friend room created:",
         roomCode,
         socket.id,
@@ -7736,7 +8250,7 @@ io.on("connection", (socket) => {
         }
       );
 
-      console.log(
+      realtimeLog(
         "Friend match found:",
         roomCode,
         realtimeRoom.roomId,
@@ -7792,7 +8306,7 @@ io.on("connection", (socket) => {
   socket.on(
     "disconnect",
     (reason) => {
-      console.log(
+      realtimeLog(
         "Socket disconnected:",
         socket.id,
         reason
@@ -7873,6 +8387,64 @@ async function migrateAndDropLegacyTaskEvents() {
   );
 }
 
+async function migrateAndDropLegacyTaskClaims() {
+  if (!pool) return;
+  const exists = await pool.query(
+    `SELECT to_regclass('public.player_task_claims') AS table_name`
+  );
+  if (!exists.rows[0]?.table_name) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Eski ayrı claim satırlarından yalnız hâlen aktif olan günlük/haftalık/aylık dönemi taşı.
+    // Geçmiş dönem claim'leri artık hiçbir kararı etkilemediği için tarihsel satırları kopyalamak gerekmez.
+    for (const { periodType, keyColumn, stateColumn } of [
+      { periodType: 'daily', keyColumn: 'daily_key', stateColumn: 'daily_state' },
+      { periodType: 'weekly', keyColumn: 'weekly_key', stateColumn: 'weekly_state' },
+      { periodType: 'monthly', keyColumn: 'monthly_key', stateColumn: 'monthly_state' },
+    ]) {
+      await client.query(
+        `UPDATE player_task_state AS pts
+         SET ${stateColumn} = jsonb_set(
+               COALESCE(pts.${stateColumn}, '{}'::jsonb),
+               '{claimed}',
+               COALESCE((
+                 SELECT jsonb_object_agg(c.task_code, to_jsonb(TRUE))
+                 FROM player_task_claims c
+                 WHERE c.player_id = pts.player_id
+                   AND c.period_type = $1
+                   AND c.period_key = pts.${keyColumn}
+               ), '{}'::jsonb),
+               true
+             ),
+             updated_at = NOW()
+         WHERE EXISTS (
+           SELECT 1 FROM player_task_claims c
+           WHERE c.player_id = pts.player_id
+             AND c.period_type = $1
+             AND c.period_key = pts.${keyColumn}
+         )`,
+        [periodType]
+      );
+    }
+
+    await client.query(`DROP TABLE IF EXISTS player_task_claims`);
+    await client.query(
+      `INSERT INTO schema_migrations (migration_id)
+       VALUES ('task_claims_embedded_v1_20260813')
+       ON CONFLICT (migration_id) DO NOTHING`
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // Kullanıcı isteği: 90 gün boyunca hiçbir sunucu işlemi/etkinliği olmayan unlinked guest silinir.
 const GUEST_RETENTION_DAYS = 90;
 const GUEST_ACTIVITY_TOUCH_DAYS = Math.max(
@@ -7883,25 +8455,56 @@ const GUEST_ACTIVITY_TOUCH_MS = GUEST_ACTIVITY_TOUCH_DAYS * 24 * 60 * 60_000;
 
 const CHALLENGE_RESULT_RETENTION_MS = Math.max(
   60 * 60_000,
-  Math.min(7 * 24 * 60 * 60_000, Number(process.env.CHALLENGE_RESULT_RETENTION_MS || 24 * 60 * 60_000) || 24 * 60 * 60_000)
+  Math.min(7 * 24 * 60 * 60_000, Number(process.env.CHALLENGE_RESULT_RETENTION_MS || 6 * 60 * 60_000) || 6 * 60 * 60_000)
 );
 const CHALLENGE_EXPIRED_GRACE_MS = 6 * 60 * 60_000;
-const TASK_CLAIM_RETENTION_MS = Math.max(
-  35 * 24 * 60 * 60_000,
-  Math.min(180 * 24 * 60 * 60_000, Number(process.env.TASK_CLAIM_RETENTION_MS || 45 * 24 * 60 * 60_000) || 45 * 24 * 60 * 60_000)
-);
+
+async function runDatabaseMaintenanceTask(taskKey, minIntervalMs, work) {
+  if (!pool) return { ran: false, value: null };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO maintenance_state (task_key, last_run_at)
+       VALUES ($1, TO_TIMESTAMP(0))
+       ON CONFLICT (task_key) DO NOTHING`,
+      [taskKey]
+    );
+    const gate = await client.query(
+      `SELECT last_run_at FROM maintenance_state WHERE task_key = $1 FOR UPDATE`,
+      [taskKey]
+    );
+    const lastRunMillis = new Date(gate.rows[0]?.last_run_at || 0).getTime();
+    if (Number.isFinite(lastRunMillis) && Date.now() - lastRunMillis < minIntervalMs) {
+      await client.query('COMMIT');
+      return { ran: false, value: null };
+    }
+    const value = await work(client);
+    await client.query(
+      `UPDATE maintenance_state SET last_run_at = NOW() WHERE task_key = $1`,
+      [taskKey]
+    );
+    await client.query('COMMIT');
+    return { ran: true, value };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 async function cleanupPersistentEphemeralData() {
   if (!pool) return;
   try {
-    await Promise.all([
-      pool.query(
+    await runDatabaseMaintenanceTask('secure_challenge_cleanup', 2 * 60 * 60_000, (client) =>
+      client.query(
         `DELETE FROM secure_game_challenges
          WHERE (completed_at IS NOT NULL AND completed_at < NOW() - ($1 * INTERVAL '1 millisecond'))
             OR (completed_at IS NULL AND expires_at < NOW() - ($2 * INTERVAL '1 millisecond'))`,
         [CHALLENGE_RESULT_RETENTION_MS, CHALLENGE_EXPIRED_GRACE_MS]
-      ),
-    ]);
+      )
+    );
   } catch (error) {
     console.error("ephemeral PostgreSQL cleanup error:", error);
   }
@@ -7911,9 +8514,9 @@ async function cleanupStaleGuestAccounts() {
   if (!pool) return;
   try {
     // Yalnız PGS'ye bağlanmamış guest hesapları silinir. Son etkinlik; credential coarse-touch,
-    // profil/skor/progress/görev güncellemeleri, task claim, challenge ve gameplay session zamanlarının
-    // en yenisidir. Aktif session/challenge varsa hesap hiçbir koşulda silinmez.
-    const result = await pool.query(
+    // profil/skor/progress/görev/challenge ve gameplay session zamanlarının en yenisidir.
+    // maintenance_state kapısı nedeniyle restart veya çoklu instance ağır sorguyu tekrar çalıştırmaz.
+    const maintenance = await runDatabaseMaintenanceTask('stale_guest_cleanup', 24 * 60 * 60_000, (client) => client.query(
       `WITH stale AS (
          SELECT gc.guest_id
          FROM guest_credentials gc
@@ -7931,11 +8534,6 @@ async function cleanupStaleGuestAccounts() {
              ps.updated_at,
              pp.updated_at,
              COALESCE(pts.updated_at, '1970-01-01'::timestamptz),
-             COALESCE((
-               SELECT MAX(cl.claimed_at)
-               FROM player_task_claims cl
-               WHERE cl.player_id = gc.guest_id
-             ), '1970-01-01'::timestamptz),
              COALESCE((
                SELECT MAX(GREATEST(ch.created_at, COALESCE(ch.completed_at, ch.created_at)))
                FROM secure_game_challenges ch
@@ -7969,25 +8567,13 @@ async function cleanupStaleGuestAccounts() {
        WHERE gc.guest_id = s.guest_id
        RETURNING gc.guest_id`,
       [GUEST_RETENTION_DAYS]
-    );
-    if (result.rowCount > 0) {
+    ));
+    const result = maintenance.value;
+    if (maintenance.ran && result?.rowCount > 0) {
       console.log(`Stale guest cleanup: ${result.rowCount} hesap silindi (${GUEST_RETENTION_DAYS}+ gün).`);
     }
   } catch (error) {
     console.error('stale guest cleanup error:', error);
-  }
-}
-
-async function cleanupOldTaskClaims() {
-  if (!pool) return;
-  try {
-    await pool.query(
-      `DELETE FROM player_task_claims
-       WHERE claimed_at < NOW() - ($1 * INTERVAL '1 millisecond')`,
-      [TASK_CLAIM_RETENTION_MS]
-    );
-  } catch (error) {
-    console.error("task claims cleanup error:", error);
   }
 }
 
@@ -8007,10 +8593,6 @@ setInterval(() => {
 }, 2 * 60 * 60_000).unref();
 
 setInterval(() => {
-  cleanupOldTaskClaims();
-}, 6 * 60 * 60_000).unref();
-
-setInterval(() => {
   cleanupStaleGuestAccounts();
 }, 24 * 60 * 60_000).unref();
 
@@ -8024,14 +8606,16 @@ assertSecurityEnvironment();
 initDatabase()
   .then(async () => {
     await migrateAndDropLegacyTaskEvents();
-    cleanupPersistentEphemeralData();
-    cleanupOldTaskClaims();
-    cleanupStaleGuestAccounts();
+    await migrateAndDropLegacyTaskClaims();
     server.listen(
       PORT,
       "0.0.0.0",
       () => {
         console.log(`Target number matchmaking server running on port ${PORT}`);
+        // Ağır bakım sorguları servis açılışını geciktirmez. DB'deki zaman kapısı aynı işi
+        // restart/çoklu instance durumunda yeniden çalıştırmayı engeller.
+        cleanupPersistentEphemeralData();
+        cleanupStaleGuestAccounts();
       }
     );
   })
