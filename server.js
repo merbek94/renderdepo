@@ -514,17 +514,6 @@ async function initDatabase() {
     ALTER TABLE secure_game_challenges
       ADD COLUMN IF NOT EXISTS wager_points INTEGER NOT NULL DEFAULT 0;
 
-    CREATE TABLE IF NOT EXISTS player_task_events (
-      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
-      source_key TEXT NOT NULL,
-      event_type TEXT NOT NULL CHECK (event_type IN ('login', 'game')),
-      game_key TEXT,
-      multiplayer BOOLEAN NOT NULL DEFAULT FALSE,
-      won BOOLEAN NOT NULL DEFAULT FALSE,
-      occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (player_id, source_key)
-    );
-
     -- Yeni görev mimarisi: geçmiş event taramak yerine oyuncu başına tek aggregate satır.
     CREATE TABLE IF NOT EXISTS player_task_state (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
@@ -552,8 +541,6 @@ async function initDatabase() {
       PRIMARY KEY (player_id, period_type, period_key, task_code)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_task_events_player_time
-      ON player_task_events (player_id, occurred_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_claims_claimed_at
       ON player_task_claims (claimed_at);
 
@@ -970,7 +957,9 @@ async function loadTaskAggregateStateForUpdate(
   now = new Date(),
   playerAlreadyEnsured = false
 ) {
-  if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
+  // requireAuth / socket kimlik doğrulaması oyuncu ana satırlarının varlığını garanti eder.
+  // Burada her görev eventinde ayrıca ensure JOIN/SELECT gönderme.
+  void playerAlreadyEnsured;
   let current = await client.query(
     `SELECT daily_key, daily_state, weekly_key, weekly_state,
             monthly_key, monthly_state, game_totals, recent_sources
@@ -997,21 +986,10 @@ async function loadTaskAggregateStateForUpdate(
     return normalizeTaskAggregateRow(current.rows[0], now);
   }
 
-  // Eski sürümden kalan ham event'leri bu oyuncu için yalnızca bir kez aggregate state'e taşı.
-  const legacy = await client.query(
-    `SELECT source_key, event_type, game_key, multiplayer, won, occurred_at
-     FROM player_task_events
-     WHERE player_id = $1
-     ORDER BY occurred_at ASC`,
-    [playerId]
-  );
-  const aggregate = aggregateLegacyTaskEvents(legacy.rows, now);
+  // Legacy ham event tablosu startup migrasyonunda tek seferlik taşınıp kaldırılır.
+  // Yeni oyuncuda doğrudan boş aggregate state oluştur.
+  const aggregate = taskAggregateSkeleton(now);
   await persistTaskAggregateState(client, playerId, aggregate);
-
-  if (legacy.rowCount > 0) {
-    // Aggregate başarıyla yazıldıktan sonra bu oyuncunun eski ham event geçmişi artık gereksizdir.
-    await client.query(`DELETE FROM player_task_events WHERE player_id = $1`, [playerId]);
-  }
   return aggregate;
 }
 
@@ -1029,7 +1007,7 @@ async function recordTaskEventInTransaction(client, {
     now,
     playerAlreadyEnsured
   );
-  if ((aggregate.recentSources || []).includes(sourceHash)) return false;
+  if ((aggregate.recentSources || []).includes(sourceHash)) return aggregate;
   aggregate.recentSources = [...(aggregate.recentSources || []), sourceHash]
     .slice(-TASK_RECENT_SOURCE_LIMIT);
 
@@ -1042,7 +1020,7 @@ async function recordTaskEventInTransaction(client, {
   await persistTaskAggregateState(client, playerId, aggregate, {
     writeGameTotals: eventType === "game",
   });
-  return true;
+  return aggregate;
 }
 
 async function recordTaskGameEvent(playerId, sourceKey, gameKey, multiplayer, won) {
@@ -1067,11 +1045,7 @@ function favoriteTaskGameKey(gameTotals) {
     .sort((a, b) => Number(b[1]) - Number(a[1]) || String(a[0]).localeCompare(String(b[0])))[0]?.[0] || null;
 }
 
-async function readTaskCenterState(client, playerId, forUpdate = false) {
-  const now = new Date();
-  const aggregate = forUpdate
-    ? await loadTaskAggregateStateForUpdate(client, playerId, now)
-    : await readTaskAggregateState(client, playerId, now);
+async function buildTaskCenterStateFromAggregate(client, playerId, aggregate, now = new Date()) {
   const favoriteGameKey = favoriteTaskGameKey(aggregate.gameTotals);
   const periods = ["daily", "weekly", "monthly"].map((type) => taskPeriodInfo(type, now));
   const claimsResult = await client.query(
@@ -1140,6 +1114,14 @@ async function readTaskCenterState(client, playerId, forUpdate = false) {
   return { serverNowMillis: now.getTime(), periods: periodStates };
 }
 
+async function readTaskCenterState(client, playerId, forUpdate = false) {
+  const now = new Date();
+  const aggregate = forUpdate
+    ? await loadTaskAggregateStateForUpdate(client, playerId, now)
+    : await readTaskAggregateState(client, playerId, now);
+  return buildTaskCenterStateFromAggregate(client, playerId, aggregate, now);
+}
+
 function mergeTaskCountMaps(a, b) {
   const out = safeTaskCountMap(a);
   for (const [key, count] of Object.entries(safeTaskCountMap(b))) {
@@ -1201,6 +1183,7 @@ async function claimTaskRewardInTransaction(client, playerId, periodType, taskCo
      RETURNING task_code`,
     [playerId, type, period.key, taskCode, rewardScore, rewardDiamonds]
   );
+  let updatedTaskCenter = taskCenter;
   if (inserted.rowCount > 0) {
     if (rewardScore > 0) await addPositiveGeneralAndXpInTransaction(client, playerId, rewardScore, 0);
     if (rewardDiamonds > 0) {
@@ -1210,7 +1193,21 @@ async function claimTaskRewardInTransaction(client, playerId, periodType, taskCo
         [playerId, rewardDiamonds]
       );
     }
+    updatedTaskCenter = {
+      ...taskCenter,
+      periods: taskCenter.periods.map((item) => {
+        if (item.type !== type) return item;
+        if (isMaster) return { ...item, masterClaimed: true };
+        return {
+          ...item,
+          tasks: item.tasks.map((entry) =>
+            entry.code === taskCode ? { ...entry, claimed: true } : entry
+          ),
+        };
+      }),
+    };
   }
+  return updatedTaskCenter;
 }
 
 function timestampMillis(value) {
@@ -1919,7 +1916,6 @@ function normalizeRequestedStake(value, difficulty, availableScore, allowAutomat
 }
 
 async function assertTwoPlayerEntryScoreInTransaction(client, playerId, difficulty, wagerPoints = 0, allowAutomatic = false) {
-  await ensureAuthenticatedPlayer(client, playerId);
   const result = await client.query(
     `SELECT general_score FROM player_scores WHERE player_id = $1 FOR UPDATE`,
     [playerId]
@@ -1980,7 +1976,6 @@ async function consumeGameRightsForPlayers(playerIds, difficulty, wagerPoints = 
 }
 
 async function refundGameRightInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
   const state = await normalizeGameRightsInTransaction(client, playerId, true);
   const refunded = Math.min(GAME_RIGHT_MAX, state.remainingRights + 1);
   const anchor = refunded >= GAME_RIGHT_MAX
@@ -2213,7 +2208,6 @@ async function normalizeHundredDailyAccessInTransaction(client, playerId, player
 }
 
 async function grantHundredRewardedRightInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
   // normalizeHundred... satırı zaten FOR UPDATE ile kilitliyor; aynı satırı ikinci kez SELECT etme.
   const access = await normalizeHundredDailyAccessInTransaction(client, playerId, true);
   if (access.active) {
@@ -2250,7 +2244,6 @@ async function grantHundredRewardedRightInTransaction(client, playerId) {
 }
 
 async function grantTournamentTicketInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
   await client.query(
     `UPDATE player_progress SET
        tournament_tickets = LEAST(tournament_tickets + 1, $2),
@@ -2262,7 +2255,6 @@ async function grantTournamentTicketInTransaction(client, playerId) {
 }
 
 async function enterTournamentInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
   const result = await client.query(
     `SELECT tournament_tickets, tournament_entry_active
      FROM player_progress WHERE player_id = $1 FOR UPDATE`,
@@ -2484,7 +2476,8 @@ async function applyTournamentOutcomeInTransaction(
   requestedStage,
   playerAlreadyEnsured = false
 ) {
-  if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
+  // Kimlik doğrulanmış oyun yollarında oyuncu satırı zaten vardır; preflight ensure sorgusunu atla.
+  void playerAlreadyEnsured;
   const locked = await client.query(
     `SELECT tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active
@@ -2627,7 +2620,6 @@ function hundredEliminationReward(stageValue) {
 }
 
 async function completeHundredStageInTransaction(client, playerId, stageValue) {
-  await ensureAuthenticatedPlayer(client, playerId);
   const locked = await client.query(
     `SELECT hundred_active, hundred_stage
      FROM player_progress WHERE player_id = $1 FOR UPDATE`,
@@ -2677,7 +2669,6 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
 }
 
 async function forfeitHundredRunInTransaction(client, playerId) {
-  await ensureAuthenticatedPlayer(client, playerId);
   const locked = await client.query(
     `SELECT hundred_active, hundred_stage
      FROM player_progress WHERE player_id = $1 FOR UPDATE`,
@@ -2914,7 +2905,6 @@ async function settleTwoPlayerBotChallengeAsDrawInTransaction(
   playerId,
   elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime())
 ) {
-  await ensureAuthenticatedPlayer(client, playerId);
   const state = await readAuthoritativePlayerState(client, playerId);
   const response = {
     ok: true,
@@ -3693,7 +3683,6 @@ app.post("/game-session/acquire", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, req.auth.sub);
 
     // Hibrit kural:
     // 1) Aynı cihaz -> newest wins. Eski sessionId atomik olarak yenisiyle değiştirilir.
@@ -3830,7 +3819,6 @@ app.post("/game/hundred/start", requireAuth, requireGameplaySession, async (req,
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, req.auth.sub);
     const access = await normalizeHundredDailyAccessInTransaction(client, req.auth.sub, true);
     // normalizeHundred... aynı progress satırını FOR UPDATE ile zaten okudu/kilitledi.
     const before = {
@@ -3940,7 +3928,6 @@ app.post("/game/tournament/state", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, req.auth.sub);
     const state = await readAuthoritativePlayerState(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({ ok: true, ...state });
@@ -4028,7 +4015,6 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, req.auth.sub);
     const requestedDifficulty = secureDifficulty(req.body.difficulty);
     if (!immediateBotMode) {
       await consumeBotFallbackEligibilityInTransaction(
@@ -4171,7 +4157,6 @@ app.post("/game/challenges/start", requireAuth, requireGameplaySession, async (r
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, req.auth.sub);
 
     let stage = 1;
     let difficulty = requestedDifficulty;
@@ -4196,15 +4181,16 @@ app.post("/game/challenges/start", requireAuth, requireGameplaySession, async (r
     }
 
     const puzzle = generateSecurePuzzle(difficulty);
+    // Eski challenge'ı supersede etme + yenisini oluşturmayı tek PostgreSQL statement/round-trip'te yap.
     await client.query(
-      `UPDATE secure_game_challenges
-       SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
-       WHERE player_id = $1 AND mode = $2 AND completed_at IS NULL`,
-      [req.auth.sub, mode]
-    );
-    await client.query(
-      `INSERT INTO secure_game_challenges
-       (challenge_id, player_id, mode, difficulty, stage, puzzle, expires_at)
+      `WITH superseded AS (
+         UPDATE secure_game_challenges
+         SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
+         WHERE player_id = $2 AND mode = $3 AND completed_at IS NULL
+         RETURNING challenge_id
+       )
+       INSERT INTO secure_game_challenges
+         (challenge_id, player_id, mode, difficulty, stage, puzzle, expires_at)
        VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW() + ($7 * INTERVAL '1 millisecond'))`,
       [challengeId, req.auth.sub, mode, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
     );
@@ -4350,7 +4336,6 @@ app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async
       return;
     }
 
-    await ensureAuthenticatedPlayer(client, req.auth.sub);
 
     let infiniteRunScore = 0;
     if (challenge.mode === "infinite") {
@@ -4491,7 +4476,6 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
       );
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, outcome.won === true, challenge.wager_points);
-      await ensureAuthenticatedPlayer(client, req.auth.sub);
       await applyLeaderboardScoreDeltaInTransaction(
         client,
         req.auth.sub,
@@ -4584,7 +4568,6 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       };
     } else {
       const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
-      await ensureAuthenticatedPlayer(client, req.auth.sub);
       await applyLeaderboardScoreDeltaInTransaction(
         client,
         req.auth.sub,
@@ -4648,12 +4631,16 @@ app.post("/tasks/login", requireAuth, async (req, res) => {
   try {
     await client.query("BEGIN");
     const daily = taskPeriodInfo("daily");
-    await recordTaskEventInTransaction(client, {
+    const aggregate = await recordTaskEventInTransaction(client, {
       playerId: req.auth.sub,
       sourceKey: `login:${daily.key}`,
       eventType: "login",
     });
-    const taskCenter = await readTaskCenterState(client, req.auth.sub);
+    const taskCenter = await buildTaskCenterStateFromAggregate(
+      client,
+      req.auth.sub,
+      aggregate || taskAggregateSkeleton()
+    );
     const state = await readAuthoritativePlayerState(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({ ok: true, taskCenter, ...state });
@@ -4682,8 +4669,12 @@ app.post("/tasks/claim", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await claimTaskRewardInTransaction(client, req.auth.sub, periodType, taskCode);
-    const taskCenter = await readTaskCenterState(client, req.auth.sub);
+    const taskCenter = await claimTaskRewardInTransaction(
+      client,
+      req.auth.sub,
+      periodType,
+      taskCode
+    );
     const state = await readAuthoritativePlayerState(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({ ok: true, taskCenter, ...state });
@@ -7537,6 +7528,68 @@ io.on("connection", (socket) => {
   );
 });
 
+async function migrateAndDropLegacyTaskEvents() {
+  if (!pool) return;
+
+  const exists = await pool.query(
+    `SELECT to_regclass('public.player_task_events') AS table_name`
+  );
+  if (!exists.rows[0]?.table_name) return;
+
+  const players = await pool.query(
+    `SELECT DISTINCT player_id FROM player_task_events ORDER BY player_id`
+  );
+
+  for (const row of players.rows) {
+    const playerId = String(row.player_id || "").trim();
+    if (!playerId) continue;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await ensureAuthenticatedPlayer(client, playerId);
+      const current = await client.query(
+        `SELECT daily_key, daily_state, weekly_key, weekly_state,
+                monthly_key, monthly_state, game_totals, recent_sources
+         FROM player_task_state
+         WHERE player_id = $1
+         FOR UPDATE`,
+        [playerId]
+      );
+      const legacy = await client.query(
+        `SELECT source_key, event_type, game_key, multiplayer, won, occurred_at
+         FROM player_task_events
+         WHERE player_id = $1
+         ORDER BY occurred_at ASC`,
+        [playerId]
+      );
+
+      if (legacy.rowCount > 0 && current.rowCount === 0) {
+        const aggregate = aggregateLegacyTaskEvents(legacy.rows, new Date());
+        await persistTaskAggregateState(client, playerId, aggregate);
+      } else if (legacy.rowCount > 0 && current.rowCount > 0) {
+        // Normal eski akış aggregate oluşturduktan sonra ham eventleri siliyordu.
+        // İkisi birden kalmışsa çifte sayım/ödül üretmemek için mevcut aggregate'i authoritative kabul et.
+        console.warn(`Legacy task events already have aggregate state; dropping stale rows for ${playerId}.`);
+      }
+
+      await client.query(`DELETE FROM player_task_events WHERE player_id = $1`, [playerId]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  await pool.query(`DROP TABLE IF EXISTS player_task_events`);
+  await pool.query(
+    `INSERT INTO schema_migrations (migration_id)
+     VALUES ('task_events_removed_v1_20260813')
+     ON CONFLICT (migration_id) DO NOTHING`
+  );
+}
+
 const CHALLENGE_RESULT_RETENTION_MS = Math.max(
   60 * 60_000,
   Math.min(7 * 24 * 60 * 60_000, Number(process.env.CHALLENGE_RESULT_RETENTION_MS || 24 * 60 * 60_000) || 24 * 60 * 60_000)
@@ -7589,7 +7642,7 @@ setInterval(() => {
 
 setInterval(() => {
   cleanupPersistentEphemeralData();
-}, 15 * 60_000).unref();
+}, 2 * 60 * 60_000).unref();
 
 setInterval(() => {
   cleanupOldTaskClaims();
@@ -7603,7 +7656,8 @@ const PORT = Number(
 assertSecurityEnvironment();
 
 initDatabase()
-  .then(() => {
+  .then(async () => {
+    await migrateAndDropLegacyTaskEvents();
     cleanupPersistentEphemeralData();
     cleanupOldTaskClaims();
     server.listen(
