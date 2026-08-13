@@ -32,8 +32,14 @@ const GOOGLE_WEB_CLIENT_SECRET = process.env.GOOGLE_WEB_CLIENT_SECRET || "";
 const PLAY_GAMES_APP_ID = process.env.PLAY_GAMES_APP_ID || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 24 * 60 * 60);
-// Gameplay oturumu heartbeat/TTL kullanmaz. Her acquire yeni sessionId üretir;
-// player_game_sessions satırında en yeni sessionId her zaman kazanır (newest wins).
+// Gameplay heartbeat yoktur. Aktif oyun kilidi yalnız oyun başlangıcı/bitimi ve zaten var olan
+// authoritative HTTP/Socket trafiğiyle yönetilir. Aynı cihaz yeni sessionId alırsa newest-wins;
+// farklı cihazdaki süresi dolmamış aktif oyun ise yeni acquire isteğini engeller.
+const GAMEPLAY_SESSION_ACTIVE_TTL_SECONDS = Math.max(10 * 60, Math.min(6 * 60 * 60,
+  Number(process.env.GAMEPLAY_SESSION_ACTIVE_TTL_SECONDS || 30 * 60) || 30 * 60));
+const GAMEPLAY_SESSION_RENEW_BEFORE_SECONDS = Math.max(60, Math.min(10 * 60,
+  Number(process.env.GAMEPLAY_SESSION_RENEW_BEFORE_SECONDS || 10 * 60) || 10 * 60,
+  Math.floor(GAMEPLAY_SESSION_ACTIVE_TTL_SECONDS / 2)));
 
 function assertSecurityEnvironment() {
   const missing = [];
@@ -246,7 +252,8 @@ async function initDatabase() {
       device_id TEXT NOT NULL,
       game_key TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      protocol_version INTEGER NOT NULL DEFAULT 3
+      expires_at TIMESTAMPTZ NOT NULL,
+      protocol_version INTEGER NOT NULL DEFAULT 4
     );
 
     -- Eski heartbeat/lease tablosu kalıcı oyuncu verisi değildir. V3'e geçişte yalnızca
@@ -267,7 +274,8 @@ async function initDatabase() {
             device_id TEXT NOT NULL,
             game_key TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            protocol_version INTEGER NOT NULL DEFAULT 3
+            expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            protocol_version INTEGER NOT NULL DEFAULT 4
           );
         END IF;
         INSERT INTO schema_migrations (migration_id)
@@ -276,6 +284,32 @@ async function initDatabase() {
       END IF;
     END
     $game_session_v3$;
+
+    -- V4: heartbeat olmadan iki cihazda eşzamanlı oyunu engellemek için aktif oyun son kullanma
+    -- zamanı eklenir. V3'ten kalan satırlar deploy anında bilerek expired yapılır; böylece eski
+    -- sürümden kalmış bir session başka cihazı gereksiz yere kilitlemez. Bu migration yalnız 1 kez çalışır.
+    DO $game_session_v4$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE migration_id = 'game_session_v4_cross_device_active_lock'
+      ) THEN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'player_game_sessions' AND column_name = 'expires_at'
+        ) THEN
+          ALTER TABLE player_game_sessions ADD COLUMN expires_at TIMESTAMPTZ;
+        END IF;
+        UPDATE player_game_sessions
+        SET expires_at = NOW()
+        WHERE expires_at IS NULL;
+        ALTER TABLE player_game_sessions ALTER COLUMN expires_at SET NOT NULL;
+        ALTER TABLE player_game_sessions ALTER COLUMN protocol_version SET DEFAULT 4;
+        INSERT INTO schema_migrations (migration_id)
+        VALUES ('game_session_v4_cross_device_active_lock')
+        ON CONFLICT (migration_id) DO NOTHING;
+      END IF;
+    END
+    $game_session_v4$;
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_player_game_sessions_session_id
       ON player_game_sessions (session_id);
@@ -2947,6 +2981,36 @@ function gameplaySessionIdFromRequest(req) {
   return normalizeGameplaySessionId(req.headers["x-game-session-id"]);
 }
 
+async function readAndMaybeRenewGameplaySession(queryable, playerId, sessionId) {
+  // Tek SQL statement: normalde yalnız SELECT sonucu döner. Session bitmeye yaklaştığında ve
+  // zaten gerçek bir authoritative istek gelmişken expiry seyrek olarak yenilenir. Böylece
+  // heartbeat/polling yoktur; PostgreSQL yazımı varsayılan 30 dk TTL'de en fazla yaklaşık
+  // 20 dakikada bir ve yalnız aktif trafik varsa gerçekleşir.
+  return queryable.query(
+    `WITH renewed AS (
+       UPDATE player_game_sessions
+       SET expires_at = NOW() + ($3::integer * INTERVAL '1 second')
+       WHERE player_id = $1
+         AND session_id = $2
+         AND expires_at > NOW()
+         AND expires_at <= NOW() + ($4::integer * INTERVAL '1 second')
+       RETURNING session_id, device_id, game_key, created_at, expires_at, protocol_version
+     ), current_session AS (
+       SELECT session_id, device_id, game_key, created_at, expires_at, protocol_version
+       FROM player_game_sessions
+       WHERE player_id = $1
+         AND session_id = $2
+         AND expires_at > NOW()
+         AND NOT EXISTS (SELECT 1 FROM renewed)
+     )
+     SELECT * FROM renewed
+     UNION ALL
+     SELECT * FROM current_session
+     LIMIT 1`,
+    [playerId, sessionId, GAMEPLAY_SESSION_ACTIVE_TTL_SECONDS, GAMEPLAY_SESSION_RENEW_BEFORE_SECONDS]
+  );
+}
+
 async function requireGameplaySession(req, res, next) {
   if (!requireDatabase(res)) return;
   const sessionId = gameplaySessionIdFromRequest(req);
@@ -2960,18 +3024,12 @@ async function requireGameplaySession(req, res, next) {
   }
 
   try {
-    // Newest-wins: doğrulama salt-okumadır. Heartbeat, TTL uzatma ve UPDATE yoktur.
-    const result = await pool.query(
-      `SELECT session_id, device_id, game_key, created_at, protocol_version
-       FROM player_game_sessions
-       WHERE player_id = $1 AND session_id = $2`,
-      [req.auth.sub, sessionId]
-    );
+    const result = await readAndMaybeRenewGameplaySession(pool, req.auth.sub, sessionId);
     if (result.rowCount === 0) {
       res.status(409).json({
         ok: false,
         code: "GAME_SESSION_REPLACED",
-        message: "Bu oyun oturumu daha yeni bir cihaz/oyun oturumu tarafından geçersiz kılındı.",
+        message: "Bu oyun oturumu artık aktif değil veya aynı cihazdaki daha yeni bir oturum tarafından değiştirildi.",
       });
       return;
     }
@@ -3001,16 +3059,11 @@ async function socketHasActiveGameplaySession(socket, playerId, errorEvent = "ma
     return false;
   }
   try {
-    const result = await pool.query(
-      `SELECT session_id
-       FROM player_game_sessions
-       WHERE player_id = $1 AND session_id = $2`,
-      [playerId, sessionId]
-    );
+    const result = await readAndMaybeRenewGameplaySession(pool, playerId, sessionId);
     if (result.rowCount === 0) {
       socket.emit(errorEvent, {
         code: "GAME_SESSION_REPLACED",
-        message: "Oyun oturumunuz daha yeni bir oturum tarafından geçersiz kılındı.",
+        message: "Oyun oturumunuz artık aktif değil veya aynı cihazdaki daha yeni bir oturum tarafından değiştirildi.",
       });
       return false;
     }
@@ -3468,9 +3521,17 @@ function disconnectSupersededGameplaySockets(playerId, newestSessionId) {
 
 app.post("/game-session/acquire", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
-  const deviceId = normalizeGameplayDeviceId(req.body.deviceId) || "device_unreported";
+  const deviceId = normalizeGameplayDeviceId(req.body.deviceId);
+  if (!deviceId) {
+    res.status(400).json({
+      ok: false,
+      code: "DEVICE_ID_REQUIRED",
+      message: "Bu cihaz için güvenli oyun kimliği oluşturulamadı.",
+    });
+    return;
+  }
   const gameKey = safeText(req.body.gameKey, "unknown_game", 64) || "unknown_game";
-  const protocolVersion = Math.max(3, Math.min(100, Number(req.body.protocolVersion || 3) || 3));
+  const protocolVersion = Math.max(4, Math.min(100, Number(req.body.protocolVersion || 4) || 4));
   const sessionId = crypto.randomUUID
     ? crypto.randomUUID()
     : crypto.randomBytes(24).toString("hex");
@@ -3480,33 +3541,76 @@ app.post("/game-session/acquire", requireAuth, async (req, res) => {
     await client.query("BEGIN");
     await ensureAuthenticatedPlayer(client, req.auth.sub);
 
-    // Newest wins: aktif/expired ayrımı ve heartbeat yok. Oyuncunun tek satırı her acquire'da
-    // yeni sessionId ile atomik olarak değiştirilir. Aynı anda iki acquire yarışırsa PostgreSQL
-    // satır kilidi nedeniyle en son tamamlanan UPSERT satırdaki güncel sessionId olur.
+    // Hibrit kural:
+    // 1) Aynı cihaz -> newest wins. Eski sessionId atomik olarak yenisiyle değiştirilir.
+    // 2) Farklı cihaz + aktif session -> dokunulmaz ve yeni oyun reddedilir.
+    // 3) Farklı cihaz + expired session -> yeni cihaz session'ı devralabilir.
+    // ON CONFLICT ... WHERE koşulu aynı anda iki cihaz yarışsa bile yalnız bir aktif sahibi bırakır.
     const sessionResult = await client.query(
       `INSERT INTO player_game_sessions
-       (player_id, session_id, device_id, game_key, created_at, protocol_version)
-       VALUES ($1, $2, $3, $4, NOW(), $5)
+       (player_id, session_id, device_id, game_key, created_at, expires_at, protocol_version)
+       VALUES (
+         $1, $2, $3, $4, NOW(),
+         NOW() + ($6::integer * INTERVAL '1 second'),
+         $5
+       )
        ON CONFLICT (player_id) DO UPDATE SET
          session_id = EXCLUDED.session_id,
          device_id = EXCLUDED.device_id,
          game_key = EXCLUDED.game_key,
          created_at = NOW(),
+         expires_at = EXCLUDED.expires_at,
          protocol_version = EXCLUDED.protocol_version
-       RETURNING session_id, device_id, game_key, created_at, protocol_version`,
-      [req.auth.sub, sessionId, deviceId, gameKey, protocolVersion]
+       WHERE player_game_sessions.device_id = EXCLUDED.device_id
+          OR player_game_sessions.expires_at <= NOW()
+       RETURNING session_id, device_id, game_key, created_at, expires_at, protocol_version`,
+      [
+        req.auth.sub,
+        sessionId,
+        deviceId,
+        gameKey,
+        protocolVersion,
+        GAMEPLAY_SESSION_ACTIVE_TTL_SECONDS,
+      ]
     );
+
+    if (sessionResult.rowCount === 0) {
+      // Bu ikinci SELECT yalnız gerçekten başka cihazda aktif oyun olduğu durumda çalışır.
+      const blockingResult = await client.query(
+        `SELECT game_key, created_at, expires_at
+         FROM player_game_sessions
+         WHERE player_id = $1 AND expires_at > NOW()
+         LIMIT 1`,
+        [req.auth.sub]
+      );
+      await client.query("COMMIT");
+
+      const blocking = blockingResult.rows[0] || {};
+      res.status(409).json({
+        ok: false,
+        code: "GAME_ACTIVE_ON_OTHER_DEVICE",
+        message: "Şu anda başka bir cihazda oyun oynuyorsunuz. Diğer cihazdaki oyundan çıktıktan sonra tekrar deneyin.",
+        activeGameKey: blocking.game_key || null,
+        activeSinceMillis: blocking.created_at ? new Date(blocking.created_at).getTime() : null,
+        expiresAtMillis: blocking.expires_at ? new Date(blocking.expires_at).getTime() : null,
+      });
+      return;
+    }
 
     await client.query("COMMIT");
     const activeSession = sessionResult.rows[0];
+    // Yalnız aynı cihazda daha eski bir socket varsa newest-wins nedeniyle kapatılır.
+    // Farklı cihazdaki aktif oyun acquire aşamasında zaten reddedildiğinden burada çalınamaz.
     disconnectSupersededGameplaySockets(req.auth.sub, activeSession.session_id);
     res.json({
       ok: true,
       sessionId: activeSession.session_id,
       gameKey: activeSession.game_key,
       createdAtMillis: new Date(activeSession.created_at).getTime(),
-      protocolVersion: Number(activeSession.protocol_version || 3),
+      expiresAtMillis: new Date(activeSession.expires_at).getTime(),
+      protocolVersion: Number(activeSession.protocol_version || 4),
       newestWins: true,
+      crossDeviceActiveGameLock: true,
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -3516,6 +3620,7 @@ app.post("/game-session/acquire", requireAuth, async (req, res) => {
     client.release();
   }
 });
+
 
 app.post("/game-session/release", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
@@ -6094,7 +6199,9 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
        JOIN player_progress g ON g.player_id = p.player_id
        JOIN player_scores s ON s.player_id = p.player_id
        JOIN player_game_sessions gs
-         ON gs.player_id = p.player_id AND gs.session_id = $2
+         ON gs.player_id = p.player_id
+        AND gs.session_id = $2
+        AND gs.expires_at > NOW()
        WHERE p.player_id = $1`,
       [session.sub, gameSessionId]
     );
