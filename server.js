@@ -554,6 +554,8 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_task_events_player_time
       ON player_task_events (player_id, occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_task_claims_claimed_at
+      ON player_task_claims (claimed_at);
 
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
@@ -886,7 +888,46 @@ function aggregateLegacyTaskEvents(rows, now = new Date()) {
   return aggregate;
 }
 
-async function persistTaskAggregateState(client, playerId, aggregate) {
+async function persistTaskAggregateState(
+  client,
+  playerId,
+  aggregate,
+  { writeGameTotals = true } = {}
+) {
+  const commonValues = [
+    playerId,
+    aggregate.dailyKey,
+    JSON.stringify(aggregate.dailyState),
+    aggregate.weeklyKey,
+    JSON.stringify(aggregate.weeklyState),
+    aggregate.monthlyKey,
+    JSON.stringify(aggregate.monthlyState),
+  ];
+
+  if (!writeGameTotals) {
+    // Login gibi game_totals'ı değiştirmeyen eventlerde büyük/uzun ömürlü JSONB alanını tekrar yazma.
+    await client.query(
+      `INSERT INTO player_task_state
+         (player_id, daily_key, daily_state, weekly_key, weekly_state,
+          monthly_key, monthly_state, game_totals, recent_sources, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7::jsonb, '{}'::jsonb, $8::jsonb, NOW())
+       ON CONFLICT (player_id) DO UPDATE SET
+         daily_key = EXCLUDED.daily_key,
+         daily_state = EXCLUDED.daily_state,
+         weekly_key = EXCLUDED.weekly_key,
+         weekly_state = EXCLUDED.weekly_state,
+         monthly_key = EXCLUDED.monthly_key,
+         monthly_state = EXCLUDED.monthly_state,
+         recent_sources = EXCLUDED.recent_sources,
+         updated_at = NOW()`,
+      [
+        ...commonValues,
+        JSON.stringify((aggregate.recentSources || []).slice(-TASK_RECENT_SOURCE_LIMIT)),
+      ]
+    );
+    return;
+  }
+
   await client.query(
     `INSERT INTO player_task_state
        (player_id, daily_key, daily_state, weekly_key, weekly_state,
@@ -903,21 +944,33 @@ async function persistTaskAggregateState(client, playerId, aggregate) {
        recent_sources = EXCLUDED.recent_sources,
        updated_at = NOW()`,
     [
-      playerId,
-      aggregate.dailyKey,
-      JSON.stringify(aggregate.dailyState),
-      aggregate.weeklyKey,
-      JSON.stringify(aggregate.weeklyState),
-      aggregate.monthlyKey,
-      JSON.stringify(aggregate.monthlyState),
+      ...commonValues,
       JSON.stringify(aggregate.gameTotals),
       JSON.stringify((aggregate.recentSources || []).slice(-TASK_RECENT_SOURCE_LIMIT)),
     ]
   );
 }
 
-async function loadTaskAggregateStateForUpdate(client, playerId, now = new Date()) {
-  await ensureAuthenticatedPlayer(client, playerId);
+async function readTaskAggregateState(client, playerId, now = new Date()) {
+  const current = await client.query(
+    `SELECT daily_key, daily_state, weekly_key, weekly_state,
+            monthly_key, monthly_state, game_totals, recent_sources
+     FROM player_task_state
+     WHERE player_id = $1`,
+    [playerId]
+  );
+  if (current.rowCount > 0) return normalizeTaskAggregateRow(current.rows[0], now);
+  // Yalnız ilk kullanım/migration durumunda kilitli oluşturma yoluna geç.
+  return loadTaskAggregateStateForUpdate(client, playerId, now);
+}
+
+async function loadTaskAggregateStateForUpdate(
+  client,
+  playerId,
+  now = new Date(),
+  playerAlreadyEnsured = false
+) {
+  if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
   let current = await client.query(
     `SELECT daily_key, daily_state, weekly_key, weekly_state,
             monthly_key, monthly_state, game_totals, recent_sources
@@ -964,12 +1017,18 @@ async function loadTaskAggregateStateForUpdate(client, playerId, now = new Date(
 
 async function recordTaskEventInTransaction(client, {
   playerId, sourceKey, eventType, gameKey = null, multiplayer = false, won = false,
+  playerAlreadyEnsured = false,
 }) {
   if (!playerId || !sourceKey) return false;
   const safeSourceKey = String(sourceKey).slice(0, 180);
   const sourceHash = taskSourceHash(safeSourceKey);
   const now = new Date();
-  const aggregate = await loadTaskAggregateStateForUpdate(client, playerId, now);
+  const aggregate = await loadTaskAggregateStateForUpdate(
+    client,
+    playerId,
+    now,
+    playerAlreadyEnsured
+  );
   if ((aggregate.recentSources || []).includes(sourceHash)) return false;
   aggregate.recentSources = [...(aggregate.recentSources || []), sourceHash]
     .slice(-TASK_RECENT_SOURCE_LIMIT);
@@ -980,7 +1039,9 @@ async function recordTaskEventInTransaction(client, {
     multiplayer: multiplayer === true,
     won: won === true,
   });
-  await persistTaskAggregateState(client, playerId, aggregate);
+  await persistTaskAggregateState(client, playerId, aggregate, {
+    writeGameTotals: eventType === "game",
+  });
   return true;
 }
 
@@ -1006,9 +1067,11 @@ function favoriteTaskGameKey(gameTotals) {
     .sort((a, b) => Number(b[1]) - Number(a[1]) || String(a[0]).localeCompare(String(b[0])))[0]?.[0] || null;
 }
 
-async function readTaskCenterState(client, playerId) {
+async function readTaskCenterState(client, playerId, forUpdate = false) {
   const now = new Date();
-  const aggregate = await loadTaskAggregateStateForUpdate(client, playerId, now);
+  const aggregate = forUpdate
+    ? await loadTaskAggregateStateForUpdate(client, playerId, now)
+    : await readTaskAggregateState(client, playerId, now);
   const favoriteGameKey = favoriteTaskGameKey(aggregate.gameTotals);
   const periods = ["daily", "weekly", "monthly"].map((type) => taskPeriodInfo(type, now));
   const claimsResult = await client.query(
@@ -1118,7 +1181,7 @@ async function mergeTaskAggregateStateForGuest(client, guestId, targetPlayerId) 
 async function claimTaskRewardInTransaction(client, playerId, periodType, taskCode) {
   const type = TASK_PERIOD_CONFIG[periodType] ? periodType : "daily";
   const period = taskPeriodInfo(type);
-  const taskCenter = await readTaskCenterState(client, playerId);
+  const taskCenter = await readTaskCenterState(client, playerId, true);
   const periodState = taskCenter.periods.find((item) => item.type === type);
   const isMaster = taskCode === "all_complete";
   const task = periodState?.tasks.find((item) => item.code === taskCode);
@@ -2414,8 +2477,14 @@ async function readAuthoritativePlayerState(client, playerId) {
   };
 }
 
-async function applyTournamentOutcomeInTransaction(client, playerId, won, requestedStage) {
-  await ensureAuthenticatedPlayer(client, playerId);
+async function applyTournamentOutcomeInTransaction(
+  client,
+  playerId,
+  won,
+  requestedStage,
+  playerAlreadyEnsured = false
+) {
+  if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
   const locked = await client.query(
     `SELECT tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active
@@ -3151,10 +3220,7 @@ async function authenticateGuestPlayer(client, guestIdRaw, guestSecretRaw) {
   }
 
   await ensureAuthenticatedPlayer(client, guestId);
-  await client.query(
-    `UPDATE guest_credentials SET updated_at = NOW() WHERE guest_id = $1`,
-    [guestId]
-  );
+  // Başarılı token yenilemede last-seen kullanılmıyorsa boş yere WAL üretme; credential satırı değişmez.
   return guestId;
 }
 
@@ -3352,6 +3418,124 @@ async function applyAuthoritativeScoreDelta(playerId, generalDelta, infiniteDelt
   }
 }
 
+async function recordRealtimeRoomTasksInTransaction(client, room, realWinner, realLoser) {
+  const sourceKey = `room:${room.roomId}`;
+  if (realWinner) {
+    await recordTaskEventInTransaction(client, {
+      playerId: realWinner.playerId,
+      sourceKey,
+      eventType: "game",
+      gameKey: "target_number",
+      multiplayer: true,
+      won: true,
+      playerAlreadyEnsured: true,
+    });
+  }
+  if (realLoser) {
+    await recordTaskEventInTransaction(client, {
+      playerId: realLoser.playerId,
+      sourceKey,
+      eventType: "game",
+      gameKey: "target_number",
+      multiplayer: true,
+      won: false,
+      playerAlreadyEnsured: true,
+    });
+  }
+}
+
+function safeTwoPlayerFinishSampleMs(elapsedMs, roundCountValue = 1) {
+  const parsedElapsedMs = Number(elapsedMs);
+  if (!Number.isFinite(parsedElapsedMs) || parsedElapsedMs <= 0) return null;
+  const roundCount = normalizeRoundCount(roundCountValue);
+  return Math.max(1, Math.min(Math.floor(parsedElapsedMs / roundCount), 2 * 60 * 1000));
+}
+
+async function settleNormalRealtimeRoom(room, realWinner, realLoser) {
+  if (!pool) return { winnerState: null, loserState: null };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const reward = Math.max(minimumTwoPlayerStake(room.difficulty), Number(room.stakePoints || 0));
+    const winnerXp = 20;
+
+    if (realWinner) {
+      await applyLeaderboardScoreDeltaInTransaction(client, realWinner.playerId, reward, 0);
+      const finishSampleMs = safeTwoPlayerFinishSampleMs(realWinner.totalElapsedMs, room.roundCount);
+      await client.query(
+        `UPDATE player_progress SET
+           total_xp = LEAST(total_xp + $2, 2000000000),
+           two_player_finish_count = LEAST(two_player_finish_count + CASE WHEN $3::bigint IS NULL THEN 0 ELSE 1 END, 2000000000),
+           two_player_finish_total_ms = LEAST(
+             two_player_finish_total_ms + COALESCE($3::bigint, 0),
+             9223372036854775807::bigint
+           ),
+           updated_at = NOW()
+         WHERE player_id = $1`,
+        [realWinner.playerId, winnerXp, finishSampleMs]
+      );
+    }
+
+    if (realLoser) {
+      await applyLeaderboardScoreDeltaInTransaction(client, realLoser.playerId, -reward, 0);
+    }
+
+    await recordRealtimeRoomTasksInTransaction(client, room, realWinner, realLoser);
+
+    const winnerState = realWinner
+      ? { ...(await readAuthoritativePlayerState(client, realWinner.playerId)), generalDelta: reward, infiniteDelta: 0, xpDelta: winnerXp }
+      : null;
+    const loserState = realLoser
+      ? { ...(await readAuthoritativePlayerState(client, realLoser.playerId)), generalDelta: -reward, infiniteDelta: 0, xpDelta: 0 }
+      : null;
+
+    await client.query("COMMIT");
+    return { winnerState, loserState };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function settleTournamentRealtimeRoom(room, realWinner, realLoser) {
+  if (!pool) return { winnerState: null, loserState: null };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const winnerState = realWinner
+      ? await applyTournamentOutcomeInTransaction(client, realWinner.playerId, true, realWinner.tournamentStage, true)
+      : null;
+    const loserState = realLoser
+      ? await applyTournamentOutcomeInTransaction(client, realLoser.playerId, false, realLoser.tournamentStage, true)
+      : null;
+    await recordRealtimeRoomTasksInTransaction(client, room, realWinner, realLoser);
+    await client.query("COMMIT");
+    return { winnerState, loserState };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function settleFriendRoomTasks(room, realWinner, realLoser) {
+  if (!pool || (!realWinner && !realLoser)) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await recordRealtimeRoomTasksInTransaction(client, room, realWinner, realLoser);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function awardRealtimeRoom(room, winner, loser) {
   if (!room || room.awardedAt) return;
   room.awardedAt = Date.now();
@@ -3360,55 +3544,25 @@ async function awardRealtimeRoom(room, winner, loser) {
   const realLoser = loser && !loser.isBot ? loser : null;
 
   if (room.isFriend) {
-    await Promise.all([
-      realWinner ? recordTaskGameEvent(realWinner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
-      realLoser ? recordTaskGameEvent(realLoser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
-    ]);
+    await settleFriendRoomTasks(room, realWinner, realLoser);
     return;
   }
 
   if (room.gameKey === "target_number_tournament") {
-    const [winnerState, loserState] = await Promise.all([
-      realWinner ? applyTournamentOutcome(realWinner.playerId, true, realWinner.tournamentStage) : null,
-      realLoser ? applyTournamentOutcome(realLoser.playerId, false, realLoser.tournamentStage) : null,
-    ]);
+    const { winnerState, loserState } = await settleTournamentRealtimeRoom(room, realWinner, realLoser);
     const winnerSocket = realWinner?.socketId ? io.sockets.sockets.get(realWinner.socketId) : null;
     const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
     if (winnerSocket && winnerState) winnerSocket.emit("authoritative_tournament", winnerState);
     if (loserSocket && loserState) loserSocket.emit("authoritative_tournament", loserState);
-    await Promise.all([
-      realWinner ? recordTaskGameEvent(realWinner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
-      realLoser ? recordTaskGameEvent(realLoser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
-    ]);
     return;
   }
 
   if (room.gameKey !== "target_number") return;
-  const reward = Math.max(minimumTwoPlayerStake(room.difficulty), Number(room.stakePoints || 0));
-  const winnerXp = 20;
-  const [winnerState, loserState] = await Promise.all([
-    realWinner ? applyAuthoritativeScoreDelta(realWinner.playerId, reward, 0, winnerXp) : null,
-    realLoser ? applyAuthoritativeScoreDelta(realLoser.playerId, -reward, 0, 0) : null,
-  ]);
+  const { winnerState, loserState } = await settleNormalRealtimeRoom(room, realWinner, realLoser);
   const winnerSocket = realWinner?.socketId ? io.sockets.sockets.get(realWinner.socketId) : null;
   const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
   if (winnerSocket && winnerState) winnerSocket.emit("authoritative_reward", winnerState);
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
-  if (realWinner?.totalElapsedMs != null) {
-    try {
-      await recordTwoPlayerFinishTime(
-        realWinner.playerId,
-        realWinner.totalElapsedMs,
-        room.roundCount
-      );
-    } catch (error) {
-      console.error("two-player finish average update error:", error);
-    }
-  }
-  await Promise.all([
-    realWinner ? recordTaskGameEvent(realWinner.playerId, `room:${room.roomId}`, "target_number", true, true) : null,
-    realLoser ? recordTaskGameEvent(realLoser.playerId, `room:${room.roomId}`, "target_number", true, false) : null,
-  ]);
 }
 
 app.post("/auth/guest", async (req, res) => {
@@ -3649,7 +3803,8 @@ app.get("/player/state", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, playerId);
+    // readAuthoritativePlayerState eksik/eski oyuncuda kendi fallback ensure akışını yapar;
+    // normal kullanıcıda fazladan ensure SELECT'i gönderme.
     // Normal durumda tek authoritative state SELECT'i yeterlidir. Önce ayrı hundred_active
     // SELECT ... FOR UPDATE yapma; yalnız gerçekten aktif abandoned run varsa forfeit akışına gir.
     const initialState = await readAuthoritativePlayerState(client, playerId);
@@ -4957,11 +5112,38 @@ function randomStakeForGroup(group, difficulty) {
   return randomStakeWithNaturalEnding(preferredMaximum + 1, maximum);
 }
 
+const LOBBY_EVENT_DEBOUNCE_MS = Math.max(100, Math.min(2_000,
+  Number(process.env.LOBBY_EVENT_DEBOUNCE_MS || 500) || 500));
+// Eski uygulama sürümleri scoped lobby aboneliğini bilmez. Geçiş döneminde yalnız bu eski
+// socket'lere legacy event gönderilir; yeni istemciler global yayından tamamen çıkarılır.
+const ENABLE_LEGACY_LOBBY_BROADCAST = process.env.ENABLE_LEGACY_LOBBY_BROADCAST !== "false";
+const lobbyChangeTimers = new Map();
+
+function lobbySocketRoom(difficulty) {
+  return `lobby:${secureDifficulty(difficulty)}`;
+}
+
 function emitRoomLobbyChanged(difficulty) {
-  io.emit("room_lobby_changed", {
-    difficulty: difficulty ? secureDifficulty(difficulty) : "",
-    changedAtMillis: Date.now(),
-  });
+  const normalizedDifficulty = secureDifficulty(difficulty);
+  const previous = lobbyChangeTimers.get(normalizedDifficulty);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    lobbyChangeTimers.delete(normalizedDifficulty);
+    // Global broadcast yerine yalnız o zorluğun oda ekranını gerçekten izleyen socket'lere gönder.
+    const payload = {
+      difficulty: normalizedDifficulty,
+      changedAtMillis: Date.now(),
+    };
+    io.to(lobbySocketRoom(normalizedDifficulty)).emit("room_lobby_changed", payload);
+    if (ENABLE_LEGACY_LOBBY_BROADCAST) {
+      for (const connectedSocket of io.sockets.sockets.values()) {
+        if (connectedSocket.data?.supportsScopedLobbyEvents === true) continue;
+        connectedSocket.emit("room_lobby_changed", payload);
+      }
+    }
+  }, LOBBY_EVENT_DEBOUNCE_MS);
+  timer.unref?.();
+  lobbyChangeTimers.set(normalizedDifficulty, timer);
 }
 
 function removeOpenTablesForSocket(socketId) {
@@ -6188,9 +6370,8 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
   }
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, session.sub);
-    // Session doğrulaması ve oyuncu state okuması tek SELECT'te yapılır; heartbeat UPDATE yoktur.
+    // Salt-okuma socket doğrulaması için BEGIN/COMMIT açılmaz. Session acquire aşaması oyuncu
+    // satırlarını zaten garanti eder; session ve state tek SELECT'te doğrulanır.
     const result = await client.query(
       `SELECT p.username, p.country, g.tournament_stage, g.tournament_rights,
               g.tournament_completed, g.tournament_entry_active, s.general_score,
@@ -6206,14 +6387,12 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       [session.sub, gameSessionId]
     );
     if (result.rowCount === 0) {
-      await client.query("ROLLBACK");
       socket.emit(errorEvent, {
         code: "GAME_SESSION_REPLACED",
         message: "Bu oyun oturumu daha yeni bir oturum tarafından geçersiz kılındı.",
       });
       return null;
     }
-    await client.query("COMMIT");
     socket.data.playerId = safePlayerId(session.sub, session.sub);
     socket.data.gameSessionId = gameSessionId;
     const row = result.rows[0] || {};
@@ -6230,7 +6409,6 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       }),
     };
   } catch (error) {
-    await client.query("ROLLBACK");
     console.error("socket player load error:", error);
     socket.emit(errorEvent, { code: "PLAYER_STATE_ERROR", message: "Oyuncu bilgisi sunucudan alınamadı." });
     return null;
@@ -6242,14 +6420,20 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
 app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   expireOldOpenTables();
-  expireGeneratedLobbyBots();
+  const clientBots = String(req.query.clientBots || "") === "1";
+  if (!clientBots) expireGeneratedLobbyBots();
   const difficulty = secureDifficulty(req.query.difficulty);
   try {
-    const scoreResult = await pool.query(
-      `SELECT general_score FROM player_scores WHERE player_id = $1`,
-      [req.auth.sub]
-    );
-    const requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
+    // Yeni istemcide lobi uygunluğu yalnız görsel bilgidir; gerçek oyuna girişte puan tekrar
+    // authoritative DB state ile doğrulanır. Böylece her lobi refresh'inde PostgreSQL SELECT yoktur.
+    let requesterScore = safeScore(req.query.score);
+    if (!clientBots) {
+      const scoreResult = await pool.query(
+        `SELECT general_score FROM player_scores WHERE player_id = $1`,
+        [req.auth.sub]
+      );
+      requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
+    }
     const realTables = [...publicOpenTables.values()]
       .filter((table) => table.player.id !== req.auth.sub && table.difficulty === difficulty)
       .sort((a, b) => a.createdAt - b.createdAt);
@@ -6278,7 +6462,9 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         roundCount: normalizeRoundCount(table.roundCount),
         isBot: false,
       }));
-      while (rooms.length < targetCount) {
+      // Yeni istemci görsel bot odalarını cihazda üretir. Sunucu bu GET sırasında bot kimliği,
+      // listing ve Map kaydı üretmez; bot ancak kullanıcı gerçekten o masaya bastığında yaratılır.
+      while (!clientBots && rooms.length < targetCount) {
         const botIdentity = createLobbyBotIdentity(usedLobbyBotNames);
         const stakePoints = randomStakeForGroup(group, difficulty);
         const currentMultiRoomCount = rooms
@@ -6314,6 +6500,7 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
       }
       return {
         ...group,
+        targetCount,
         eligible: requesterScore >= group.minScore &&
           (group.maxScore == null || requesterScore <= group.maxScore),
         rooms,
@@ -6332,6 +6519,29 @@ io.on("connection", (socket) => {
     "transport:",
     socket.conn.transport.name
   );
+
+  socket.on("client_capabilities", (payload = {}) => {
+    if (payload.scopedLobbyEvents === true) {
+      socket.data.supportsScopedLobbyEvents = true;
+    }
+  });
+
+  socket.on("lobby_subscribe", (payload = {}) => {
+    socket.data.supportsScopedLobbyEvents = true;
+    const difficulty = secureDifficulty(payload.difficulty);
+    // Aynı socket yalnız ihtiyaç duyduğu lobi kanalını dinler.
+    for (const roomName of socket.rooms) {
+      if (roomName.startsWith("lobby:") && roomName !== lobbySocketRoom(difficulty)) {
+        socket.leave(roomName);
+      }
+    }
+    socket.join(lobbySocketRoom(difficulty));
+  });
+
+  socket.on("lobby_unsubscribe", (payload = {}) => {
+    const difficulty = secureDifficulty(payload.difficulty);
+    socket.leave(lobbySocketRoom(difficulty));
+  });
 
   socket.conn.on(
     "upgrade",
@@ -6511,10 +6721,44 @@ io.on("connection", (socket) => {
 
       if (gameKey === "target_number" && listingId.startsWith("bot:")) {
         expireGeneratedLobbyBots();
-        const botTable = generatedLobbyBots.get(listingId);
+        let botTable = generatedLobbyBots.get(listingId);
+
+        // Yeni istemci bot listing'ini yalnız görsel olarak kendisi üretir:
+        // bot:<groupId>:<stakePoints>:<roundCount>:<nonce>. Sunucu hiçbir lobi botu saklamaz;
+        // kullanıcı gerçekten seçtiğinde değerleri authoritative kurallarla doğrulayıp botu şimdi oluşturur.
         if (!botTable) {
-          socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen bot masası artık uygun değil." });
-          return;
+          const parts = listingId.split(":");
+          const groupId = safeText(parts[1], "", 32);
+          const stakePoints = Number(parts[2]);
+          const roundCount = Number(parts[3]);
+          const group = TWO_PLAYER_ROOM_GROUPS.find((item) => item.id === groupId);
+          const stakeValid = group && Number.isInteger(stakePoints) &&
+            stakePoints >= Math.max(group.minScore, minimumTwoPlayerStake(difficulty)) &&
+            (group.maxScore == null || stakePoints <= group.maxScore);
+          const roundValid = Number.isInteger(roundCount) && roundCount >= 1 && roundCount <= 3;
+          if (!stakeValid || !roundValid) {
+            socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen bot masası artık uygun değil." });
+            return;
+          }
+          const usedNames = new Set([player.name]);
+          const generatedIdentity = createLobbyBotIdentity(usedNames);
+          const requestedBotName = safeText(payload.presetOpponentName, "", 40);
+          const requestedBotCountry = safeText(payload.presetOpponentCountry, "", 3);
+          botTable = {
+            listingId,
+            player: {
+              id: `bot_${crypto.randomBytes(12).toString("hex")}`,
+              // Bot adı/ülkesi puana etki etmez; istemcide görülen kimliği koru.
+              name: requestedBotName || generatedIdentity.name,
+              country: requestedBotCountry ? safeCountry(requestedBotCountry) : generatedIdentity.country,
+              isBot: true,
+            },
+            difficulty,
+            stakePoints,
+            roundCount,
+            createdAt: Date.now(),
+            stateless: true,
+          };
         }
         if (identity.generalScore < botTable.stakePoints) {
           socket.emit("match_error", { code: "INSUFFICIENT_SCORE", message: "Bu masaya katılmak için yeterli puanınız yok." });
@@ -6527,7 +6771,7 @@ io.on("connection", (socket) => {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
         }
-        generatedLobbyBots.delete(listingId);
+        if (!botTable.stateless) generatedLobbyBots.delete(listingId);
         const botPuzzles = Array.from({ length: botTable.roundCount }, () => generateSecurePuzzle(botTable.difficulty));
         const room = createRealtimeRoom(
           socket, player, null, botTable.player, "target_number", botTable.difficulty,
@@ -7298,6 +7542,10 @@ const CHALLENGE_RESULT_RETENTION_MS = Math.max(
   Math.min(7 * 24 * 60 * 60_000, Number(process.env.CHALLENGE_RESULT_RETENTION_MS || 24 * 60 * 60_000) || 24 * 60 * 60_000)
 );
 const CHALLENGE_EXPIRED_GRACE_MS = 6 * 60 * 60_000;
+const TASK_CLAIM_RETENTION_MS = Math.max(
+  35 * 24 * 60 * 60_000,
+  Math.min(180 * 24 * 60 * 60_000, Number(process.env.TASK_CLAIM_RETENTION_MS || 45 * 24 * 60 * 60_000) || 45 * 24 * 60 * 60_000)
+);
 
 async function cleanupPersistentEphemeralData() {
   if (!pool) return;
@@ -7312,6 +7560,19 @@ async function cleanupPersistentEphemeralData() {
     ]);
   } catch (error) {
     console.error("ephemeral PostgreSQL cleanup error:", error);
+  }
+}
+
+async function cleanupOldTaskClaims() {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `DELETE FROM player_task_claims
+       WHERE claimed_at < NOW() - ($1 * INTERVAL '1 millisecond')`,
+      [TASK_CLAIM_RETENTION_MS]
+    );
+  } catch (error) {
+    console.error("task claims cleanup error:", error);
   }
 }
 
@@ -7330,6 +7591,10 @@ setInterval(() => {
   cleanupPersistentEphemeralData();
 }, 15 * 60_000).unref();
 
+setInterval(() => {
+  cleanupOldTaskClaims();
+}, 6 * 60 * 60_000).unref();
+
 
 const PORT = Number(
   process.env.PORT || 10000
@@ -7340,6 +7605,7 @@ assertSecurityEnvironment();
 initDatabase()
   .then(() => {
     cleanupPersistentEphemeralData();
+    cleanupOldTaskClaims();
     server.listen(
       PORT,
       "0.0.0.0",
