@@ -2017,8 +2017,10 @@ function generateSecurePuzzle(difficultyValue) {
 function generateEqualSumPuzzle(difficultyValue) {
   const difficulty = secureDifficulty(difficultyValue);
   const size = 6;
-  const baseValues = [];
-  for (let i = 0; i < size; i += 1) baseValues.push(secureRandomInt(2, 10));
+  // Aynı satır veya sütunda sayı tekrarı olmasın: 2..9 havuzundan
+  // altı farklı sayı seçilir. Latin-kare döngüsü bu altı sayının her satır
+  // ve her sütunda tam birer kez görünmesini garanti eder.
+  const baseValues = shuffled([2, 3, 4, 5, 6, 7, 8, 9]).slice(0, size);
   const target = baseValues.reduce((sum, value) => sum + value, 0);
 
   const rowShift = secureRandomInt(0, size);
@@ -3990,14 +3992,24 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
     }
     const target = Number(puzzle.target);
     for (let row = 0; row < size; row += 1) {
+      const rowValues = [];
       let sum = 0;
-      for (let col = 0; col < size; col += 1) sum += grid[row * size + col];
-      if (sum !== target) return false;
+      for (let col = 0; col < size; col += 1) {
+        const value = grid[row * size + col];
+        rowValues.push(value);
+        sum += value;
+      }
+      if (new Set(rowValues).size !== size || sum !== target) return false;
     }
     for (let col = 0; col < size; col += 1) {
+      const columnValues = [];
       let sum = 0;
-      for (let row = 0; row < size; row += 1) sum += grid[row * size + col];
-      if (sum !== target) return false;
+      for (let row = 0; row < size; row += 1) {
+        const value = grid[row * size + col];
+        columnValues.push(value);
+        sum += value;
+      }
+      if (new Set(columnValues).size !== size || sum !== target) return false;
     }
     const expectedMultiset = [...expected].sort((a, b) => a - b);
     const actualMultiset = [...grid].sort((a, b) => a - b);
@@ -8107,7 +8119,9 @@ io.on("connection", (socket) => {
         const room = createRealtimeRoom(
           socket, player, opponentSocket, opponent.player, gameKey, difficulty, selectedPuzzle,
           tournamentStage, opponent.tournamentStage, selectedStake, matchMode,
-          isNormalCompetitiveGameKey(gameKey) ? TWO_PLAYER_PREPARE_MS : 0
+          isTournamentGameKey(gameKey)
+            ? (baseGameKeyFromMatchKey(gameKey) === "equal_sum" ? 5_000 : 0)
+            : (isNormalCompetitiveGameKey(gameKey) ? TWO_PLAYER_PREPARE_MS : 0)
         );
         socket.emit("match_found", {
           roomId: room.roomId, opponent: { name: opponent.player.name, country: opponent.player.country, matchKey: matchmakingPlayerKey(opponent.player.id) },
