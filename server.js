@@ -1838,7 +1838,8 @@ function tournamentProgressFromRow(row, gameKey = "target_number") {
     remainingRights: Math.max(0, Math.min(Number(stored.remainingRights ?? 3), 3)),
     totalScore: Math.max(0, Number(stored.totalScore || 0)),
     completed: stored.completed === true,
-    entryActive: stored.entryActive === true,
+   /* entryActive: stored.entryActive === true, */
+   entryActive: true,
   };
 }
 
