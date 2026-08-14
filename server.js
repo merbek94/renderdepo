@@ -1798,6 +1798,29 @@ async function ensurePlayerForScore(
 
 
 const SUPPORTED_NORMAL_GAME_KEYS = new Set(["target_number", "equal_sum"]);
+const TARGET_NUMBER_GAME_LIMIT_MS = 2 * 60 * 1000;
+const EQUAL_SUM_GAME_LIMIT_MS = 5 * 60 * 1000;
+const EQUAL_SUM_BOT_MIN_FINISH_MS = 3 * 60 * 1000;
+const EQUAL_SUM_BOT_MAX_FINISH_MS = 5 * 60 * 1000;
+
+function competitiveGameLimitMs(gameKey) {
+  return baseGameKeyFromMatchKey(gameKey) === "equal_sum"
+    ? EQUAL_SUM_GAME_LIMIT_MS
+    : REALTIME_MATCH_LIMIT_MS;
+}
+
+function hundredStageLimitMs(gameKey) {
+  // Hedef Sayıyı Bul'un mevcut 90 saniyelik 100 kişilik aşama kuralını koru;
+  // Eşit Toplam'ın bütün oyunları ise 5 dakika sürer.
+  return baseGameKeyFromMatchKey(gameKey) === "equal_sum"
+    ? EQUAL_SUM_GAME_LIMIT_MS
+    : 90 * 1000;
+}
+
+function equalSumBotFinishMs() {
+  // Üst sınır oyun deadline'ı ile çakışmasın diye 5:00'dan 1 ms önceye kadar seçilir.
+  return secureRandomInt(EQUAL_SUM_BOT_MIN_FINISH_MS, EQUAL_SUM_BOT_MAX_FINISH_MS);
+}
 function isNormalCompetitiveGameKey(gameKey) {
   return SUPPORTED_NORMAL_GAME_KEYS.has(String(gameKey || ""));
 }
@@ -2016,20 +2039,25 @@ function generateEqualSumPuzzle(difficultyValue) {
   const colFixedCount = Array(size).fill(0);
   const fixedIndices = [];
   let guard = 0;
-  while (fixedIndices.length < 9 && guard < 10000) {
+  while (fixedIndices.length < 18 && guard < 20000) {
     guard += 1;
     const index = secureRandomInt(0, size * size);
     if (fixedIndices.includes(index)) continue;
     const row = Math.floor(index / size);
     const col = index % size;
-    if (rowFixedCount[row] >= 2 || colFixedCount[col] >= 2) continue;
+    if (rowFixedCount[row] >= 4 || colFixedCount[col] >= 4) continue;
     fixedIndices.push(index);
     rowFixedCount[row] += 1;
     colFixedCount[col] += 1;
   }
-  if (fixedIndices.length !== 9) {
-    // Deterministik güvenli desen: 9 sabit hücre, hiçbir satır/sütunda 2'den fazla yok.
-    fixedIndices.splice(0, fixedIndices.length, 0, 7, 14, 21, 28, 35, 5, 16, 27);
+  if (fixedIndices.length !== 18) {
+    // Deterministik dama deseni: 18 sabit hücre, her satır/sütunda tam 3 adet.
+    fixedIndices.splice(0, fixedIndices.length);
+    for (let row = 0; row < size; row += 1) {
+      for (let col = 0; col < size; col += 1) {
+        if ((row + col) % 2 === 0) fixedIndices.push(row * size + col);
+      }
+    }
   }
 
   const fixedSet = new Set(fixedIndices);
@@ -3679,7 +3707,10 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, maxFinishMs = BOT_MAX_FI
   return secureRandomInt(minimumFinishMs, maximumFinishMs + 1);
 }
 
-function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
+function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}, gameKey = "target_number") {
+  if (baseGameKeyFromMatchKey(gameKey) === "equal_sum") {
+    return { finishMs: equalSumBotFinishMs(), leaveMs: null };
+  }
   const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
   const roll = secureRandomInt(0, 10000);
   if (roll < 560) {
@@ -3951,7 +3982,7 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
     if (size !== 6 || expected.length !== size * size || grid.length !== size * size) return false;
     if (!grid.every((value) => Number.isInteger(value))) return false;
     const fixedCells = Array.isArray(puzzle.fixedCells) ? puzzle.fixedCells : [];
-    if (fixedCells.length !== 9) return false;
+    if (fixedCells.length !== 18) return false;
     for (const cell of fixedCells) {
       const index = Number(cell?.index);
       const value = Number(cell?.value);
@@ -4894,7 +4925,7 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
   const fresh = req.body.fresh === true;
   const gameKey = normalizedNormalGameKey(req.body?.gameKey);
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
-  const lifetimeMs = 2 * 60 * 1000;
+  const lifetimeMs = hundredStageLimitMs(gameKey);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -5093,7 +5124,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
   const matchMode = safeText(req.body.matchMode, "quick", 32);
   const immediateBotMode = !tournamentMode && ["quick", "ready_room", "open_table"].includes(matchMode);
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
-  const lifetimeMs = 2 * 60 * 1000;
+  const lifetimeMs = competitiveGameLimitMs(baseGameKey);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -5204,7 +5235,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
     }
 
     const puzzle = generatePuzzleForGame(baseGameKey, difficulty);
-    const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile || {});
+    const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile || {}, baseGameKey);
     await client.query(
       `INSERT INTO secure_game_challenges
        (challenge_id, player_id, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
@@ -5346,7 +5377,10 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     if (elapsedServerMs < 500) {
       const error = new Error("Sonuç olağan dışı hızda gönderildi."); error.statusCode = 409; throw error;
     }
-    if (challenge.mode === "hundred" && elapsedServerMs > 90 * 1000) {
+    if (
+      challenge.mode === "hundred" &&
+      elapsedServerMs > hundredStageLimitMs(challenge.puzzle?.gameKey)
+    ) {
       const error = new Error("100 kişilik oyun aşamasının süresi doldu.");
       error.statusCode = 409;
       error.publicCode = "HUNDRED_STAGE_EXPIRED";
@@ -6726,8 +6760,9 @@ function emitToRoomParticipant(participant, eventName, payload) {
 }
 
 function realtimeRoundWinner(room, first, second) {
-  const firstElapsed = Number(first?.roundElapsedMs ?? REALTIME_MATCH_LIMIT_MS);
-  const secondElapsed = Number(second?.roundElapsedMs ?? REALTIME_MATCH_LIMIT_MS);
+  const matchLimitMs = competitiveGameLimitMs(room?.gameKey);
+  const firstElapsed = Number(first?.roundElapsedMs ?? matchLimitMs);
+  const secondElapsed = Number(second?.roundElapsedMs ?? matchLimitMs);
   if (firstElapsed < secondElapsed) return first;
   if (secondElapsed < firstElapsed) return second;
   return String(first?.playerId || "").localeCompare(String(second?.playerId || "")) <= 0 ? first : second;
@@ -6773,6 +6808,7 @@ function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
 
 function scheduleRealtimeRound(room, prepareMs = 3_000) {
   if (!room || room.resolved) return;
+  const matchLimitMs = competitiveGameLimitMs(room.gameKey);
   if (room.deadlineHandle) clearTimeout(room.deadlineHandle);
   if (room.botFinishHandle) clearTimeout(room.botFinishHandle);
 
@@ -6792,21 +6828,23 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
     roomParticipants(room).forEach((participant) => {
       if (participant.finishedRoundIndex !== room.roundIndex) {
         participant.finishedAt = Date.now();
-        participant.elapsedMs = REALTIME_MATCH_LIMIT_MS;
-        participant.roundElapsedMs = REALTIME_MATCH_LIMIT_MS;
+        participant.elapsedMs = matchLimitMs;
+        participant.roundElapsedMs = matchLimitMs;
         participant.finishedRoundIndex = room.roundIndex;
       }
     });
     resolveRealtimeRound(room);
-  }, safePrepareMs + REALTIME_MATCH_LIMIT_MS);
+  }, safePrepareMs + matchLimitMs);
   if (typeof room.deadlineHandle.unref === "function") room.deadlineHandle.unref();
 
   const botParticipant = roomParticipants(room).find((participant) => participant.isBot);
   if (botParticipant) {
-    const botElapsedMs = createTwoPlayerBotFinishMs(
-      room.botFinishProfile || {},
-      Math.max(BOT_MIN_FINISH_MS, REALTIME_MATCH_LIMIT_MS - 1)
-    );
+    const botElapsedMs = baseGameKeyFromMatchKey(room.gameKey) === "equal_sum"
+      ? equalSumBotFinishMs()
+      : createTwoPlayerBotFinishMs(
+          room.botFinishProfile || {},
+          Math.max(BOT_MIN_FINISH_MS, matchLimitMs - 1)
+        );
     room.botFinishHandle = setTimeout(() => {
       registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
     }, safePrepareMs + botElapsedMs);
@@ -6817,7 +6855,8 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
 function registerRealtimeRoundFinish(room, participant, elapsedMs) {
   if (!room || !participant || room.resolved) return;
   if (participant.finishedRoundIndex === room.roundIndex) return;
-  const safeElapsedMs = Math.max(1, Math.min(Number(elapsedMs || 1), REALTIME_MATCH_LIMIT_MS));
+  const matchLimitMs = competitiveGameLimitMs(room.gameKey);
+  const safeElapsedMs = Math.max(1, Math.min(Number(elapsedMs || 1), matchLimitMs));
   participant.finishedAt = Date.now();
   participant.elapsedMs = safeElapsedMs;
   participant.roundElapsedMs = safeElapsedMs;
@@ -6841,8 +6880,8 @@ function registerRealtimeRoundFinish(room, participant, elapsedMs) {
   const unfinishedOpponent = getOpponentParticipant(room, participant.playerId);
   if (unfinishedOpponent && unfinishedOpponent.finishedRoundIndex !== room.roundIndex) {
     unfinishedOpponent.finishedAt = Date.now();
-    unfinishedOpponent.elapsedMs = REALTIME_MATCH_LIMIT_MS;
-    unfinishedOpponent.roundElapsedMs = REALTIME_MATCH_LIMIT_MS;
+    unfinishedOpponent.elapsedMs = matchLimitMs;
+    unfinishedOpponent.roundElapsedMs = matchLimitMs;
     unfinishedOpponent.finishedRoundIndex = room.roundIndex;
   }
   resolveRealtimeRound(room);
@@ -6865,8 +6904,9 @@ function resolveRealtimeRound(room) {
   const [first, second] = participants;
   const roundWinner = realtimeRoundWinner(room, first, second);
   roundWinner.roundWins += 1;
+  const matchLimitMs = competitiveGameLimitMs(room.gameKey);
   participants.forEach((participant) => {
-    participant.totalElapsedMs += Number(participant.roundElapsedMs || REALTIME_MATCH_LIMIT_MS);
+    participant.totalElapsedMs += Number(participant.roundElapsedMs || matchLimitMs);
   });
 
   participants.forEach((participant) => {
