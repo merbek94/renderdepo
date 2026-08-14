@@ -487,7 +487,7 @@ async function initDatabase() {
       hundred_daily_key TEXT NOT NULL DEFAULT '',
       hundred_daily_base_used BOOLEAN NOT NULL DEFAULT FALSE,
       hundred_daily_ad_used BOOLEAN NOT NULL DEFAULT FALSE,
-      hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0 CHECK (hundred_rewarded_rights BETWEEN 0 AND 2),
+      hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0 CHECK (hundred_rewarded_rights BETWEEN 0 AND 1),
       game_rights INTEGER NOT NULL DEFAULT 10 CHECK (game_rights BETWEEN 0 AND 10),
       game_rights_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       diamond_balance INTEGER NOT NULL DEFAULT 0 CHECK (diamond_balance >= 0),
@@ -530,43 +530,6 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS hundred_daily_ad_used BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0;
-
-    -- V4 ortak rekabet kotaları: günlük 100 kişilik kullanım sayaçları ve reklamla kazanılan
-    -- turnuva biletleri tüm oyunlarda aynı oyuncu havuzundan tüketilir.
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_daily_base_used_count INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_daily_ad_used_count INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_active_game_key TEXT NOT NULL DEFAULT '';
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_reward_day_key TEXT NOT NULL DEFAULT '';
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_rewarded_tickets_today INTEGER NOT NULL DEFAULT 0;
-
-    -- Oyun başına ayrılan ilerlemeler burada tutulur. Genel puan, 10 oyun hakkı,
-    -- 100 kişilik günlük kota ve turnuva bilet cüzdanı player_progress/player_scores'ta ortaktır.
-    CREATE TABLE IF NOT EXISTS player_game_progress (
-      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
-      game_key TEXT NOT NULL,
-      infinite_high_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_high_score >= 0),
-      infinite_monthly_key TEXT NOT NULL DEFAULT '',
-      infinite_monthly_high_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_monthly_high_score >= 0),
-      infinite_run_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
-      infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
-      tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
-      tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3),
-      tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
-      tournament_completed BOOLEAN NOT NULL DEFAULT FALSE,
-      tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE,
-      hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (player_id, game_key)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_player_game_progress_game_infinite
-      ON player_game_progress (game_key, infinite_high_score DESC, player_id ASC)
-      WHERE infinite_high_score > 0;
 
     -- Büyük UPDATE/constraint normalizasyonları her Render restartında değil yalnızca bir kez çalışır.
     DO $progress_normalization_v3$
@@ -619,62 +582,6 @@ async function initDatabase() {
       END IF;
     END
     $progress_normalization_v3$;
-
-
-    DO $multi_game_progress_v4$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM schema_migrations WHERE migration_id = 'multi_game_progress_v4_20260814'
-      ) THEN
-        -- Eski boolean günlük hak bilgisini sayaca dönüştür.
-        UPDATE player_progress
-        SET hundred_daily_base_used_count = CASE WHEN hundred_daily_base_used THEN 1 ELSE 0 END,
-            hundred_daily_ad_used_count = CASE WHEN hundred_daily_ad_used THEN 1 ELSE 0 END,
-            tournament_reward_day_key = CASE
-              WHEN tournament_reward_day_key = '' THEN TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD')
-              ELSE tournament_reward_day_key
-            END;
-
-        UPDATE player_progress
-        SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 2),
-            hundred_daily_base_used_count = LEAST(GREATEST(hundred_daily_base_used_count, 0), 2),
-            hundred_daily_ad_used_count = LEAST(GREATEST(hundred_daily_ad_used_count, 0), 2),
-            tournament_rewarded_tickets_today = LEAST(GREATEST(tournament_rewarded_tickets_today, 0), 15);
-
-        ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-        ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v2;
-        ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
-          CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
-
-        ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_daily_base_used_count_check_v1;
-        ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_daily_base_used_count_check_v1
-          CHECK (hundred_daily_base_used_count BETWEEN 0 AND 2);
-        ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_daily_ad_used_count_check_v1;
-        ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_daily_ad_used_count_check_v1
-          CHECK (hundred_daily_ad_used_count BETWEEN 0 AND 2);
-        ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_tournament_rewarded_tickets_today_check_v1;
-        ALTER TABLE player_progress ADD CONSTRAINT player_progress_tournament_rewarded_tickets_today_check_v1
-          CHECK (tournament_rewarded_tickets_today BETWEEN 0 AND 15);
-
-        -- Hedef Sayıyı Bul'un eski oyun-bazlı verilerini yeni genel tabloya bir kez taşı.
-        INSERT INTO player_game_progress (
-          player_id, game_key, infinite_high_score, infinite_run_score, infinite_next_stage,
-          tournament_stage, tournament_rights, tournament_bank, tournament_completed,
-          tournament_entry_active, hundred_stage, updated_at
-        )
-        SELECT p.player_id, 'target_number', s.infinite_score, p.infinite_run_score, p.infinite_next_stage,
-               p.tournament_stage, p.tournament_rights, p.tournament_bank, p.tournament_completed,
-               p.tournament_entry_active, p.hundred_stage, NOW()
-        FROM player_progress p
-        JOIN player_scores s ON s.player_id = p.player_id
-        ON CONFLICT (player_id, game_key) DO NOTHING;
-
-        INSERT INTO schema_migrations (migration_id)
-        VALUES ('multi_game_progress_v4_20260814')
-        ON CONFLICT (migration_id) DO NOTHING;
-      END IF;
-    END
-    $multi_game_progress_v4$;
 
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS game_rights INTEGER NOT NULL DEFAULT 10;
@@ -764,8 +671,6 @@ async function initDatabase() {
 
     ALTER TABLE secure_game_challenges
       ADD COLUMN IF NOT EXISTS wager_points INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE secure_game_challenges
-      ADD COLUMN IF NOT EXISTS game_key TEXT NOT NULL DEFAULT 'target_number';
 
     -- Yeni görev mimarisi: geçmiş event taramak yerine oyuncu başına tek aggregate satır.
     CREATE TABLE IF NOT EXISTS player_task_state (
@@ -784,7 +689,7 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS recent_sources JSONB NOT NULL DEFAULT '[]'::jsonb;
 
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
-      ON secure_game_challenges (player_id, game_key, mode, completed_at, expires_at);
+      ON secure_game_challenges (player_id, mode, completed_at, expires_at);
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_cleanup
       ON secure_game_challenges (completed_at, expires_at);
 
@@ -1927,95 +1832,7 @@ function buildSolvableTarget(numbers, minTarget, maxTarget, requireMultiplyOrDiv
   return null;
 }
 
-const SUPPORTED_GAME_KEYS = new Set(["target_number", "equal_sum"]);
-function normalizeBaseGameKey(value) {
-  const raw = String(value || "target_number").trim().toLowerCase().replace(/_tournament$/, "");
-  return SUPPORTED_GAME_KEYS.has(raw) ? raw : "target_number";
-}
-function tournamentGameKey(value) {
-  return `${normalizeBaseGameKey(value)}_tournament`;
-}
-
-async function ensurePlayerGameProgress(client, playerId, gameKeyValue) {
-  const gameKey = normalizeBaseGameKey(gameKeyValue);
-  await client.query(
-    `INSERT INTO player_game_progress (player_id, game_key)
-     VALUES ($1, $2)
-     ON CONFLICT (player_id, game_key) DO NOTHING`,
-    [playerId, gameKey]
-  );
-  return gameKey;
-}
-
-async function readPlayerGameProgress(client, playerId, gameKeyValue, forUpdate = false) {
-  const gameKey = await ensurePlayerGameProgress(client, playerId, gameKeyValue);
-  const result = await client.query(
-    `SELECT * FROM player_game_progress WHERE player_id = $1 AND game_key = $2${forUpdate ? " FOR UPDATE" : ""}`,
-    [playerId, gameKey]
-  );
-  return result.rows[0] || { player_id: playerId, game_key: gameKey };
-}
-
-async function readAllPlayerGameProgress(client, playerId) {
-  await ensurePlayerGameProgress(client, playerId, "target_number");
-  await ensurePlayerGameProgress(client, playerId, "equal_sum");
-  const result = await client.query(
-    `SELECT * FROM player_game_progress WHERE player_id = $1 ORDER BY game_key`,
-    [playerId]
-  );
-  return result.rows;
-}
-
-async function refreshAggregateInfiniteScoreInTransaction(client, playerId) {
-  const monthKey = currentMonthKey();
-  const result = await client.query(
-    `SELECT COALESCE(SUM(infinite_high_score), 0)::bigint AS total,
-            COALESCE(SUM(CASE WHEN infinite_monthly_key = $2 THEN infinite_monthly_high_score ELSE 0 END), 0)::bigint AS monthly_total
-     FROM player_game_progress WHERE player_id = $1`,
-    [playerId, monthKey]
-  );
-  const total = Math.max(0, Math.min(Number(result.rows[0]?.total || 0), 2_000_000_000));
-  const monthlyTotal = Math.max(0, Math.min(Number(result.rows[0]?.monthly_total || 0), 2_000_000_000));
-  await client.query(
-    `UPDATE player_scores SET infinite_score = $2, monthly_infinite_score = $3,
-       monthly_key = $4, monthly_updated_at = NOW(), updated_at = NOW()
-     WHERE player_id = $1`,
-    [playerId, total, monthlyTotal, monthKey]
-  );
-  return total;
-}
-
-async function updateGameInfiniteHighScoreInTransaction(client, playerId, gameKeyValue, runScore) {
-  const gameKey = await ensurePlayerGameProgress(client, playerId, gameKeyValue);
-  const safeScore = Math.max(0, Math.min(Number(runScore || 0), 2_000_000_000));
-  const monthKey = currentMonthKey();
-  await client.query(
-    `UPDATE player_game_progress
-     SET infinite_high_score = GREATEST(infinite_high_score, $3),
-         infinite_monthly_high_score = CASE
-           WHEN infinite_monthly_key = $4 THEN GREATEST(infinite_monthly_high_score, $3)
-           ELSE $3
-         END,
-         infinite_monthly_key = $4,
-         updated_at = NOW()
-     WHERE player_id = $1 AND game_key = $2`,
-    [playerId, gameKey, safeScore, monthKey]
-  );
-  return refreshAggregateInfiniteScoreInTransaction(client, playerId);
-}
-
-function generateEqualSumPuzzle(difficultyValue) {
-  const difficulty = secureDifficulty(difficultyValue);
-  const base = Array.from({ length: 6 }, () => secureRandomInt(1, 10));
-  const target = base.reduce((sum, value) => sum + value, 0);
-  const solved = [];
-  for (let row = 0; row < 6; row += 1) {
-    for (let col = 0; col < 6; col += 1) solved.push(base[(row + col) % 6]);
-  }
-  return { gameKey: "equal_sum", difficulty, target, targetSum: target, numbers: shuffled(solved) };
-}
-
-function generateTargetNumberPuzzle(difficultyValue) {
+function generateSecurePuzzle(difficultyValue) {
   const difficulty = secureDifficulty(difficultyValue);
   const count = secureRandomInt(3, 5); // 3 veya 4 sayı
 
@@ -2041,16 +1858,8 @@ function generateTargetNumberPuzzle(difficultyValue) {
     }
   }
 
-  return { gameKey: "target_number", difficulty, target: 20, numbers: shuffled([2, 4, 5]) };
+  return { difficulty, target: 20, numbers: shuffled([2, 4, 5]) };
 }
-
-function generateSecurePuzzle(difficultyValue, gameKeyValue = "target_number") {
-  const gameKey = normalizeBaseGameKey(gameKeyValue);
-  return gameKey === "equal_sum"
-    ? generateEqualSumPuzzle(difficultyValue)
-    : { ...generateTargetNumberPuzzle(difficultyValue), gameKey: "target_number" };
-}
-
 function challengeRewards(mode, stage) {
   const safeStage = Math.max(1, Math.min(Number(stage || 1), 1000));
   if (mode === "infinite") {
@@ -2065,9 +1874,8 @@ function challengeRewards(mode, stage) {
 const TOURNAMENT_STAGE_REWARDS = [50, 150, 350, 1000, 2500, 7000, 18000, 50000];
 const TOURNAMENT_ENTRY_TICKET_COST = 5;
 const TOURNAMENT_TICKET_MAX = 9999;
-const HUNDRED_DAILY_BASE_RIGHTS = 2;
-const HUNDRED_DAILY_REWARDED_RIGHTS_MAX = 2;
-const TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT = 15;
+const HUNDRED_DAILY_BASE_RIGHTS = 1;
+const HUNDRED_DAILY_REWARDED_RIGHTS_MAX = 1;
 
 function currentUtcDayKey() {
   return new Date().toISOString().slice(0, 10);
@@ -2500,7 +2308,9 @@ const BOT_FALLBACK_RAM_MAX_AGE_MS = Math.max(BOT_FALLBACK_MIN_WAIT_MS * 4, 5 * 6
 
 async function markBotFallbackEligibility(playerId, gameKey, difficulty) {
   if (!playerId) return;
-  const normalizedGameKey = normalizeMatchGameKey(gameKey);
+  const normalizedGameKey = gameKey === "target_number_tournament"
+    ? "target_number_tournament"
+    : "target_number";
   const normalizedDifficulty = secureDifficulty(difficulty);
   const existing = botFallbackEligibility.get(String(playerId));
   if (
@@ -2531,7 +2341,9 @@ async function consumeBotFallbackEligibilityInTransaction(
   expectedGameKey,
   expectedDifficulty
 ) {
-  const normalizedGameKey = normalizeMatchGameKey(expectedGameKey);
+  const normalizedGameKey = expectedGameKey === "target_number_tournament"
+    ? "target_number_tournament"
+    : "target_number";
   const normalizedDifficulty = secureDifficulty(expectedDifficulty);
   const key = String(playerId || "");
   const entry = botFallbackEligibility.get(key);
@@ -2650,166 +2462,137 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
 }
 
 async function normalizeHundredDailyAccessInTransaction(client, playerId, playerAlreadyEnsured = false) {
-  if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
+  if (!playerAlreadyEnsured) {
+    await ensureAuthenticatedPlayer(client, playerId);
+  }
   const result = await client.query(
-    `SELECT hundred_active, hundred_stage, hundred_active_game_key, hundred_daily_key,
-            hundred_daily_base_used_count, hundred_daily_ad_used_count, hundred_rewarded_rights
-     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
+    `SELECT hundred_active, hundred_stage, hundred_daily_key, hundred_daily_base_used,
+            hundred_daily_ad_used, hundred_rewarded_rights
+     FROM player_progress
+     WHERE player_id = $1
+     FOR UPDATE`,
     [playerId]
   );
   const row = result.rows[0] || {};
   const todayKey = currentUtcDayKey();
   let dailyKey = String(row.hundred_daily_key || "");
-  let baseUsedCount = Math.max(0, Math.min(Number(row.hundred_daily_base_used_count || 0), HUNDRED_DAILY_BASE_RIGHTS));
-  let adUsedCount = Math.max(0, Math.min(Number(row.hundred_daily_ad_used_count || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
-  let rewardedRights = Math.max(0, Math.min(Number(row.hundred_rewarded_rights || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
+  let baseUsed = row.hundred_daily_base_used === true;
+  let adUsed = row.hundred_daily_ad_used === true;
+  let rewardedRights = Math.max(
+    0,
+    Math.min(Number(row.hundred_rewarded_rights || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX)
+  );
 
   if (dailyKey !== todayKey) {
     dailyKey = todayKey;
-    baseUsedCount = 0;
-    adUsedCount = 0;
+    baseUsed = false;
+    adUsed = false;
     rewardedRights = 0;
     await client.query(
-      `UPDATE player_progress SET hundred_daily_key = $2,
-         hundred_daily_base_used = FALSE, hundred_daily_ad_used = FALSE,
-         hundred_daily_base_used_count = 0, hundred_daily_ad_used_count = 0,
-         hundred_rewarded_rights = 0, updated_at = NOW()
+      `UPDATE player_progress SET
+         hundred_daily_key = $2,
+         hundred_daily_base_used = FALSE,
+         hundred_daily_ad_used = FALSE,
+         hundred_rewarded_rights = 0,
+         updated_at = NOW()
        WHERE player_id = $1`,
       [playerId, todayKey]
     );
   }
 
-  const baseRightsRemaining = Math.max(0, HUNDRED_DAILY_BASE_RIGHTS - baseUsedCount);
+  const baseRightsRemaining = baseUsed ? 0 : HUNDRED_DAILY_BASE_RIGHTS;
   const active = row.hundred_active === true;
   return {
     active,
-    activeGameKey: normalizeBaseGameKey(row.hundred_active_game_key || "target_number"),
     stage: Math.max(0, Math.min(Number(row.hundred_stage || 0), 12)),
     dayKey: dailyKey,
-    baseRightsUsedToday: baseUsedCount,
     baseRightsRemaining,
     rewardedRightsRemaining: rewardedRights,
-    rewardedAdsUsedToday: adUsedCount,
-    rewardedAdsDailyLimit: HUNDRED_DAILY_REWARDED_RIGHTS_MAX,
-    rewardedAdUsedToday: adUsedCount > 0,
-    rewardedAdAvailable: !active && baseRightsRemaining <= 0 && adUsedCount < HUNDRED_DAILY_REWARDED_RIGHTS_MAX,
+    rewardedAdUsedToday: adUsed,
+    rewardedAdAvailable: !active && baseUsed && !adUsed && rewardedRights <= 0,
     canStart: !active && (baseRightsRemaining + rewardedRights > 0),
     nextResetAtMillis: nextUtcDayStartMillis(),
   };
 }
 
 async function grantHundredRewardedRightInTransaction(client, playerId) {
+  // normalizeHundred... satırı zaten FOR UPDATE ile kilitliyor; aynı satırı ikinci kez SELECT etme.
   const access = await normalizeHundredDailyAccessInTransaction(client, playerId, true);
   if (access.active) {
     const error = new Error("Aktif 100 kişilik oyun varken reklam hakkı alınamaz.");
-    error.statusCode = 409; error.publicCode = "HUNDRED_RUN_ACTIVE"; throw error;
+    error.statusCode = 409;
+    error.publicCode = "HUNDRED_RUN_ACTIVE";
+    throw error;
   }
   if (access.baseRightsRemaining > 0) {
-    const error = new Error("Önce bugünkü ücretsiz 100 kişilik oyun haklarını kullanmalısınız.");
-    error.statusCode = 409; error.publicCode = "HUNDRED_FREE_RIGHT_AVAILABLE"; throw error;
+    const error = new Error("Önce bugünkü ücretsiz 100 kişilik oyun hakkını kullanmalısınız.");
+    error.statusCode = 409;
+    error.publicCode = "HUNDRED_FREE_RIGHT_AVAILABLE";
+    throw error;
   }
-  if (access.rewardedAdsUsedToday >= HUNDRED_DAILY_REWARDED_RIGHTS_MAX) {
-    const error = new Error("Bugün reklam izleyerek alınabilecek 2 ek 100 kişilik oyun hakkını kullandınız.");
-    error.statusCode = 409; error.publicCode = "HUNDRED_AD_DAILY_LIMIT"; throw error;
+  if (access.rewardedAdUsedToday) {
+    if (access.rewardedRightsRemaining > 0) {
+      return readAuthoritativePlayerState(client, playerId);
+    }
+    const error = new Error("Bugün reklam izleyerek alınabilecek ek 100 kişilik oyun hakkını kullandınız.");
+    error.statusCode = 409;
+    error.publicCode = "HUNDRED_AD_ALREADY_USED";
+    throw error;
   }
+
   await client.query(
     `UPDATE player_progress SET
        hundred_daily_ad_used = TRUE,
-       hundred_daily_ad_used_count = LEAST(hundred_daily_ad_used_count + 1, $2),
-       hundred_rewarded_rights = LEAST(hundred_rewarded_rights + 1, $2),
+       hundred_rewarded_rights = 1,
        updated_at = NOW()
      WHERE player_id = $1`,
-    [playerId, HUNDRED_DAILY_REWARDED_RIGHTS_MAX]
+    [playerId]
   );
   return readAuthoritativePlayerState(client, playerId);
 }
 
 async function grantTournamentTicketInTransaction(client, playerId) {
-  const todayKey = currentUtcDayKey();
-  const locked = await client.query(
-    `SELECT tournament_reward_day_key, tournament_rewarded_tickets_today
-     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
-    [playerId]
-  );
-  const row = locked.rows[0] || {};
-  const storedDay = String(row.tournament_reward_day_key || "");
-  const earned = storedDay === todayKey
-    ? Math.max(0, Math.min(Number(row.tournament_rewarded_tickets_today || 0), TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT))
-    : 0;
-  if (earned >= TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT) {
-    const error = new Error("Bugün reklam izleyerek kazanılabilecek 15 turnuva biletinin tamamını aldınız.");
-    error.statusCode = 409; error.publicCode = "TOURNAMENT_REWARDED_DAILY_LIMIT"; throw error;
-  }
   await client.query(
     `UPDATE player_progress SET
        tournament_tickets = LEAST(tournament_tickets + 1, $2),
-       tournament_reward_day_key = $3,
-       tournament_rewarded_tickets_today = $4,
        updated_at = NOW()
      WHERE player_id = $1`,
-    [playerId, TOURNAMENT_TICKET_MAX, todayKey, earned + 1]
+    [playerId, TOURNAMENT_TICKET_MAX]
   );
   return readAuthoritativePlayerState(client, playerId);
 }
 
-async function enterTournamentInTransaction(client, playerId, gameKeyValue = "target_number") {
-  const gameKey = normalizeBaseGameKey(gameKeyValue);
-  const progress = await readPlayerGameProgress(client, playerId, gameKey, true);
-  const wallet = await client.query(
-    `SELECT tournament_tickets FROM player_progress WHERE player_id = $1 FOR UPDATE`, [playerId]
+async function enterTournamentInTransaction(client, playerId) {
+  const result = await client.query(
+    `SELECT tournament_tickets, tournament_entry_active
+     FROM player_progress WHERE player_id = $1 FOR UPDATE`,
+    [playerId]
   );
-  if (progress.tournament_entry_active === true) {
-    const activeState = await readAuthoritativePlayerState(client, playerId);
-    const selectedTournament = activeState.games?.[gameKey]?.tournament || {};
-    return {
-      ...activeState,
-      tournament: {
-        ...selectedTournament,
-        tickets: activeState.tournament?.tickets || 0,
-        ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
-        rewardedTicketsEarnedToday: activeState.tournament?.rewardedTicketsEarnedToday || 0,
-        rewardedTicketsDailyLimit: TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT,
-        nextResetAtMillis: activeState.tournament?.nextResetAtMillis || nextUtcDayStartMillis(),
-      },
-    };
+  const row = result.rows[0] || {};
+  if (row.tournament_entry_active === true) {
+    return readAuthoritativePlayerState(client, playerId);
   }
-  const tickets = Math.max(0, Number(wallet.rows[0]?.tournament_tickets || 0));
+  const tickets = Math.max(0, Number(row.tournament_tickets || 0));
   if (tickets < TOURNAMENT_ENTRY_TICKET_COST) {
     const error = new Error(`Turnuvaya girmek için ${TOURNAMENT_ENTRY_TICKET_COST} bilet gerekli.`);
-    error.statusCode = 409; error.publicCode = "TOURNAMENT_TICKETS_REQUIRED"; throw error;
+    error.statusCode = 409;
+    error.publicCode = "TOURNAMENT_TICKETS_REQUIRED";
+    throw error;
   }
+
   await client.query(
-    `UPDATE player_progress SET tournament_tickets = tournament_tickets - $2, updated_at = NOW()
+    `UPDATE player_progress SET
+       tournament_tickets = tournament_tickets - $2,
+       tournament_entry_active = TRUE,
+       tournament_stage = 1,
+       tournament_rights = 3,
+       tournament_bank = 0,
+       tournament_completed = FALSE,
+       updated_at = NOW()
      WHERE player_id = $1`,
     [playerId, TOURNAMENT_ENTRY_TICKET_COST]
   );
-  await client.query(
-    `UPDATE player_game_progress SET tournament_entry_active = TRUE, tournament_stage = 1,
-       tournament_rights = 3, tournament_bank = 0, tournament_completed = FALSE, updated_at = NOW()
-     WHERE player_id = $1 AND game_key = $2`,
-    [playerId, gameKey]
-  );
-  // Hedef Sayıyı Bul eski istemcisiyle geriye dönük uyumluluk için legacy alanları aynala.
-  if (gameKey === "target_number") {
-    await client.query(
-      `UPDATE player_progress SET tournament_entry_active = TRUE, tournament_stage = 1,
-         tournament_rights = 3, tournament_bank = 0, tournament_completed = FALSE, updated_at = NOW()
-       WHERE player_id = $1`, [playerId]
-    );
-  }
-  const state = await readAuthoritativePlayerState(client, playerId);
-  const selectedTournament = state.games?.[gameKey]?.tournament || {};
-  return {
-    ...state,
-    tournament: {
-      ...selectedTournament,
-      tickets: state.tournament?.tickets || 0,
-      ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
-      rewardedTicketsEarnedToday: state.tournament?.rewardedTicketsEarnedToday || 0,
-      rewardedTicketsDailyLimit: TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT,
-      nextResetAtMillis: state.tournament?.nextResetAtMillis || nextUtcDayStartMillis(),
-    },
-  };
+  return readAuthoritativePlayerState(client, playerId);
 }
 
 async function readAuthoritativePlayerState(client, playerId) {
@@ -2824,9 +2607,6 @@ async function readAuthoritativePlayerState(client, playerId) {
               p.hundred_active, p.hundred_stage,
               p.hundred_daily_key, p.hundred_daily_base_used,
               p.hundred_daily_ad_used, p.hundred_rewarded_rights,
-              p.hundred_daily_base_used_count, p.hundred_daily_ad_used_count,
-              p.hundred_active_game_key,
-              p.tournament_reward_day_key, p.tournament_rewarded_tickets_today,
               p.game_rights, p.game_rights_refill_at,
               pl.username, pl.country, pl.username_user_set,
               pl.username_change_count, pl.username_last_changed_at,
@@ -2874,18 +2654,13 @@ async function readAuthoritativePlayerState(client, playerId) {
   const storedHundredDayKey = String(row.hundred_daily_key || "");
   const hundredResetNeeded = storedHundredDayKey !== todayKey;
   const hundredDayKey = hundredResetNeeded ? todayKey : storedHundredDayKey;
-  const hundredBaseUsedCount = hundredResetNeeded ? 0
-    : Math.max(0, Math.min(Number(row.hundred_daily_base_used_count || (row.hundred_daily_base_used ? 1 : 0)), HUNDRED_DAILY_BASE_RIGHTS));
-  const hundredAdUsedCount = hundredResetNeeded ? 0
-    : Math.max(0, Math.min(Number(row.hundred_daily_ad_used_count || (row.hundred_daily_ad_used ? 1 : 0)), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
+  const hundredBaseUsed = hundredResetNeeded ? false : row.hundred_daily_base_used === true;
+  const hundredAdUsed = hundredResetNeeded ? false : row.hundred_daily_ad_used === true;
   const hundredRewardedRights = hundredResetNeeded
     ? 0
     : Math.max(0, Math.min(Number(row.hundred_rewarded_rights || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
-  const hundredBaseRightsRemaining = Math.max(0, HUNDRED_DAILY_BASE_RIGHTS - hundredBaseUsedCount);
+  const hundredBaseRightsRemaining = hundredBaseUsed ? 0 : HUNDRED_DAILY_BASE_RIGHTS;
   const hundredActive = row.hundred_active === true;
-  const tournamentRewardResetNeeded = String(row.tournament_reward_day_key || "") !== todayKey;
-  const tournamentRewardedTicketsToday = tournamentRewardResetNeeded ? 0
-    : Math.max(0, Math.min(Number(row.tournament_rewarded_tickets_today || 0), TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT));
 
   // İki oyunculu hakları aynı satırdan hesapla. Hak artmadıysa UPDATE yapılmayacak.
   const storedGameRights = Math.max(
@@ -2910,7 +2685,7 @@ async function readAuthoritativePlayerState(client, playerId) {
 
   // Aynı player_progress satırına ait tüm bakım işlerini tek UPDATE'te birleştir.
   const progressMaintenanceNeeded =
-    levelSettlementNeeded || hundredResetNeeded || tournamentRewardResetNeeded || gameRightsChanged;
+    levelSettlementNeeded || hundredResetNeeded || gameRightsChanged;
   if (progressMaintenanceNeeded) {
     const persistedGameRightsAnchor = gameRightsChanged
       ? calculatedGameRightsAnchor
@@ -2920,15 +2695,11 @@ async function readAuthoritativePlayerState(client, playerId) {
          diamond_balance = LEAST(diamond_balance + $2, 2000000000),
          level_reward_claimed_through = $3,
          hundred_daily_key = $4,
-         hundred_daily_base_used = $5 > 0,
-         hundred_daily_ad_used = $6 > 0,
+         hundred_daily_base_used = $5,
+         hundred_daily_ad_used = $6,
          hundred_rewarded_rights = $7,
-         hundred_daily_base_used_count = $5,
-         hundred_daily_ad_used_count = $6,
-         tournament_reward_day_key = $8,
-         tournament_rewarded_tickets_today = $9,
-         game_rights = $10,
-         game_rights_refill_at = TO_TIMESTAMP($11 / 1000.0),
+         game_rights = $8,
+         game_rights_refill_at = TO_TIMESTAMP($9 / 1000.0),
          updated_at = NOW()
        WHERE player_id = $1`,
       [
@@ -2936,11 +2707,9 @@ async function readAuthoritativePlayerState(client, playerId) {
         levelSettlementNeeded ? levelDiamondDelta : 0,
         levelSettlementNeeded ? eligibleThroughLevel : claimedThroughLevel,
         hundredDayKey,
-        hundredBaseUsedCount,
-        hundredAdUsedCount,
+        hundredBaseUsed,
+        hundredAdUsed,
         hundredRewardedRights,
-        todayKey,
-        tournamentRewardedTicketsToday,
         gameRightsRemaining,
         persistedGameRightsAnchor,
       ]
@@ -2952,30 +2721,6 @@ async function readAuthoritativePlayerState(client, playerId) {
     generalDelta: levelGeneralDelta,
     diamondDelta: levelDiamondDelta,
   };
-
-  const gameProgressRows = await readAllPlayerGameProgress(client, playerId);
-  const games = {};
-  for (const gameRow of gameProgressRows) {
-    const gameKey = normalizeBaseGameKey(gameRow.game_key);
-    games[gameKey] = {
-      gameKey,
-      infiniteScore: Math.max(0, Number(gameRow.infinite_high_score || 0)),
-      runScore: Math.max(0, Number(gameRow.infinite_run_score || 0)),
-      infiniteNextStage: Math.max(1, Number(gameRow.infinite_next_stage || 1)),
-      tournament: {
-        currentStage: Math.max(1, Math.min(Number(gameRow.tournament_stage || 1), 8)),
-        remainingRights: Math.max(0, Math.min(Number(gameRow.tournament_rights ?? 3), 3)),
-        totalScore: Math.max(0, Number(gameRow.tournament_bank || 0)),
-        completed: gameRow.tournament_completed === true,
-        entryActive: gameRow.tournament_entry_active === true,
-      },
-      hundred: {
-        active: hundredActive && normalizeBaseGameKey(row.hundred_active_game_key || "target_number") === gameKey,
-        stage: Math.max(0, Math.min(Number(gameRow.hundred_stage || 0), 12)),
-      },
-    };
-  }
-  const targetGame = games.target_number || {};
 
   const gameRights = {
     remainingRights: gameRightsRemaining,
@@ -2996,8 +2741,8 @@ async function readAuthoritativePlayerState(client, playerId) {
     ),
     levelRewardClaimedThrough: levelRewardSettlement.claimedThroughLevel,
     levelRewardSettlement,
-    runScore: Number(targetGame.runScore || row.infinite_run_score || 0),
-    infiniteNextStage: Math.max(1, Number(targetGame.infiniteNextStage || row.infinite_next_stage || 1)),
+    runScore: Number(row.infinite_run_score || 0),
+    infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
     profile: {
       username: safeUsername(row.username || ""),
       userSet: row.username_user_set === true,
@@ -3007,53 +2752,172 @@ async function readAuthoritativePlayerState(client, playerId) {
       country: safeCountry(row.country),
     },
     tournament: {
-      ...(targetGame.tournament || {}),
-      currentStage: targetGame.tournament?.currentStage ?? Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
-      remainingRights: targetGame.tournament?.remainingRights ?? Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3)),
-      totalScore: targetGame.tournament?.totalScore ?? Math.max(0, Number(row.tournament_bank || 0)),
-      completed: targetGame.tournament?.completed ?? (row.tournament_completed === true),
+      currentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
+      remainingRights: Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3)),
+      totalScore: Math.max(0, Number(row.tournament_bank || 0)),
+      completed: row.tournament_completed === true,
       tickets: Math.max(0, Number(row.tournament_tickets || 0)),
       ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
-      entryActive: targetGame.tournament?.entryActive ?? (row.tournament_entry_active === true),
-      rewardedTicketsEarnedToday: tournamentRewardedTicketsToday,
-      rewardedTicketsDailyLimit: TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT,
-      nextResetAtMillis: nextUtcDayStartMillis(),
+      entryActive: row.tournament_entry_active === true,
     },
     hundred: {
       active: hundredActive,
-      activeGameKey: normalizeBaseGameKey(row.hundred_active_game_key || "target_number"),
       stage: Math.max(0, Math.min(Number(row.hundred_stage || 0), 12)),
       dailyBaseRightsRemaining: hundredBaseRightsRemaining,
       rewardedRightsRemaining: hundredRewardedRights,
-      rewardedAdsUsedToday: hundredAdUsedCount,
-      rewardedAdsDailyLimit: HUNDRED_DAILY_REWARDED_RIGHTS_MAX,
-      rewardedAdUsedToday: hundredAdUsedCount > 0,
+      rewardedAdUsedToday: hundredAdUsed,
       rewardedAdAvailable:
-        !hundredActive && hundredBaseRightsRemaining <= 0 && hundredAdUsedCount < HUNDRED_DAILY_REWARDED_RIGHTS_MAX,
-      canStart: !hundredActive && (hundredBaseRightsRemaining + hundredRewardedRights > 0),
+        !hundredActive && hundredBaseUsed && !hundredAdUsed && hundredRewardedRights <= 0,
+      canStart:
+        !hundredActive && (hundredBaseRightsRemaining + hundredRewardedRights > 0),
       nextResetAtMillis: nextUtcDayStartMillis(),
       dayKey: hundredDayKey,
     },
-    games,
     gameRights,
   };
 }
 
 async function readAuthoritativePlayerStateReadMostly(playerId) {
   if (!pool) return null;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await ensureAuthenticatedPlayer(client, playerId);
-    const state = await readAuthoritativePlayerState(client, playerId);
-    await client.query("COMMIT");
-    return state;
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
+  const result = await pool.query(
+    `SELECT s.general_score, s.infinite_score,
+            p.total_xp, p.infinite_run_score, p.infinite_next_stage,
+            p.diamond_balance, p.level_reward_claimed_through,
+            p.tournament_stage, p.tournament_rights,
+            p.tournament_bank, p.tournament_completed,
+            p.tournament_tickets, p.tournament_entry_active,
+            p.hundred_active, p.hundred_stage,
+            p.hundred_daily_key, p.hundred_daily_base_used,
+            p.hundred_daily_ad_used, p.hundred_rewarded_rights,
+            p.game_rights, p.game_rights_refill_at,
+            pl.username, pl.country, pl.username_user_set,
+            pl.username_change_count, pl.username_last_changed_at,
+            pl.updated_at AS profile_updated_at
+     FROM player_scores s
+     JOIN player_progress p ON p.player_id = s.player_id
+     JOIN players pl ON pl.player_id = s.player_id
+     WHERE s.player_id = $1`,
+    [playerId]
+  );
+
+  // Eksik eski hesap veya gerçekten yazılması gereken bakım varsa yalnız o nadir durumda
+  // eski kilitli/transactional yola düş. Common path tek plain SELECT'tir.
+  if (result.rowCount === 0) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await ensureAuthenticatedPlayer(client, playerId);
+      const state = await readAuthoritativePlayerState(client, playerId);
+      await client.query('COMMIT');
+      return state;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
+
+  const row = result.rows[0] || {};
+  const now = Date.now();
+  const totalXp = Math.max(0, Math.min(Number(row.total_xp || 0), 2_000_000_000));
+  const levelSettlement = calculateLevelMilestoneSettlement(
+    totalXp,
+    row.level_reward_claimed_through
+  );
+  const levelSettlementNeeded =
+    levelSettlement.claimedThroughLevel !== Math.max(
+      0,
+      Math.min(1000, Math.floor(Number(row.level_reward_claimed_through || 0) / 10) * 10)
+    );
+
+  const todayKey = currentUtcDayKey();
+  const hundredResetNeeded = String(row.hundred_daily_key || '') !== todayKey;
+  const hundredDayKey = hundredResetNeeded ? todayKey : String(row.hundred_daily_key || '');
+  const hundredBaseUsed = hundredResetNeeded ? false : row.hundred_daily_base_used === true;
+  const hundredAdUsed = hundredResetNeeded ? false : row.hundred_daily_ad_used === true;
+  const hundredRewardedRights = hundredResetNeeded
+    ? 0
+    : Math.max(0, Math.min(Number(row.hundred_rewarded_rights || 0), HUNDRED_DAILY_REWARDED_RIGHTS_MAX));
+  const hundredBaseRightsRemaining = hundredBaseUsed ? 0 : HUNDRED_DAILY_BASE_RIGHTS;
+  const hundredActive = row.hundred_active === true;
+
+  const storedGameRights = Math.max(0, Math.min(Number(row.game_rights ?? GAME_RIGHT_MAX), GAME_RIGHT_MAX));
+  const storedGameRightsAnchor = new Date(row.game_rights_refill_at || now).getTime();
+  const gameRightsElapsed = Math.max(0, now - storedGameRightsAnchor);
+  const refillCount = storedGameRights >= GAME_RIGHT_MAX ? 0 : Math.floor(gameRightsElapsed / GAME_RIGHT_REFILL_MS);
+  const gameRightsRemaining = Math.min(GAME_RIGHT_MAX, storedGameRights + refillCount);
+  const gameRightsChanged = gameRightsRemaining !== storedGameRights;
+  const gameRightsAnchor = gameRightsRemaining >= GAME_RIGHT_MAX
+    ? now
+    : storedGameRightsAnchor + refillCount * GAME_RIGHT_REFILL_MS;
+
+  if (levelSettlementNeeded || hundredResetNeeded || gameRightsChanged) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const state = await readAuthoritativePlayerState(client, playerId);
+      await client.query('COMMIT');
+      return state;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  return {
+    generalScore: Number(row.general_score || 0),
+    infiniteScore: Number(row.infinite_score || 0),
+    totalXp,
+    diamondBalance: Math.max(0, Number(row.diamond_balance || 0)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: {
+      claimedThroughLevel: levelSettlement.claimedThroughLevel,
+      generalDelta: 0,
+      diamondDelta: 0,
+    },
+    runScore: Number(row.infinite_run_score || 0),
+    infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
+    profile: {
+      username: safeUsername(row.username || ''),
+      userSet: row.username_user_set === true,
+      changeCountAfterInitial: Math.max(0, Number(row.username_change_count || 0)),
+      lastChangeTimeMillis: timestampMillis(row.username_last_changed_at),
+      updatedAtMillis: timestampMillis(row.profile_updated_at),
+      country: safeCountry(row.country),
+    },
+    tournament: {
+      currentStage: Math.max(1, Math.min(Number(row.tournament_stage || 1), 8)),
+      remainingRights: Math.max(0, Math.min(Number(row.tournament_rights ?? 3), 3)),
+      totalScore: Math.max(0, Number(row.tournament_bank || 0)),
+      completed: row.tournament_completed === true,
+      tickets: Math.max(0, Number(row.tournament_tickets || 0)),
+      ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
+      entryActive: row.tournament_entry_active === true,
+    },
+    hundred: {
+      active: hundredActive,
+      stage: Math.max(0, Math.min(Number(row.hundred_stage || 0), 12)),
+      dailyBaseRightsRemaining: hundredBaseRightsRemaining,
+      rewardedRightsRemaining: hundredRewardedRights,
+      rewardedAdUsedToday: hundredAdUsed,
+      rewardedAdAvailable:
+        !hundredActive && hundredBaseUsed && !hundredAdUsed && hundredRewardedRights <= 0,
+      canStart: !hundredActive && (hundredBaseRightsRemaining + hundredRewardedRights > 0),
+      nextResetAtMillis: nextUtcDayStartMillis(),
+      dayKey: hundredDayKey,
+    },
+    gameRights: {
+      remainingRights: gameRightsRemaining,
+      maxRights: GAME_RIGHT_MAX,
+      lastRefillTimeMillis: gameRightsAnchor,
+      millisUntilNextRight: gameRightsRemaining >= GAME_RIGHT_MAX
+        ? 0
+        : Math.max(0, GAME_RIGHT_REFILL_MS - (now - gameRightsAnchor)),
+    },
+  };
 }
 
 async function applyTournamentOutcomeInTransaction(
@@ -3061,22 +2925,22 @@ async function applyTournamentOutcomeInTransaction(
   playerId,
   won,
   requestedStage,
-  playerAlreadyEnsured = false,
-  gameKeyValue = "target_number"
+  playerAlreadyEnsured = false
 ) {
-  if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
-  const gameKey = normalizeBaseGameKey(gameKeyValue);
+  void playerAlreadyEnsured;
+  // Turnuva partial SELECT + final full-state SELECT yerine tek authoritative snapshot kullanır.
   const before = await readAuthoritativePlayerState(client, playerId);
-  const progress = await readPlayerGameProgress(client, playerId, gameKey, true);
-  const currentStage = Math.max(1, Math.min(Number(progress.tournament_stage || 1), 8));
-  const remainingRights = Math.max(0, Math.min(Number(progress.tournament_rights ?? 3), 3));
-  const bank = Math.max(0, Number(progress.tournament_bank || 0));
-  const completedBefore = progress.tournament_completed === true;
-  const entryActive = progress.tournament_entry_active === true;
+  const currentStage = Math.max(1, Math.min(Number(before.tournament?.currentStage || 1), 8));
+  const remainingRights = Math.max(0, Math.min(Number(before.tournament?.remainingRights ?? 3), 3));
+  const bank = Math.max(0, Number(before.tournament?.totalScore || 0));
+  const completedBefore = before.tournament?.completed === true;
+  const entryActive = before.tournament?.entryActive === true;
   const stage = Math.max(1, Math.min(Number(requestedStage || currentStage), 8));
   if (stage !== currentStage || completedBefore || remainingRights <= 0 || !entryActive) {
     const error = new Error("Turnuva aşaması sunucu ilerlemesiyle uyuşmuyor.");
-    error.statusCode = 409; error.publicCode = "TOURNAMENT_STATE_MISMATCH"; throw error;
+    error.statusCode = 409;
+    error.publicCode = "TOURNAMENT_STATE_MISMATCH";
+    throw error;
   }
 
   let nextStage = currentStage;
@@ -3093,71 +2957,105 @@ async function applyTournamentOutcomeInTransaction(
     xpDelta = stageReward;
     completed = currentStage >= 8;
     nextStage = completed ? 8 : currentStage + 1;
-    if (completed) { awardedScore = nextBank; nextEntryActive = false; }
+    if (completed) {
+      awardedScore = nextBank;
+      nextEntryActive = false;
+    }
   } else if (won === false) {
     nextRights = Math.max(0, remainingRights - 1);
     if (nextRights === 0) {
       awardedScore = bank;
-      nextStage = 1; nextRights = 3; nextBank = 0; completed = false; nextEntryActive = false;
+      nextStage = 1;
+      nextRights = 3;
+      nextBank = 0;
+      completed = false;
+      nextEntryActive = false;
     }
   }
 
   const totalXpAfter = Math.min(2_000_000_000, Number(before.totalXp || 0) + xpDelta);
-  const levelSettlement = calculateLevelMilestoneSettlement(totalXpAfter, before.levelRewardClaimedThrough);
+  const levelSettlement = calculateLevelMilestoneSettlement(
+    totalXpAfter,
+    before.levelRewardClaimedThrough
+  );
   const persistedGeneralDelta = awardedScore + levelSettlement.generalDelta;
-  if (persistedGeneralDelta > 0) {
-    await applyLeaderboardScoreDeltaInTransaction(client, playerId, persistedGeneralDelta, 0);
-  }
+  const monthKey = currentMonthKey();
+
+  // Turnuva progress + XP/level + skor ödülünü tek DB statement'ında uygula.
   await client.query(
-    `UPDATE player_progress SET total_xp = $2,
-       diamond_balance = LEAST(diamond_balance + $3, 2000000000),
-       level_reward_claimed_through = $4, updated_at = NOW()
+    `WITH score_update AS (
+       UPDATE player_scores
+       SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+           monthly_general_score = CASE
+             WHEN monthly_key = $11 THEN
+               GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
+             ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+           END,
+           monthly_infinite_score = CASE WHEN monthly_key = $11 THEN monthly_infinite_score ELSE 0 END,
+           monthly_key = $11,
+           monthly_updated_at = NOW(),
+           updated_at = NOW()
+       WHERE player_id = $1 AND $2::bigint <> 0
+       RETURNING player_id
+     )
+     UPDATE player_progress
+     SET tournament_stage = $3,
+         tournament_rights = $4,
+         tournament_bank = $5,
+         tournament_completed = $6,
+         tournament_entry_active = $7,
+         total_xp = $8,
+         diamond_balance = LEAST(diamond_balance + $9, 2000000000),
+         level_reward_claimed_through = $10,
+         updated_at = NOW()
      WHERE player_id = $1`,
-    [playerId, totalXpAfter, levelSettlement.diamondDelta, levelSettlement.claimedThroughLevel]
+    [
+      playerId,
+      persistedGeneralDelta,
+      nextStage,
+      nextRights,
+      nextBank,
+      completed,
+      nextEntryActive,
+      totalXpAfter,
+      levelSettlement.diamondDelta,
+      levelSettlement.claimedThroughLevel,
+      monthKey,
+    ]
   );
-  await client.query(
-    `UPDATE player_game_progress SET tournament_stage = $3, tournament_rights = $4,
-       tournament_bank = $5, tournament_completed = $6, tournament_entry_active = $7, updated_at = NOW()
-     WHERE player_id = $1 AND game_key = $2`,
-    [playerId, gameKey, nextStage, nextRights, nextBank, completed, nextEntryActive]
-  );
-  if (gameKey === "target_number") {
-    await client.query(
-      `UPDATE player_progress SET tournament_stage = $2, tournament_rights = $3,
-         tournament_bank = $4, tournament_completed = $5, tournament_entry_active = $6, updated_at = NOW()
-       WHERE player_id = $1`,
-      [playerId, nextStage, nextRights, nextBank, completed, nextEntryActive]
-    );
-  }
-  const after = await readAuthoritativePlayerState(client, playerId);
-  const selectedTournament = after.games?.[gameKey]?.tournament || {};
+
   return {
-    ...after,
+    ...before,
+    generalScore: Math.max(0, Math.min(2_000_000_000,
+      Number(before.generalScore || 0) + persistedGeneralDelta)),
+    totalXp: totalXpAfter,
+    diamondBalance: Math.max(0, Math.min(2_000_000_000,
+      Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
+    levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
+    levelRewardSettlement: levelSettlement,
     generalDelta: awardedScore,
     infiniteDelta: 0,
     xpDelta,
     awardedScore,
     won,
-    gameKey,
     tournament: {
-      ...selectedTournament,
-      tickets: after.tournament?.tickets || 0,
-      ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
-      rewardedTicketsEarnedToday: after.tournament?.rewardedTicketsEarnedToday || 0,
-      rewardedTicketsDailyLimit: TOURNAMENT_REWARDED_TICKETS_DAILY_LIMIT,
-      nextResetAtMillis: nextUtcDayStartMillis(),
+      ...before.tournament,
+      currentStage: nextStage,
+      remainingRights: nextRights,
+      totalScore: nextBank,
+      completed,
+      entryActive: nextEntryActive,
+      awardedScore,
     },
   };
 }
 
-async function applyTournamentOutcome(playerId, won, requestedStage, gameKeyValue = "target_number") {
+async function applyTournamentOutcome(playerId, won, requestedStage) {
   if (!pool || !playerId) return null;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const result = await applyTournamentOutcomeInTransaction(
-      client, playerId, won, requestedStage, false, gameKeyValue
-    );
+    const result = await applyTournamentOutcomeInTransaction(client, playerId, won, requestedStage);
     await client.query("COMMIT");
     return result;
   } catch (error) {
@@ -3214,7 +3112,6 @@ function hundredEliminationReward(stageValue) {
 async function completeHundredStageInTransaction(client, playerId, stageValue) {
   // İlk partial SELECT + final full-state SELECT yerine tek authoritative kilitli snapshot kullan.
   const before = await readAuthoritativePlayerState(client, playerId);
-  const gameKey = normalizeBaseGameKey(before.hundred?.activeGameKey || "target_number");
   const currentStage = Math.max(1, Math.min(Number(before.hundred?.stage || 1), 12));
   const stage = Math.max(1, Math.min(Number(stageValue || currentStage), 12));
   if (before.hundred?.active !== true || stage !== currentStage) {
@@ -3268,7 +3165,6 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
      UPDATE player_progress
      SET hundred_active = $3,
          hundred_stage = $4,
-         hundred_active_game_key = CASE WHEN $3 THEN hundred_active_game_key ELSE '' END,
          total_xp = $5,
          diamond_balance = LEAST(diamond_balance + $6, 2000000000),
          level_reward_claimed_through = $7,
@@ -3285,12 +3181,6 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
       monthKey,
     ]
   );
-  await ensurePlayerGameProgress(client, playerId, gameKey);
-  await client.query(
-    `UPDATE player_game_progress SET hundred_stage = $3, updated_at = NOW()
-     WHERE player_id = $1 AND game_key = $2`,
-    [playerId, gameKey, nextStage]
-  );
 
   return {
     ...before,
@@ -3305,11 +3195,10 @@ async function completeHundredStageInTransaction(client, playerId, stageValue) {
       ...before.hundred,
       active: !runCompleted,
       stage: nextStage,
-      activeGameKey: runCompleted ? "" : gameKey,
       rewardedAdAvailable: runCompleted
-        ? (Number(before.hundred?.dailyBaseRightsRemaining || 0) <= 0 &&
-           Number(before.hundred?.rewardedAdsUsedToday || 0) <
-             Number(before.hundred?.rewardedAdsDailyLimit || HUNDRED_DAILY_REWARDED_RIGHTS_MAX))
+        ? (before.hundred?.dailyBaseRightsRemaining <= 0 &&
+           before.hundred?.rewardedAdUsedToday !== true &&
+           Number(before.hundred?.rewardedRightsRemaining || 0) <= 0)
         : false,
       canStart: runCompleted
         ? ((Number(before.hundred?.dailyBaseRightsRemaining || 0) +
@@ -3340,13 +3229,12 @@ async function forfeitHundredRunInTransaction(client, playerId) {
       hundredRunCompleted: true,
     };
   }
-  const gameKey = normalizeBaseGameKey(before.hundred?.activeGameKey || "target_number");
   const stage = Math.max(1, Math.min(Number(before.hundred?.stage || 1), 12));
   const activeChallenge = await client.query(
     `SELECT challenge_id FROM secure_game_challenges
-     WHERE player_id = $1 AND mode = 'hundred' AND game_key = $2 AND completed_at IS NULL
+     WHERE player_id = $1 AND mode = 'hundred' AND completed_at IS NULL
      ORDER BY created_at DESC LIMIT 1`,
-    [playerId, gameKey]
+    [playerId]
   );
   await recordTaskEventInTransaction(client, {
     playerId,
@@ -3354,7 +3242,7 @@ async function forfeitHundredRunInTransaction(client, playerId) {
       ? `challenge:${activeChallenge.rows[0].challenge_id}`
       : `hundred-forfeit:${stage}:${Date.now()}`,
     eventType: "game",
-    gameKey,
+    gameKey: "target_number",
     multiplayer: true,
     won: false,
   });
@@ -3388,7 +3276,6 @@ async function forfeitHundredRunInTransaction(client, playerId) {
      UPDATE player_progress
      SET hundred_active = FALSE,
          hundred_stage = 0,
-         hundred_active_game_key = '',
          total_xp = $3,
          diamond_balance = LEAST(diamond_balance + $4, 2000000000),
          level_reward_claimed_through = $5,
@@ -3403,19 +3290,13 @@ async function forfeitHundredRunInTransaction(client, playerId) {
       monthKey,
     ]
   );
-  await ensurePlayerGameProgress(client, playerId, gameKey);
-  await client.query(
-    `UPDATE player_game_progress SET hundred_stage = 0, updated_at = NOW()
-     WHERE player_id = $1 AND game_key = $2`,
-    [playerId, gameKey]
-  );
   await client.query(
     `UPDATE secure_game_challenges SET
        completed_at = COALESCE(completed_at, NOW()),
        result = CASE WHEN completed_at IS NULL
          THEN '{"status":"forfeit"}'::jsonb ELSE result END
-     WHERE player_id = $1 AND mode = 'hundred' AND game_key = $2 AND completed_at IS NULL`,
-    [playerId, gameKey]
+     WHERE player_id = $1 AND mode = 'hundred' AND completed_at IS NULL`,
+    [playerId]
   );
 
   return {
@@ -3431,11 +3312,10 @@ async function forfeitHundredRunInTransaction(client, playerId) {
       ...before.hundred,
       active: false,
       stage: 0,
-      activeGameKey: "",
       rewardedAdAvailable:
-        Number(before.hundred?.dailyBaseRightsRemaining || 0) <= 0 &&
-        Number(before.hundred?.rewardedAdsUsedToday || 0) <
-          Number(before.hundred?.rewardedAdsDailyLimit || HUNDRED_DAILY_REWARDED_RIGHTS_MAX),
+        before.hundred?.dailyBaseRightsRemaining <= 0 &&
+        before.hundred?.rewardedAdUsedToday !== true &&
+        Number(before.hundred?.rewardedRightsRemaining || 0) <= 0,
       canStart:
         Number(before.hundred?.dailyBaseRightsRemaining || 0) +
         Number(before.hundred?.rewardedRightsRemaining || 0) > 0,
@@ -3626,8 +3506,6 @@ function compactChallengeResult(response) {
       hundredStage: Math.max(0, Number(response?.hundredStage || 0)),
       hundredRunCompleted: response?.hundredRunCompleted === true,
       runScore: Math.max(0, Number(response?.runScore || 0)),
-      gameKey: normalizeBaseGameKey(response?.gameKey || "target_number"),
-      gameInfiniteScore: Math.max(0, Number(response?.gameInfiniteScore || 0)),
     },
   };
 }
@@ -3644,16 +3522,7 @@ async function rebuildStoredChallengeResponseInTransaction(client, playerId, sto
     infiniteDelta: Number(summary.infiniteDelta || 0),
     xpDelta: Number(summary.xpDelta || 0),
     ...state,
-    gameKey: normalizeBaseGameKey(summary.gameKey || "target_number"),
-    gameInfiniteScore: Math.max(
-      0,
-      Number(
-        state.games?.[normalizeBaseGameKey(summary.gameKey || "target_number")]?.infiniteScore ||
-        summary.gameInfiniteScore ||
-        0
-      )
-    ),
-    runScore: Math.max(0, Number(summary.runScore || state.runScore || 0)),
+    runScore: Math.max(0, Number(state.runScore || summary.runScore || 0)),
     won: summary.won === null || summary.won === undefined ? null : summary.won === true,
     outcomeReason: summary.outcomeReason || null,
     elapsedServerMs: Math.max(0, Number(summary.elapsedServerMs || 0)),
@@ -3779,7 +3648,7 @@ async function settleTwoPlayerBotChallengeAsDrawInTransaction(
     playerId,
     sourceKey: `challenge:${challenge.challenge_id}`,
     eventType: "game",
-    gameKey: normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey),
+    gameKey: "target_number",
     multiplayer: true,
     won: false,
   });
@@ -3798,8 +3667,7 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
   let response;
   if (challenge.mode === "tournament_bot") {
     const tournamentResult = await applyTournamentOutcomeInTransaction(
-      client, playerId, false, Number(challenge.stage), false,
-      normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey)
+      client, playerId, false, Number(challenge.stage)
     );
     response = {
       ok: true,
@@ -3824,7 +3692,7 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
     playerId,
     sourceKey: `challenge:${challenge.challenge_id}`,
     eventType: "game",
-    gameKey: normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey),
+    gameKey: "target_number",
     multiplayer: true,
     won: false,
   });
@@ -3836,32 +3704,7 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
   return response;
 }
 
-function validateEqualSumGrid(puzzle, gridValuesRaw) {
-  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  const grid = Array.isArray(gridValuesRaw) ? gridValuesRaw.map(Number) : [];
-  if (numbers.length !== 36 || grid.length !== 36) return false;
-  if (!grid.every(Number.isInteger)) return false;
-  const available = [...numbers].sort((a, b) => a - b);
-  const submitted = [...grid].sort((a, b) => a - b);
-  if (!submitted.every((value, index) => value === available[index])) return false;
-  const target = Number(puzzle.targetSum ?? puzzle.target);
-  if (!Number.isFinite(target)) return false;
-  for (let row = 0; row < 6; row += 1) {
-    let sum = 0;
-    for (let col = 0; col < 6; col += 1) sum += grid[row * 6 + col];
-    if (sum !== target) return false;
-  }
-  for (let col = 0; col < 6; col += 1) {
-    let sum = 0;
-    for (let row = 0; row < 6; row += 1) sum += grid[row * 6 + col];
-    if (sum !== target) return false;
-  }
-  return true;
-}
-
-function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValuesRaw) {
-  const gameKey = normalizeBaseGameKey(puzzle?.gameKey);
-  if (gameKey === "equal_sum") return validateEqualSumGrid(puzzle, gridValuesRaw);
+function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const numberSlots = Array.isArray(numberSlotsRaw) ? numberSlotsRaw.map(Number) : [];
   const operators = Array.isArray(operatorsRaw) ? operatorsRaw.map(String) : [];
@@ -4212,13 +4055,17 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
   await client.query(
     `UPDATE player_scores AS target
      SET general_score = LEAST(target.general_score::bigint + guest.general_score::bigint, 2000000000)::integer,
+         infinite_score = LEAST(target.infinite_score::bigint + guest.infinite_score::bigint, 2000000000)::integer,
          monthly_general_score = LEAST(
            (CASE WHEN target.monthly_key = $3 THEN target.monthly_general_score ELSE 0 END)::bigint +
            (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_general_score ELSE 0 END)::bigint,
            2000000000
          )::integer,
-         -- Sonsuz skor oyun başına high-score olduğundan burada toplanmaz. player_game_progress
-         -- birleştirildikten sonra aggregate değer yeniden hesaplanır.
+         monthly_infinite_score = LEAST(
+           (CASE WHEN target.monthly_key = $3 THEN target.monthly_infinite_score ELSE 0 END)::bigint +
+           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_infinite_score ELSE 0 END)::bigint,
+           2000000000
+         )::integer,
          monthly_key = $3,
          monthly_updated_at = NOW(),
          updated_at = NOW()
@@ -4248,20 +4095,7 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          hundred_daily_key = GREATEST(target.hundred_daily_key, guest.hundred_daily_key),
          hundred_daily_base_used = target.hundred_daily_base_used OR guest.hundred_daily_base_used,
          hundred_daily_ad_used = target.hundred_daily_ad_used OR guest.hundred_daily_ad_used,
-         hundred_daily_base_used_count = LEAST(target.hundred_daily_base_used_count + guest.hundred_daily_base_used_count, 2),
-         hundred_daily_ad_used_count = LEAST(target.hundred_daily_ad_used_count + guest.hundred_daily_ad_used_count, 2),
-         hundred_rewarded_rights = LEAST(target.hundred_rewarded_rights + guest.hundred_rewarded_rights, 2),
-         hundred_active_game_key = CASE
-           WHEN target.hundred_active THEN target.hundred_active_game_key
-           WHEN guest.hundred_active THEN guest.hundred_active_game_key
-           ELSE ''
-         END,
-         tournament_reward_day_key = $3,
-         tournament_rewarded_tickets_today = LEAST(
-           (CASE WHEN target.tournament_reward_day_key = $3 THEN target.tournament_rewarded_tickets_today ELSE 0 END) +
-           (CASE WHEN guest.tournament_reward_day_key = $3 THEN guest.tournament_rewarded_tickets_today ELSE 0 END),
-           15
-         ),
+         hundred_rewarded_rights = GREATEST(target.hundred_rewarded_rights, guest.hundred_rewarded_rights),
          game_rights = GREATEST(target.game_rights, guest.game_rights),
          game_rights_refill_at = LEAST(target.game_rights_refill_at, guest.game_rights_refill_at),
          diamond_balance = LEAST(target.diamond_balance::bigint + guest.diamond_balance::bigint, 2000000000)::integer,
@@ -4271,44 +4105,8 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          updated_at = NOW()
      FROM player_progress AS guest
      WHERE target.player_id = $2 AND guest.player_id = $1`,
-    [guestId, playGamesPlayerId, currentUtcDayKey()]
+    [guestId, playGamesPlayerId]
   );
-
-  // Oyun-bazlı sonsuz/turnuva/100 kişilik ilerlemeleri gameKey başına birleştir.
-  // High-score ve aktif seri değerleri toplanmaz; en ileri/iyi kayıt korunur.
-  await client.query(
-    `INSERT INTO player_game_progress (
-       player_id, game_key, infinite_high_score, infinite_monthly_key, infinite_monthly_high_score,
-       infinite_run_score, infinite_next_stage, tournament_stage, tournament_rights, tournament_bank,
-       tournament_completed, tournament_entry_active, hundred_stage, updated_at
-     )
-     SELECT $2, game_key, infinite_high_score, infinite_monthly_key, infinite_monthly_high_score,
-            infinite_run_score, infinite_next_stage, tournament_stage, tournament_rights, tournament_bank,
-            tournament_completed, tournament_entry_active, hundred_stage, NOW()
-     FROM player_game_progress WHERE player_id = $1
-     ON CONFLICT (player_id, game_key) DO UPDATE SET
-       infinite_high_score = GREATEST(player_game_progress.infinite_high_score, EXCLUDED.infinite_high_score),
-       infinite_monthly_key = CASE
-         WHEN player_game_progress.infinite_monthly_key = $3 THEN $3
-         WHEN EXCLUDED.infinite_monthly_key = $3 THEN $3
-         ELSE player_game_progress.infinite_monthly_key
-       END,
-       infinite_monthly_high_score = GREATEST(
-         CASE WHEN player_game_progress.infinite_monthly_key = $3 THEN player_game_progress.infinite_monthly_high_score ELSE 0 END,
-         CASE WHEN EXCLUDED.infinite_monthly_key = $3 THEN EXCLUDED.infinite_monthly_high_score ELSE 0 END
-       ),
-       infinite_run_score = GREATEST(player_game_progress.infinite_run_score, EXCLUDED.infinite_run_score),
-       infinite_next_stage = GREATEST(player_game_progress.infinite_next_stage, EXCLUDED.infinite_next_stage),
-       tournament_stage = GREATEST(player_game_progress.tournament_stage, EXCLUDED.tournament_stage),
-       tournament_rights = GREATEST(player_game_progress.tournament_rights, EXCLUDED.tournament_rights),
-       tournament_bank = GREATEST(player_game_progress.tournament_bank, EXCLUDED.tournament_bank),
-       tournament_completed = player_game_progress.tournament_completed OR EXCLUDED.tournament_completed,
-       tournament_entry_active = player_game_progress.tournament_entry_active OR EXCLUDED.tournament_entry_active,
-       hundred_stage = GREATEST(player_game_progress.hundred_stage, EXCLUDED.hundred_stage),
-       updated_at = NOW()`,
-    [guestId, playGamesPlayerId, migrationMonthKey]
-  );
-  await refreshAggregateInfiniteScoreInTransaction(client, playGamesPlayerId);
 
   // Tamamlanmamış güvenli challenge'lar ve görev geçmişleri de hedef hesaba bağlanır.
   await client.query(
@@ -4376,7 +4174,7 @@ async function recordRealtimeRoomTasksInTransaction(client, room, realWinner, re
       playerId: realWinner.playerId,
       sourceKey,
       eventType: "game",
-      gameKey: normalizeBaseGameKey(room.gameKey),
+      gameKey: "target_number",
       multiplayer: true,
       won: true,
       playerAlreadyEnsured: true,
@@ -4387,7 +4185,7 @@ async function recordRealtimeRoomTasksInTransaction(client, room, realWinner, re
       playerId: realLoser.playerId,
       sourceKey,
       eventType: "game",
-      gameKey: normalizeBaseGameKey(room.gameKey),
+      gameKey: "target_number",
       multiplayer: true,
       won: false,
       playerAlreadyEnsured: true,
@@ -4504,10 +4302,10 @@ async function settleTournamentRealtimeRoom(room, realWinner, realLoser) {
   try {
     await client.query("BEGIN");
     const winnerState = realWinner
-      ? await applyTournamentOutcomeInTransaction(client, realWinner.playerId, true, realWinner.tournamentStage, true, normalizeBaseGameKey(room.gameKey))
+      ? await applyTournamentOutcomeInTransaction(client, realWinner.playerId, true, realWinner.tournamentStage, true)
       : null;
     const loserState = realLoser
-      ? await applyTournamentOutcomeInTransaction(client, realLoser.playerId, false, realLoser.tournamentStage, true, normalizeBaseGameKey(room.gameKey))
+      ? await applyTournamentOutcomeInTransaction(client, realLoser.playerId, false, realLoser.tournamentStage, true)
       : null;
     await recordRealtimeRoomTasksInTransaction(client, room, realWinner, realLoser);
     await client.query("COMMIT");
@@ -4547,7 +4345,7 @@ async function awardRealtimeRoom(room, winner, loser) {
     return;
   }
 
-  if (String(room.gameKey).endsWith("_tournament")) {
+  if (room.gameKey === "target_number_tournament") {
     const { winnerState, loserState } = await settleTournamentRealtimeRoom(room, realWinner, realLoser);
     const winnerSocket = realWinner?.socketId ? io.sockets.sockets.get(realWinner.socketId) : null;
     const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
@@ -4556,7 +4354,7 @@ async function awardRealtimeRoom(room, winner, loser) {
     return;
   }
 
-  if (!SUPPORTED_GAME_KEYS.has(normalizeBaseGameKey(room.gameKey))) return;
+  if (room.gameKey !== "target_number") return;
   const { winnerState, loserState } = await settleNormalRealtimeRoom(room, realWinner, realLoser);
   const winnerSocket = realWinner?.socketId ? io.sockets.sockets.get(realWinner.socketId) : null;
   const loserSocket = realLoser?.socketId ? io.sockets.sockets.get(realLoser.socketId) : null;
@@ -4826,16 +4624,22 @@ app.get("/player/state", requireAuth, async (req, res) => {
 app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const fresh = req.body.fresh === true;
-  const gameKey = normalizeBaseGameKey(req.body.gameKey);
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
   const lifetimeMs = 2 * 60 * 1000;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const access = await normalizeHundredDailyAccessInTransaction(client, req.auth.sub, true);
+    // normalizeHundred... aynı progress satırını FOR UPDATE ile zaten okudu/kilitledi.
+    const before = {
+      hundred_active: access.active,
+      hundred_stage: access.stage,
+      hundred_daily_base_used: access.baseRightsRemaining <= 0,
+      hundred_rewarded_rights: access.rewardedRightsRemaining,
+    };
 
     if (fresh) {
-      if (access.active) {
+      if (before.hundred_active === true) {
         const error = new Error("Zaten aktif bir 100 kişilik oyununuz var.");
         error.statusCode = 409;
         error.publicCode = "HUNDRED_RUN_ACTIVE";
@@ -4845,79 +4649,62 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
       if (access.baseRightsRemaining > 0) {
         await client.query(
           `UPDATE player_progress SET
-             hundred_daily_base_used_count = LEAST(hundred_daily_base_used_count + 1, $2),
              hundred_daily_base_used = TRUE,
              hundred_active = TRUE,
-             hundred_active_game_key = $3,
              hundred_stage = 1,
              updated_at = NOW()
            WHERE player_id = $1`,
-          [req.auth.sub, HUNDRED_DAILY_BASE_RIGHTS, gameKey]
+          [req.auth.sub]
         );
-      } else if (access.rewardedRightsRemaining > 0) {
+      } else if (Number(before.hundred_rewarded_rights || 0) > 0) {
         await client.query(
           `UPDATE player_progress SET
-             hundred_rewarded_rights = GREATEST(hundred_rewarded_rights - 1, 0),
+             hundred_rewarded_rights = hundred_rewarded_rights - 1,
              hundred_active = TRUE,
-             hundred_active_game_key = $2,
              hundred_stage = 1,
              updated_at = NOW()
            WHERE player_id = $1`,
-          [req.auth.sub, gameKey]
+          [req.auth.sub]
         );
       } else {
-        const error = new Error(
-          access.rewardedAdsUsedToday < HUNDRED_DAILY_REWARDED_RIGHTS_MAX
-            ? "Bugünkü 2 ücretsiz 100 kişilik oyun hakkınız bitti. Reklam izleyerek bugün en fazla 2 ek hak kazanabilirsiniz."
-            : "Bugünkü 2 ücretsiz ve 2 reklamlı 100 kişilik oyun hakkınızın tamamını kullandınız."
-        );
+        const error = new Error("Bugünkü 100 kişilik oyun hakkınız bitti. Reklam izleyerek bir kez daha oynayabilirsiniz.");
         error.statusCode = 409;
         error.publicCode = "HUNDRED_DAILY_RIGHT_EXHAUSTED";
         throw error;
       }
-      await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
-      await client.query(
-        `UPDATE player_game_progress SET hundred_stage = 1, updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey]
-      );
-    } else {
-      if (!access.active) {
-        const error = new Error("100 kişilik oyun aktif değil.");
-        error.statusCode = 409;
-        throw error;
-      }
-      if (normalizeBaseGameKey(access.activeGameKey) !== gameKey) {
-        const error = new Error("Aktif 100 kişilik seri başka bir oyuna ait.");
-        error.statusCode = 409;
-        error.publicCode = "HUNDRED_GAME_MISMATCH";
-        throw error;
-      }
     }
 
+    // access satırı transaction başında FOR UPDATE ile okundu. Fresh başlangıçta az önce
+    // stage=1 yazdık; devam oyununda da access.stage zaten kilitli satırdan geldi.
+    const activeAfterStart = fresh ? true : access.active;
+    if (!activeAfterStart) {
+      const error = new Error("100 kişilik oyun aktif değil.");
+      error.statusCode = 409;
+      throw error;
+    }
     const stage = fresh
       ? 1
       : Math.max(1, Math.min(Number(access.stage || 1), 12));
     const difficulty = hundredDifficultyForStage(stage);
-    const puzzle = generateSecurePuzzle(difficulty, gameKey);
+    const puzzle = generateSecurePuzzle(difficulty);
+    // Eski aktif 100 kişilik challenge'ı kapatma + yenisini eklemeyi tek DB round-trip'te yap.
     await client.query(
       `WITH superseded AS (
          UPDATE secure_game_challenges
          SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
-         WHERE player_id = $2 AND mode = 'hundred' AND game_key = $3 AND completed_at IS NULL
+         WHERE player_id = $2 AND mode = 'hundred' AND completed_at IS NULL
          RETURNING challenge_id
        )
        INSERT INTO secure_game_challenges
-         (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, expires_at)
-       VALUES ($1, $2, $3, 'hundred', $4, $5, $6::jsonb,
-               NOW() + ($7 * INTERVAL '1 millisecond'))`,
-      [challengeId, req.auth.sub, gameKey, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
+         (challenge_id, player_id, mode, difficulty, stage, puzzle, expires_at)
+       VALUES ($1, $2, 'hundred', $3, $4, $5::jsonb,
+               NOW() + ($6 * INTERVAL '1 millisecond'))`,
+      [challengeId, req.auth.sub, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
     );
     await client.query("COMMIT");
     res.json({
       ok: true,
       challengeId,
-      gameKey,
       mode: "hundred",
       stage,
       puzzle,
@@ -4994,7 +4781,7 @@ app.post("/game/tournament/enter", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const state = await enterTournamentInTransaction(client, req.auth.sub, req.body.gameKey);
+    const state = await enterTournamentInTransaction(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({ ok: true, ...state, awardedScore: 0 });
   } catch (error) {
@@ -5012,7 +4799,7 @@ app.post("/game/tournament/reset", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    const state = await enterTournamentInTransaction(client, req.auth.sub, req.body.gameKey);
+    const state = await enterTournamentInTransaction(client, req.auth.sub);
     await client.query("COMMIT");
     res.json({ ok: true, ...state, awardedScore: 0 });
   } catch (error) {
@@ -5026,7 +4813,6 @@ app.post("/game/tournament/reset", requireAuth, async (req, res) => {
 app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const tournamentMode = req.body.mode === "tournament";
-  const gameKey = normalizeBaseGameKey(req.body.gameKey);
   const matchMode = safeText(req.body.matchMode, "quick", 32);
   const immediateBotMode = !tournamentMode && ["quick", "ready_room", "open_table"].includes(matchMode);
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
@@ -5039,7 +4825,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       await consumeBotFallbackEligibilityInTransaction(
         client,
         req.auth.sub,
-        tournamentMode ? tournamentGameKey(gameKey) : gameKey,
+        tournamentMode ? "target_number_tournament" : "target_number",
         requestedDifficulty
       );
     }
@@ -5048,6 +4834,8 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
     let finishProfile = null;
     let tournamentResponse = null;
     if (!tournamentMode) {
+      // consumeGameRightInTransaction skor + hak satırını aynı SELECT'te kilitler ve generalScore'u döndürür.
+      // open_table için ayrı SELECT yok; stake doğrulaması başarısız olursa transaction hak UPDATE'ini rollback eder.
       const consumed = await consumeGameRightInTransaction(
         client,
         req.auth.sub,
@@ -5055,7 +4843,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         req.body.wagerPoints,
         matchMode === "quick"
       );
-      if (matchMode === "open_table") {
+      if (matchMode === 'open_table') {
         assertOpenTableStake(req.body.wagerPoints, consumed.generalScore, requestedDifficulty);
       }
       stakePoints = consumed.stakePoints;
@@ -5067,12 +4855,11 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
     let difficulty = requestedDifficulty;
     const challengeMode = tournamentMode ? "tournament_bot" : "two_player_bot";
 
-    // Başka bir oyundaki bot challenge'ını bozma; challenge izolasyonu game_key ile sağlanır.
     const activeResult = await client.query(
       `SELECT * FROM secure_game_challenges
-       WHERE player_id = $1 AND game_key = $2 AND mode = $3 AND completed_at IS NULL
+       WHERE player_id = $1 AND mode = $2 AND completed_at IS NULL
        ORDER BY created_at ASC FOR UPDATE`,
-      [req.auth.sub, gameKey, challengeMode]
+      [req.auth.sub, challengeMode]
     );
     for (const activeChallenge of activeResult.rows) {
       const elapsedServerMs = Math.max(
@@ -5104,13 +4891,14 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
     }
 
     if (tournamentMode) {
-      const progress = await readPlayerGameProgress(client, req.auth.sub, gameKey, true);
-      const sharedResult = await client.query(
-        `SELECT tournament_tickets, two_player_finish_count, two_player_finish_total_ms
+      const progressResult = await client.query(
+        `SELECT tournament_stage, tournament_rights, tournament_bank, tournament_completed,
+                tournament_tickets, tournament_entry_active,
+                two_player_finish_count, two_player_finish_total_ms
          FROM player_progress WHERE player_id = $1 FOR UPDATE`,
         [req.auth.sub]
       );
-      const shared = sharedResult.rows[0] || {};
+      const progress = progressResult.rows[0] || {};
       if (
         progress.tournament_entry_active !== true ||
         progress.tournament_completed === true ||
@@ -5123,38 +4911,34 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       stage = Math.max(1, Math.min(Number(progress.tournament_stage || 1), 8));
       difficulty = "Standard";
       finishProfile = normalizeTwoPlayerFinishProfile({
-        finishCount: shared.two_player_finish_count,
-        finishTotalMs: shared.two_player_finish_total_ms,
+        finishCount: progress.two_player_finish_count,
+        finishTotalMs: progress.two_player_finish_total_ms,
       });
       tournamentResponse = {
         currentStage: stage,
         remainingRights: Math.max(0, Math.min(Number(progress.tournament_rights ?? 3), 3)),
         totalScore: Math.max(0, Number(progress.tournament_bank || 0)),
         completed: progress.tournament_completed === true,
-        tickets: Math.max(0, Number(shared.tournament_tickets || 0)),
+        tickets: Math.max(0, Number(progress.tournament_tickets || 0)),
         ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
         entryActive: progress.tournament_entry_active === true,
       };
     }
 
-    const puzzle = generateSecurePuzzle(difficulty, gameKey);
+    const puzzle = generateSecurePuzzle(difficulty);
     const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile || {});
     await client.query(
       `INSERT INTO secure_game_challenges
-       (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8,
-               NOW() + ($9 * INTERVAL '1 millisecond'), $10::jsonb)`,
-      [
-        challengeId, req.auth.sub, gameKey, challengeMode, difficulty, stage,
-        JSON.stringify(puzzle), stakePoints, lifetimeMs,
-        JSON.stringify({ status: "active", plan, matchMode, gameKey })
-      ]
+       (challenge_id, player_id, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7,
+               NOW() + ($8 * INTERVAL '1 millisecond'), $9::jsonb)`,
+      [challengeId, req.auth.sub, challengeMode, difficulty, stage,
+       JSON.stringify(puzzle), stakePoints, lifetimeMs, JSON.stringify({ status: "active", plan, matchMode })]
     );
     await client.query("COMMIT");
     res.json({
       ok: true,
       challengeId,
-      gameKey,
       mode: challengeMode,
       stage,
       puzzle,
@@ -5173,7 +4957,6 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
   }
 });
 
-
 app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const mode = safeText(req.body.mode, "", 32);
@@ -5181,24 +4964,20 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
     res.status(400).json({ ok: false, message: "Bu endpoint yalnızca sonsuz modu destekler." });
     return;
   }
-  const gameKey = normalizeBaseGameKey(req.body.gameKey);
   const requestedDifficulty = secureDifficulty(req.body.difficulty);
   const freshInfiniteRun = req.body.fresh === true;
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+  // Sonsuz modda uygulama arka plana alındığında yerel sayaç duraklatıldığı için
+  // challenge uzun ömürlü tutulur; puan yine yalnızca tek kullanımlık kayıt ve doğru çözümle alınır.
   const lifetimeMs = 7 * 24 * 60 * 60 * 1000;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
 
-    if (freshInfiniteRun) {
-      await client.query(
-        `UPDATE player_game_progress
-         SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey]
-      );
-      if (gameKey === "target_number") {
+    let stage = 1;
+    let difficulty = requestedDifficulty;
+    if (mode === "infinite") {
+      if (freshInfiniteRun) {
         await client.query(
           `UPDATE player_progress
            SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
@@ -5206,30 +4985,35 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
           [req.auth.sub]
         );
       }
+      const progressResult = await client.query(
+        `SELECT infinite_next_stage
+         FROM player_progress
+         WHERE player_id = $1
+         FOR UPDATE`,
+        [req.auth.sub]
+      );
+      stage = Math.max(1, Math.min(Number(progressResult.rows[0]?.infinite_next_stage || 1), 1000));
+      difficulty = stage <= 5 ? "Medium" : "Hard";
     }
 
-    const progress = await readPlayerGameProgress(client, req.auth.sub, gameKey, true);
-    const stage = Math.max(1, Math.min(Number(progress.infinite_next_stage || 1), 1000));
-    const difficulty = stage <= 5 ? "Medium" : "Hard";
-    const puzzle = generateSecurePuzzle(difficulty || requestedDifficulty, gameKey);
-
+    const puzzle = generateSecurePuzzle(difficulty);
+    // Eski challenge'ı supersede etme + yenisini oluşturmayı tek PostgreSQL statement/round-trip'te yap.
     await client.query(
       `WITH superseded AS (
          UPDATE secure_game_challenges
          SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
-         WHERE player_id = $2 AND game_key = $3 AND mode = $4 AND completed_at IS NULL
+         WHERE player_id = $2 AND mode = $3 AND completed_at IS NULL
          RETURNING challenge_id
        )
        INSERT INTO secure_game_challenges
-         (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW() + ($8 * INTERVAL '1 millisecond'))`,
-      [challengeId, req.auth.sub, gameKey, mode, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
+         (challenge_id, player_id, mode, difficulty, stage, puzzle, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW() + ($7 * INTERVAL '1 millisecond'))`,
+      [challengeId, req.auth.sub, mode, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
     );
     await client.query("COMMIT");
     res.json({
       ok: true,
       challengeId,
-      gameKey,
       mode,
       stage,
       puzzle,
@@ -5261,13 +5045,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       [challengeId, req.auth.sub]
     );
     if (result.rowCount === 0) {
-      const error = new Error("Oyun doğrulama kaydı bulunamadı.");
-      error.statusCode = 404;
-      throw error;
+      const error = new Error("Oyun doğrulama kaydı bulunamadı."); error.statusCode = 404; throw error;
     }
     const challenge = result.rows[0];
-    const gameKey = normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey);
-
     if (challenge.completed_at) {
       const previousResponse = await rebuildStoredChallengeResponseInTransaction(
         client,
@@ -5279,20 +5059,14 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         res.json(previousResponse);
         return;
       }
-      const error = new Error("Bu oyun sonucu daha önce işlendi.");
-      error.statusCode = 409;
-      throw error;
+      const error = new Error("Bu oyun sonucu daha önce işlendi."); error.statusCode = 409; throw error;
     }
     if (Date.now() > new Date(challenge.expires_at).getTime()) {
-      const error = new Error("Oyun süresi doldu.");
-      error.statusCode = 409;
-      throw error;
+      const error = new Error("Oyun süresi doldu."); error.statusCode = 409; throw error;
     }
     const elapsedServerMs = Date.now() - new Date(challenge.created_at).getTime();
     if (elapsedServerMs < 500) {
-      const error = new Error("Sonuç olağan dışı hızda gönderildi.");
-      error.statusCode = 409;
-      throw error;
+      const error = new Error("Sonuç olağan dışı hızda gönderildi."); error.statusCode = 409; throw error;
     }
     if (challenge.mode === "hundred" && elapsedServerMs > 90 * 1000) {
       const error = new Error("100 kişilik oyun aşamasının süresi doldu.");
@@ -5300,17 +5074,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       error.publicCode = "HUNDRED_STAGE_EXPIRED";
       throw error;
     }
-    if (!validateChallengeAnswer(
-      challenge.puzzle,
-      req.body.numberSlots,
-      req.body.operators,
-      req.body.gridValues
-    )) {
-      const error = new Error("Oyun sonucu sunucuda doğrulanamadı.");
-      error.statusCode = 422;
-      throw error;
+    if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators)) {
+      const error = new Error("İşlem sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
     }
-
     let won = null;
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.stage);
@@ -5322,13 +5088,6 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     }
 
     if (challenge.mode === "hundred") {
-      const currentState = await readAuthoritativePlayerState(client, req.auth.sub);
-      if (normalizeBaseGameKey(currentState.hundred?.activeGameKey) !== gameKey) {
-        const error = new Error("100 kişilik oyun başka bir oyun anahtarına ait.");
-        error.statusCode = 409;
-        error.publicCode = "HUNDRED_GAME_MISMATCH";
-        throw error;
-      }
       const hundredResult = await completeHundredStageInTransaction(
         client,
         req.auth.sub,
@@ -5338,15 +5097,13 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         playerId: req.auth.sub,
         sourceKey: `challenge:${challengeId}`,
         eventType: "game",
-        gameKey,
+        gameKey: "target_number",
         multiplayer: true,
         won: true,
       });
       const response = {
         ok: true,
         ...hundredResult,
-        gameKey,
-        gameInfiniteScore: Number(hundredResult.games?.[gameKey]?.infiniteScore || 0),
         runScore: hundredResult.runScore || 0,
         elapsedServerMs,
       };
@@ -5364,23 +5121,19 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         client,
         req.auth.sub,
         won,
-        Number(challenge.stage),
-        false,
-        gameKey
+        Number(challenge.stage)
       );
       await recordTaskEventInTransaction(client, {
         playerId: req.auth.sub,
         sourceKey: `challenge:${challengeId}`,
         eventType: "game",
-        gameKey,
+        gameKey: "target_number",
         multiplayer: true,
         won: won === true,
       });
       const response = {
         ok: true,
         ...tournamentResult,
-        gameKey,
-        gameInfiniteScore: Number(tournamentResult.games?.[gameKey]?.infiniteScore || 0),
         runScore: tournamentResult.runScore || 0,
         won,
         outcomeReason,
@@ -5395,48 +5148,31 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       return;
     }
 
+
     let infiniteRunScore = 0;
     let state;
     if (challenge.mode === "infinite") {
-      const gameProgress = await readPlayerGameProgress(client, req.auth.sub, gameKey, true);
-      infiniteRunScore = Math.min(
-        2_000_000_000,
-        Math.max(0, Number(gameProgress.infinite_run_score || 0)) +
-          Math.max(0, Number(rewards.infiniteDelta || 0))
-      );
-      const nextStage = Math.max(
-        Number(gameProgress.infinite_next_stage || 1),
-        Number(challenge.stage || 1) + 1
-      );
-      await client.query(
-        `UPDATE player_game_progress
-         SET infinite_run_score = $3, infinite_next_stage = $4, updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey, infiniteRunScore, nextStage]
-      );
-      await client.query(
+      const progressUpdate = await client.query(
         `UPDATE player_progress
          SET total_xp = LEAST(total_xp + $2, 2000000000),
+             infinite_run_score = LEAST(infinite_run_score + $3, 2000000000),
+             infinite_next_stage = GREATEST(infinite_next_stage, $4 + 1),
              updated_at = NOW()
-         WHERE player_id = $1`,
-        [req.auth.sub, rewards.xpDelta]
+         WHERE player_id = $1
+         RETURNING infinite_run_score`,
+        [req.auth.sub, rewards.xpDelta, rewards.infiniteDelta, Number(challenge.stage)]
       );
-      if (gameKey === "target_number") {
-        await client.query(
-          `UPDATE player_progress
-           SET infinite_run_score = $2, infinite_next_stage = $3, updated_at = NOW()
-           WHERE player_id = $1`,
-          [req.auth.sub, infiniteRunScore, nextStage]
-        );
-      }
-      await updateGameInfiniteHighScoreInTransaction(
+      infiniteRunScore = Number(progressUpdate.rows[0]?.infinite_run_score || 0);
+      await applyLeaderboardGeneralDeltaAndInfiniteHighScoreInTransaction(
         client,
         req.auth.sub,
-        gameKey,
+        rewards.generalDelta,
         infiniteRunScore
       );
       state = await readAuthoritativePlayerState(client, req.auth.sub);
     } else {
+      // Normal bot sonucu: finish profili + XP + level milestone + score değişimini tek hot-path helper'ında
+      // uygula; eski ayrı finish UPDATE + XP UPDATE + final full-state SELECT zinciri yoktur.
       state = await applyTwoPlayerBotRewardsInTransaction(
         client,
         req.auth.sub,
@@ -5447,22 +5183,18 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         playerId: req.auth.sub,
         sourceKey: `challenge:${challengeId}`,
         eventType: "game",
-        gameKey,
+        gameKey: "target_number",
         multiplayer: true,
         won: won === true,
       });
     }
-
-    const gameInfiniteScore = Number(state.games?.[gameKey]?.infiniteScore || 0);
     const response = {
       ok: true,
       ...state,
-      gameKey,
-      gameInfiniteScore,
       generalDelta: Number(rewards.generalDelta || 0),
       infiniteDelta: Number(rewards.infiniteDelta || 0),
       xpDelta: Number(rewards.xpDelta || 0),
-      runScore: Number(infiniteRunScore || state.games?.[gameKey]?.runScore || 0),
+      runScore: Number(state.runScore || infiniteRunScore || 0),
       won,
       outcomeReason,
       elapsedServerMs,
@@ -5480,6 +5212,8 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     client.release();
   }
 });
+
+
 
 
 
@@ -5504,7 +5238,6 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
       const error = new Error("Bot eşleşmesi bulunamadı."); error.statusCode = 404; throw error;
     }
     const challenge = result.rows[0];
-    const gameKey = normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey);
     if (challenge.completed_at) {
       const previousResponse = await rebuildStoredChallengeResponseInTransaction(
         client,
@@ -5536,12 +5269,11 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
     let response;
     if (challenge.mode === "tournament_bot") {
       const tournamentResult = await applyTournamentOutcomeInTransaction(
-        client, req.auth.sub, outcome.won, Number(challenge.stage), false, gameKey
+        client, req.auth.sub, outcome.won, Number(challenge.stage)
       );
       response = {
         ok: true,
         ...tournamentResult,
-        gameKey,
         runScore: tournamentResult.runScore || 0,
         won: outcome.won,
         outcomeReason: outcome.reason,
@@ -5560,8 +5292,6 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
       response = {
         ok: true,
         ...state,
-        gameKey,
-        gameInfiniteScore: Number(state.games?.[gameKey]?.infiniteScore || 0),
         generalDelta: rewards.generalDelta,
         infiniteDelta: 0,
         xpDelta: rewards.xpDelta,
@@ -5576,7 +5306,7 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
         playerId: req.auth.sub,
         sourceKey: `challenge:${challengeId}`,
         eventType: "game",
-        gameKey,
+        gameKey: "target_number",
         multiplayer: true,
         won: outcome.won === true,
       });
@@ -5619,7 +5349,6 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       const error = new Error("Bot eşleşmesi bulunamadı."); error.statusCode = 404; throw error;
     }
     const challenge = result.rows[0];
-    const gameKey = normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey);
     if (challenge.completed_at) {
       const previousResponse = await rebuildStoredChallengeResponseInTransaction(
         client,
@@ -5639,12 +5368,11 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
     let response;
     if (challenge.mode === "tournament_bot") {
       const tournamentResult = await applyTournamentOutcomeInTransaction(
-        client, req.auth.sub, false, Number(challenge.stage), false, gameKey
+        client, req.auth.sub, false, Number(challenge.stage)
       );
       response = {
         ok: true,
         ...tournamentResult,
-        gameKey,
         runScore: tournamentResult.runScore || 0,
         won: false,
         outcomeReason: "player_forfeit",
@@ -5656,8 +5384,6 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       response = {
         ok: true,
         ...state,
-        gameKey,
-        gameInfiniteScore: Number(state.games?.[gameKey]?.infiniteScore || 0),
         generalDelta: rewards.generalDelta,
         infiniteDelta: 0,
         xpDelta: rewards.xpDelta,
@@ -5670,7 +5396,7 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       playerId: req.auth.sub,
       sourceKey: `challenge:${challengeId}`,
       eventType: "game",
-      gameKey,
+      gameKey: "target_number",
       multiplayer: true,
       won: false,
     });
@@ -6207,26 +5933,23 @@ const LOBBY_EVENT_DEBOUNCE_MS = Math.max(100, Math.min(2_000,
 const ENABLE_LEGACY_LOBBY_BROADCAST = process.env.ENABLE_LEGACY_LOBBY_BROADCAST === 'true';
 const lobbyChangeTimers = new Map();
 
-function lobbySocketRoom(gameKeyValue, difficultyValue) {
-  const gameKey = normalizeBaseGameKey(gameKeyValue);
-  return `lobby:${gameKey}:${secureDifficulty(difficultyValue)}`;
+function lobbySocketRoom(difficulty) {
+  return `lobby:${secureDifficulty(difficulty)}`;
 }
 
-function emitRoomLobbyChanged(gameKeyValue, difficultyValue) {
-  const gameKey = normalizeBaseGameKey(gameKeyValue);
-  const normalizedDifficulty = secureDifficulty(difficultyValue);
-  const timerKey = `${gameKey}:${normalizedDifficulty}`;
-  const previous = lobbyChangeTimers.get(timerKey);
+function emitRoomLobbyChanged(difficulty) {
+  const normalizedDifficulty = secureDifficulty(difficulty);
+  const previous = lobbyChangeTimers.get(normalizedDifficulty);
   if (previous) clearTimeout(previous);
   const timer = setTimeout(() => {
-    lobbyChangeTimers.delete(timerKey);
+    lobbyChangeTimers.delete(normalizedDifficulty);
+    // Global broadcast yerine yalnız o zorluğun oda ekranını gerçekten izleyen socket'lere gönder.
     const payload = {
-      gameKey,
       difficulty: normalizedDifficulty,
       changedAtMillis: Date.now(),
     };
-    io.to(lobbySocketRoom(gameKey, normalizedDifficulty)).emit("room_lobby_changed", payload);
-    if (ENABLE_LEGACY_LOBBY_BROADCAST && gameKey === "target_number") {
+    io.to(lobbySocketRoom(normalizedDifficulty)).emit("room_lobby_changed", payload);
+    if (ENABLE_LEGACY_LOBBY_BROADCAST) {
       for (const connectedSocket of io.sockets.sockets.values()) {
         if (connectedSocket.data?.supportsScopedLobbyEvents === true) continue;
         connectedSocket.emit("room_lobby_changed", payload);
@@ -6234,36 +5957,30 @@ function emitRoomLobbyChanged(gameKeyValue, difficultyValue) {
     }
   }, LOBBY_EVENT_DEBOUNCE_MS);
   timer.unref?.();
-  lobbyChangeTimers.set(timerKey, timer);
+  lobbyChangeTimers.set(normalizedDifficulty, timer);
 }
 
 function removeOpenTablesForSocket(socketId) {
-  const changed = new Set();
+  const changedDifficulties = new Set();
   for (const [listingId, table] of publicOpenTables.entries()) {
     if (table.ownerSocketId === socketId) {
-      changed.add(`${normalizeBaseGameKey(table.gameKey)}|${table.difficulty}`);
+      changedDifficulties.add(table.difficulty);
       publicOpenTables.delete(listingId);
     }
   }
-  for (const key of changed) {
-    const [gameKey, difficulty] = key.split("|");
-    emitRoomLobbyChanged(gameKey, difficulty);
-  }
+  for (const difficulty of changedDifficulties) emitRoomLobbyChanged(difficulty);
 }
 
 function expireOldOpenTables() {
   const now = Date.now();
-  const changed = new Set();
+  const changedDifficulties = new Set();
   for (const [listingId, table] of publicOpenTables.entries()) {
     if (now - table.createdAt > 15 * 60 * 1000 || !io.sockets.sockets.get(table.ownerSocketId)) {
-      changed.add(`${normalizeBaseGameKey(table.gameKey)}|${table.difficulty}`);
+      changedDifficulties.add(table.difficulty);
       publicOpenTables.delete(listingId);
     }
   }
-  for (const key of changed) {
-    const [gameKey, difficulty] = key.split("|");
-    emitRoomLobbyChanged(gameKey, difficulty);
-  }
+  for (const difficulty of changedDifficulties) emitRoomLobbyChanged(difficulty);
 }
 
 const PRIVATE_ROOM_TTL_MS = Number(
@@ -6292,12 +6009,21 @@ const RESOLVED_ROOM_TTL_MS = Number(
 );
 
 function normalizeMatchGameKey(value) {
-  const raw = String(value || "target_number").trim().toLowerCase().slice(0, 96);
-  const tournamentMatch = raw.match(/^(.+?)_tournament(?:_stage_\d+)?$/i);
-  if (tournamentMatch) {
-    return tournamentGameKey(tournamentMatch[1]);
+  const gameKey = String(
+    value || "target_number"
+  )
+    .trim()
+    .slice(0, 96);
+
+  if (
+    /^target_number_tournament(?:_stage_\d+)?$/i.test(
+      gameKey
+    )
+  ) {
+    return "target_number_tournament";
   }
-  return normalizeBaseGameKey(raw);
+
+  return gameKey || "target_number";
 }
 
 function queueKey(gameKey, difficulty) {
@@ -6534,11 +6260,10 @@ async function resolveRoomByGameDeadline(roomId) {
   markRoomResolved(room, "game_deadline", null, null);
 
   try {
-    if (!room.isFriend && String(room.gameKey).endsWith("_tournament")) {
-      const deadlineGameKey = normalizeBaseGameKey(room.gameKey);
+    if (!room.isFriend && room.gameKey === "target_number_tournament") {
       const states = await Promise.all(
         participants.map((participant) =>
-          applyTournamentOutcome(participant.playerId, false, participant.tournamentStage, deadlineGameKey)
+          applyTournamentOutcome(participant.playerId, false, participant.tournamentStage)
         )
       );
       participants.forEach((participant, index) => {
@@ -6549,7 +6274,7 @@ async function resolveRoomByGameDeadline(roomId) {
           participantSocket.emit("authoritative_tournament", states[index]);
         }
       });
-    } else if (!room.isFriend && !String(room.gameKey).endsWith("_tournament")) {
+    } else if (!room.isFriend && room.gameKey === "target_number") {
       const reward = Math.max(minimumTwoPlayerStake(room.difficulty), Number(room.stakePoints || 0));
       const states = await Promise.all(
         participants.map((participant) =>
@@ -6570,7 +6295,7 @@ async function resolveRoomByGameDeadline(roomId) {
         recordTaskGameEvent(
           participant.playerId,
           `room:${room.roomId}`,
-          normalizeBaseGameKey(room.gameKey),
+          "target_number",
           true,
           false
         )
@@ -6770,7 +6495,7 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
   if (room.deadlineHandle) clearTimeout(room.deadlineHandle);
   if (room.botFinishHandle) clearTimeout(room.botFinishHandle);
 
-  room.puzzle = room.puzzles[room.roundIndex] || generateSecurePuzzle(room.difficulty, room.gameKey);
+  room.puzzle = room.puzzles[room.roundIndex] || generateSecurePuzzle(room.difficulty);
   const safePrepareMs = Math.max(0, Math.min(Number(prepareMs || 0), 30_000));
   room.startsAtMillis = Date.now() + safePrepareMs;
 
@@ -6921,10 +6646,10 @@ function createRealtimeRoom(
     : crypto.randomBytes(16).toString("hex");
 
   const createdAt = Date.now();
-  const roundCount = String(gameKey).endsWith("_tournament") ? 1 : normalizeRoundCount(roundCountValue);
+  const roundCount = gameKey === "target_number" ? normalizeRoundCount(roundCountValue) : 1;
   const puzzles = Array.isArray(suppliedPuzzles) && suppliedPuzzles.length >= roundCount
     ? suppliedPuzzles.slice(0, roundCount)
-    : [puzzle, ...Array.from({ length: Math.max(0, roundCount - 1) }, () => generateSecurePuzzle(difficulty, gameKey))];
+    : [puzzle, ...Array.from({ length: Math.max(0, roundCount - 1) }, () => generateSecurePuzzle(difficulty))];
   const room = {
     roomId,
     gameKey,
@@ -7186,7 +6911,7 @@ function leaveRoomAsCancel(socket) {
     ) {
       const isFreePreparationExit =
         !room.isFriend &&
-        !String(room.gameKey).endsWith("_tournament") &&
+        room.gameKey === "target_number" &&
         Date.now() < Number(room.startsAtMillis || 0);
 
       if (isFreePreparationExit) {
@@ -7437,8 +7162,6 @@ function authenticatedSocketPlayer(socket, payload, errorEvent = "match_error") 
 }
 
 async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent = "match_error") {
-  const requestedMatchGameKey = normalizeMatchGameKey(payload?.gameKey);
-  const requestedBaseGameKey = normalizeBaseGameKey(requestedMatchGameKey);
   const session = verifySessionToken(payload?.authToken);
   if (!session) {
     socket.emit(errorEvent, {
@@ -7464,23 +7187,18 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
     // Salt-okuma socket doğrulaması için BEGIN/COMMIT açılmaz. Session acquire aşaması oyuncu
     // satırlarını zaten garanti eder; session ve state tek SELECT'te doğrulanır.
     const result = await client.query(
-      `SELECT p.username, p.country,
-              COALESCE(pg.tournament_stage, g.tournament_stage) AS tournament_stage,
-              COALESCE(pg.tournament_rights, g.tournament_rights) AS tournament_rights,
-              COALESCE(pg.tournament_completed, g.tournament_completed) AS tournament_completed,
-              COALESCE(pg.tournament_entry_active, g.tournament_entry_active) AS tournament_entry_active,
-              s.general_score, g.two_player_finish_count, g.two_player_finish_total_ms
+      `SELECT p.username, p.country, g.tournament_stage, g.tournament_rights,
+              g.tournament_completed, g.tournament_entry_active, s.general_score,
+              g.two_player_finish_count, g.two_player_finish_total_ms
        FROM players p
        JOIN player_progress g ON g.player_id = p.player_id
        JOIN player_scores s ON s.player_id = p.player_id
-       LEFT JOIN player_game_progress pg
-         ON pg.player_id = p.player_id AND pg.game_key = $3
        JOIN player_game_sessions gs
          ON gs.player_id = p.player_id
         AND gs.session_id = $2
         AND gs.expires_at > NOW()
        WHERE p.player_id = $1`,
-      [session.sub, gameSessionId, requestedBaseGameKey]
+      [session.sub, gameSessionId]
     );
     if (result.rowCount === 0) {
       socket.emit(errorEvent, {
@@ -7518,7 +7236,6 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
   expireOldOpenTables();
   const clientBots = String(req.query.clientBots || "") === "1";
   if (!clientBots) expireGeneratedLobbyBots();
-  const gameKey = normalizeBaseGameKey(req.query.gameKey);
   const difficulty = secureDifficulty(req.query.difficulty);
   try {
     // Yeni istemcide lobi uygunluğu yalnız görsel bilgidir; gerçek oyuna girişte puan tekrar
@@ -7532,11 +7249,7 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
       requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
     }
     const realTables = [...publicOpenTables.values()]
-      .filter((table) =>
-        table.player.id !== req.auth.sub &&
-        normalizeBaseGameKey(table.gameKey) === gameKey &&
-        table.difficulty === difficulty
-      )
+      .filter((table) => table.player.id !== req.auth.sub && table.difficulty === difficulty)
       .sort((a, b) => a.createdAt - b.createdAt);
 
     const usedListings = new Set();
@@ -7585,7 +7298,6 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
             country: botIdentity.country,
             isBot: true,
           },
-          gameKey,
           difficulty,
           stakePoints,
           roundCount,
@@ -7608,7 +7320,7 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         rooms,
       };
     });
-    res.json({ ok: true, score: requesterScore, gameKey, difficulty, groups });
+    res.json({ ok: true, score: requesterScore, difficulty, groups });
   } catch (error) {
     sendLeaderboardError(res, error, "Oda listesi alınamadı.", "room lobby error:");
   }
@@ -7677,21 +7389,19 @@ io.on("connection", (socket) => {
 
   socket.on("lobby_subscribe", (payload = {}) => {
     socket.data.supportsScopedLobbyEvents = true;
-    const gameKey = normalizeBaseGameKey(payload.gameKey);
     const difficulty = secureDifficulty(payload.difficulty);
-    const desiredRoom = lobbySocketRoom(gameKey, difficulty);
+    // Aynı socket yalnız ihtiyaç duyduğu lobi kanalını dinler.
     for (const roomName of socket.rooms) {
-      if (roomName.startsWith("lobby:") && roomName !== desiredRoom) {
+      if (roomName.startsWith("lobby:") && roomName !== lobbySocketRoom(difficulty)) {
         socket.leave(roomName);
       }
     }
-    socket.join(desiredRoom);
+    socket.join(lobbySocketRoom(difficulty));
   });
 
   socket.on("lobby_unsubscribe", (payload = {}) => {
-    const gameKey = normalizeBaseGameKey(payload.gameKey);
     const difficulty = secureDifficulty(payload.difficulty);
-    socket.leave(lobbySocketRoom(gameKey, difficulty));
+    socket.leave(lobbySocketRoom(difficulty));
   });
 
   socket.conn.on(
@@ -7712,7 +7422,6 @@ io.on("connection", (socket) => {
       expireOldOpenTables();
       const identity = await authenticatedSocketPlayerFromDatabase(socket, payload, "match_error");
       if (!identity) return;
-      const gameKey = normalizeBaseGameKey(payload.gameKey);
       const difficulty = secureDifficulty(payload.difficulty);
       let stakePoints;
       let roundCount;
@@ -7730,16 +7439,12 @@ io.on("connection", (socket) => {
       leaveRoomAsCancel(socket);
 
       const listingId = `real:${crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString("hex")}`;
-      const tablePuzzles = Array.from(
-        { length: roundCount },
-        () => generateSecurePuzzle(difficulty, gameKey)
-      );
+      const tablePuzzles = Array.from({ length: roundCount }, () => generateSecurePuzzle(difficulty));
       publicOpenTables.set(listingId, {
         listingId,
         ownerSocketId: socket.id,
         player: identity.player,
         generalScore: identity.generalScore,
-        gameKey,
         difficulty,
         stakePoints,
         roundCount,
@@ -7747,9 +7452,9 @@ io.on("connection", (socket) => {
         puzzle: tablePuzzles[0],
         createdAt: Date.now(),
       });
-      emitRoomLobbyChanged(gameKey, difficulty);
-      socket.emit("open_table_created", { listingId, stakePoints, gameKey, difficulty, roundCount });
-      socket.emit("waiting", { gameKey, difficulty, matchMode: "open_table", stakePoints, roundCount });
+      emitRoomLobbyChanged(difficulty);
+      socket.emit("open_table_created", { listingId, stakePoints, difficulty, roundCount });
+      socket.emit("waiting", { gameKey: "target_number", difficulty, matchMode: "open_table", stakePoints, roundCount });
     }
   );
 
@@ -7790,7 +7495,7 @@ io.on("connection", (socket) => {
       }
 
       publicOpenTables.delete(listingId);
-      emitRoomLobbyChanged(table.gameKey, table.difficulty);
+      emitRoomLobbyChanged(table.difficulty);
       await clearBotFallbackEligibilityForPlayers([identity.player.id]);
 
       const usedNames = new Set([identity.player.name]);
@@ -7807,7 +7512,7 @@ io.on("connection", (socket) => {
         identity.player,
         null,
         botPlayer,
-        normalizeBaseGameKey(table.gameKey),
+        "target_number",
         table.difficulty,
         table.puzzle,
         null,
@@ -7846,15 +7551,14 @@ io.on("connection", (socket) => {
       const identity = await authenticatedSocketPlayerFromDatabase(socket, payload, "match_error");
       if (!identity) return;
       const player = identity.player;
-      const isTournamentMatch = gameKey.endsWith("_tournament");
-      const tournamentStage = isTournamentMatch ? identity.tournamentStage : null;
-      const matchMode = isTournamentMatch
+      const tournamentStage = gameKey === "target_number_tournament" ? identity.tournamentStage : null;
+      const matchMode = gameKey === "target_number_tournament"
         ? "tournament"
         : safeText(payload.matchMode, "quick", 32);
       const listingId = safeText(payload.listingId, "", 128);
       const excludedOpponentMatchKey = safeText(payload.excludedOpponentMatchKey, "", 64);
 
-      if (isTournamentMatch) {
+      if (gameKey === "target_number_tournament") {
         if (
           identity.tournamentEntryActive !== true ||
           identity.tournamentCompleted === true ||
@@ -7876,7 +7580,7 @@ io.on("connection", (socket) => {
       removeOpenTablesForSocket(socket.id);
       leaveRoomAsCancel(socket);
 
-      if (!gameKey.endsWith("_tournament") && listingId.startsWith("bot:")) {
+      if (gameKey === "target_number" && listingId.startsWith("bot:")) {
         expireGeneratedLobbyBots();
         let botTable = generatedLobbyBots.get(listingId);
 
@@ -7910,17 +7614,12 @@ io.on("connection", (socket) => {
               country: requestedBotCountry ? safeCountry(requestedBotCountry) : generatedIdentity.country,
               isBot: true,
             },
-            gameKey,
             difficulty,
             stakePoints,
             roundCount,
             createdAt: Date.now(),
             stateless: true,
           };
-        }
-        if (normalizeBaseGameKey(botTable.gameKey || gameKey) !== normalizeBaseGameKey(gameKey)) {
-          socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen masa başka bir oyuna ait." });
-          return;
         }
         if (identity.generalScore < botTable.stakePoints) {
           socket.emit("match_error", { code: "INSUFFICIENT_SCORE", message: "Bu masaya katılmak için yeterli puanınız yok." });
@@ -7934,12 +7633,9 @@ io.on("connection", (socket) => {
           return;
         }
         if (!botTable.stateless) generatedLobbyBots.delete(listingId);
-        const botPuzzles = Array.from(
-          { length: botTable.roundCount },
-          () => generateSecurePuzzle(botTable.difficulty, gameKey)
-        );
+        const botPuzzles = Array.from({ length: botTable.roundCount }, () => generateSecurePuzzle(botTable.difficulty));
         const room = createRealtimeRoom(
-          socket, player, null, botTable.player, gameKey, botTable.difficulty,
+          socket, player, null, botTable.player, "target_number", botTable.difficulty,
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
           botTable.roundCount, botPuzzles, identity.twoPlayerFinishProfile
         );
@@ -7957,16 +7653,11 @@ io.on("connection", (socket) => {
         return;
       }
 
-      if (!gameKey.endsWith("_tournament") && listingId.startsWith("real:")) {
+      if (gameKey === "target_number" && listingId.startsWith("real:")) {
         expireOldOpenTables();
         const table = publicOpenTables.get(listingId);
         const ownerSocket = table ? io.sockets.sockets.get(table.ownerSocketId) : null;
-        if (
-          !table ||
-          !ownerSocket ||
-          table.player.id === player.id ||
-          normalizeBaseGameKey(table.gameKey) !== normalizeBaseGameKey(gameKey)
-        ) {
+        if (!table || !ownerSocket || table.player.id === player.id) {
           socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen masa artık uygun değil." });
           return;
         }
@@ -7982,14 +7673,14 @@ io.on("connection", (socket) => {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
           ownerSocket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
           publicOpenTables.delete(listingId);
-          emitRoomLobbyChanged(table.gameKey, table.difficulty);
+          emitRoomLobbyChanged(table.difficulty);
           return;
         }
         publicOpenTables.delete(listingId);
-        emitRoomLobbyChanged(table.gameKey, table.difficulty);
+        emitRoomLobbyChanged(table.difficulty);
         await clearBotFallbackEligibilityForPlayers([player.id, table.player.id]);
         const room = createRealtimeRoom(
-          socket, player, ownerSocket, table.player, gameKey, table.difficulty,
+          socket, player, ownerSocket, table.player, "target_number", table.difficulty,
           table.puzzle, null, null, table.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
           table.roundCount, table.puzzles
         );
@@ -8006,9 +7697,9 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const puzzle = generateSecurePuzzle(difficulty, gameKey);
+      const puzzle = generateSecurePuzzle(difficulty);
       let requestedStake = 0;
-      if (!gameKey.endsWith("_tournament")) {
+      if (gameKey === "target_number") {
         try {
           requestedStake = normalizeRequestedStake(
             payload.stakePoints, difficulty, identity.generalScore, matchMode === "quick"
@@ -8021,7 +7712,7 @@ io.on("connection", (socket) => {
 
       const key = queueKey(gameKey, difficulty);
       const queue = waitingQueues.get(key) || [];
-      const quickRange = !gameKey.endsWith("_tournament") && matchMode === "quick"
+      const quickRange = gameKey === "target_number" && matchMode === "quick"
         ? quickStakeRange(identity.generalScore, difficulty)
         : null;
       const skippedOpponents = [];
@@ -8046,7 +7737,7 @@ io.on("connection", (socket) => {
         }
 
         let selectedStake = 0;
-        if (!gameKey.endsWith("_tournament")) {
+        if (gameKey === "target_number") {
           if (matchMode === "quick" && opponent.matchMode === "quick" && quickRange) {
             const overlapMin = Math.max(quickRange.minStake, Number(opponent.quickMinStake || 0));
             const overlapMax = Math.min(quickRange.maxStake, Number(opponent.quickMaxStake || 0));
@@ -8066,7 +7757,7 @@ io.on("connection", (socket) => {
         }
         waitingQueues.set(key, [...skippedOpponents, ...queue]);
         const selectedPuzzle = opponent.puzzle || puzzle;
-        if (!isTournamentMatch) {
+        if (gameKey !== "target_number_tournament") {
           try {
             await consumeGameRightsForPlayers([player.id, opponent.player.id], difficulty, selectedStake);
           } catch (error) {
@@ -8080,7 +7771,7 @@ io.on("connection", (socket) => {
         const room = createRealtimeRoom(
           socket, player, opponentSocket, opponent.player, gameKey, difficulty, selectedPuzzle,
           tournamentStage, opponent.tournamentStage, selectedStake, matchMode,
-          !gameKey.endsWith("_tournament") ? TWO_PLAYER_PREPARE_MS : 0
+          gameKey === "target_number" ? TWO_PLAYER_PREPARE_MS : 0
         );
         socket.emit("match_found", {
           roomId: room.roomId, opponent: { name: opponent.player.name, country: opponent.player.country, matchKey: matchmakingPlayerKey(opponent.player.id) },
@@ -8412,7 +8103,10 @@ io.on("connection", (socket) => {
     async (payload = {}) => {
       expireOldPrivateRooms();
 
-      const gameKey = normalizeBaseGameKey(payload.gameKey);
+      const gameKey = String(
+        payload.gameKey ||
+          "target_number"
+      );
 
       const difficulty = String(
         payload.difficulty ||
@@ -8423,7 +8117,7 @@ io.on("connection", (socket) => {
       if (!identity) return;
       const player = identity.player;
 
-      const puzzle = generateSecurePuzzle(difficulty, gameKey);
+      const puzzle = generateSecurePuzzle(difficulty);
 
       removeFromAllQueues(
         socket.id,
@@ -8512,15 +8206,6 @@ io.on("connection", (socket) => {
           }
         );
 
-        return;
-      }
-
-      const requestedFriendGameKey = normalizeBaseGameKey(payload.gameKey);
-      if (requestedFriendGameKey !== normalizeBaseGameKey(room.gameKey)) {
-        socket.emit("friend_room_error", {
-          code: "ROOM_GAME_MISMATCH",
-          message: "Bu oda başka bir oyuna ait. Oda kodunu ilgili oyunun sayfasından kullanın.",
-        });
         return;
       }
 
@@ -8666,7 +8351,7 @@ io.on("connection", (socket) => {
         socket.emit("match_error", { code: "MATCH_NOT_STARTED", message: "Hazırlık geri sayımı henüz tamamlanmadı." });
         return;
       }
-      if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators, payload.gridValues)) {
+      if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators)) {
         socket.emit("match_error", { code: "INVALID_SOLUTION", message: "Gönderilen işlem sunucuda doğrulanamadı." });
         return;
       }
