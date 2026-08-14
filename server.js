@@ -2802,13 +2802,13 @@ async function enterTournamentInTransaction(client, playerId, gameKey = "target_
   if (progress.entryActive === true) {
     return readAuthoritativePlayerState(client, playerId, normalizedGameKey);
   }
-  const tickets = Math.max(0, Number(row.tournament_tickets || 0));
+ /* const tickets = Math.max(0, Number(row.tournament_tickets || 0));
   if (tickets < TOURNAMENT_ENTRY_TICKET_COST) {
     const error = new Error(`Turnuvaya girmek için ${TOURNAMENT_ENTRY_TICKET_COST} bilet gerekli.`);
     error.statusCode = 409;
     error.publicCode = "TOURNAMENT_TICKETS_REQUIRED";
     throw error;
-  }
+  } */
 
   await client.query(
     `UPDATE player_progress SET tournament_tickets = tournament_tickets - $2, updated_at = NOW()
