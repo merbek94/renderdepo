@@ -2808,13 +2808,13 @@ async function enterTournamentInTransaction(client, playerId, gameKey = "target_
     error.statusCode = 409;
     error.publicCode = "TOURNAMENT_TICKETS_REQUIRED";
     throw error;
-  } */
+  } 
 
   await client.query(
     `UPDATE player_progress SET tournament_tickets = tournament_tickets - $2, updated_at = NOW()
      WHERE player_id = $1`,
     [playerId, TOURNAMENT_ENTRY_TICKET_COST]
-  );
+  ); */
   await persistTournamentProgressInTransaction(client, playerId, normalizedGameKey, {
     currentStage: 1,
     remainingRights: 3,
