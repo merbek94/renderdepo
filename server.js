@@ -7,6 +7,111 @@ const { Pool } = require("pg");
 
 const app = express();
 
+// Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
+// Farklı bir topoloji kullanıyorsan TRUST_PROXY_HOPS ortam değişkenini buna göre ayarla.
+const TRUST_PROXY_HOPS = Math.max(0, Math.min(5, Number(process.env.TRUST_PROXY_HOPS || 1) || 1));
+if (TRUST_PROXY_HOPS > 0) app.set("trust proxy", TRUST_PROXY_HOPS);
+
+// Harici Redis gerektirmeyen hafif, instance-bazlı rate limiter.
+// Birden fazla Render instance varsa limitler instance başınadır; yine de kaba kuvvet / spam maliyetini ciddi düşürür.
+const securityRateBuckets = new Map();
+const SECURITY_RATE_BUCKET_MAX_KEYS = Math.max(
+  5_000,
+  Math.min(200_000, Number(process.env.SECURITY_RATE_BUCKET_MAX_KEYS || 50_000) || 50_000)
+);
+
+function cleanRateLimitKey(value) {
+  return String(value || "unknown").trim().slice(0, 180) || "unknown";
+}
+
+function forwardedClientIp(req) {
+  const forwarded = String(req?.headers?.["x-forwarded-for"] || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (TRUST_PROXY_HOPS > 0 && forwarded.length > 0) {
+    // Sağdan say: istemcinin sahte bir X-Forwarded-For öneki eklemesi limiti aşmak için kullanılamaz.
+    const trustedIndex = Math.max(0, forwarded.length - TRUST_PROXY_HOPS);
+    return cleanRateLimitKey(forwarded[trustedIndex]);
+  }
+  return cleanRateLimitKey(req?.socket?.remoteAddress || req?.connection?.remoteAddress || "unknown");
+}
+
+function consumeSecurityRateLimit(scope, key, maxRequests, windowMs) {
+  const now = Date.now();
+  const bucketKey = `${scope}:${cleanRateLimitKey(key)}`;
+  let bucket = securityRateBuckets.get(bucketKey);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + windowMs };
+    securityRateBuckets.set(bucketKey, bucket);
+  }
+  if (bucket.count >= maxRequests) {
+    return { allowed: false, retryAfterMs: Math.max(1, bucket.resetAt - now) };
+  }
+  bucket.count += 1;
+  return { allowed: true, retryAfterMs: 0 };
+}
+
+function createHttpRateLimiter({ scope, maxRequests, windowMs, key }) {
+  return (req, res, next) => {
+    const keyValue = key ? key(req) : (req.ip || forwardedClientIp(req));
+    const result = consumeSecurityRateLimit(scope, keyValue, maxRequests, windowMs);
+    if (!result.allowed) {
+      res.set("Retry-After", String(Math.max(1, Math.ceil(result.retryAfterMs / 1000))));
+      res.status(429).json({
+        ok: false,
+        code: "RATE_LIMITED",
+        message: "Çok fazla istek gönderildi. Lütfen kısa süre sonra tekrar deneyin.",
+      });
+      return;
+    }
+    next();
+  };
+}
+
+const generalHttpRateLimit = createHttpRateLimiter({
+  scope: "http-general",
+  maxRequests: Math.max(120, Math.min(5_000, Number(process.env.HTTP_RATE_LIMIT_PER_MINUTE || 900) || 900)),
+  windowMs: 60_000,
+});
+const guestAuthRateLimit = createHttpRateLimiter({
+  scope: "auth-guest",
+  maxRequests: Math.max(5, Math.min(100, Number(process.env.GUEST_AUTH_RATE_LIMIT_10M || 30) || 30)),
+  windowMs: 10 * 60_000,
+});
+const playGamesAuthRateLimit = createHttpRateLimiter({
+  scope: "auth-play-games",
+  maxRequests: Math.max(5, Math.min(120, Number(process.env.PLAY_GAMES_AUTH_RATE_LIMIT_10M || 40) || 40)),
+  windowMs: 10 * 60_000,
+});
+const gameplayAcquireRateLimit = createHttpRateLimiter({
+  scope: "game-session-acquire",
+  maxRequests: Math.max(10, Math.min(240, Number(process.env.GAME_SESSION_ACQUIRE_RATE_LIMIT_PER_MINUTE || 60) || 60)),
+  windowMs: 60_000,
+  key: (req) => req.auth?.sub || req.ip || forwardedClientIp(req),
+});
+const challengeMutationRateLimit = createHttpRateLimiter({
+  scope: "challenge-mutation",
+  maxRequests: Math.max(30, Math.min(600, Number(process.env.CHALLENGE_RATE_LIMIT_PER_MINUTE || 180) || 180)),
+  windowMs: 60_000,
+  key: (req) => req.auth?.sub || req.ip || forwardedClientIp(req),
+});
+
+const rateCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of securityRateBuckets.entries()) {
+    if (now >= bucket.resetAt) securityRateBuckets.delete(key);
+  }
+  while (securityRateBuckets.size > SECURITY_RATE_BUCKET_MAX_KEYS) {
+    const oldestKey = securityRateBuckets.keys().next().value;
+    if (oldestKey === undefined) break;
+    securityRateBuckets.delete(oldestKey);
+  }
+}, 5 * 60_000);
+rateCleanupTimer.unref?.();
+
+app.use(generalHttpRateLimit);
+
 const ENABLE_REALTIME_LOGS = process.env.ENABLE_REALTIME_LOGS === "true";
 function realtimeLog(...args) {
   if (ENABLE_REALTIME_LOGS) console.log(...args);
@@ -509,6 +614,41 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_guest_credentials_linked_player
       ON guest_credentials (linked_player_id);
+
+    -- Bir Play Games hesabına yalnızca tek bir guest geçmişinin aktarılmasına izin verir.
+    -- target_player_id PRIMARY KEY ve guest_id UNIQUE birlikte hem hedef hem kaynak tarafında
+    -- tekrar/yarış durumlarını transaction seviyesinde engeller.
+    CREATE TABLE IF NOT EXISTS play_games_guest_migrations (
+      target_player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      guest_id TEXT NOT NULL UNIQUE,
+      migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Daha önce guest -> PGS aktarımı yapılmış hesapları da korumaya al. Aynı PGS'ye geçmişte
+    -- birden fazla guest bağlanmışsa en eski bağlantı seçilir ve hedef hesap bundan sonra yeni
+    -- guest aktarımı kabul etmez. Tarama yalnızca bu migration ilk kez deploy edildiğinde çalışır.
+    DO $guest_migration_guard_backfill$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE migration_id = 'guest_migration_guard_v1_20260814'
+      ) THEN
+        INSERT INTO play_games_guest_migrations (target_player_id, guest_id, migrated_at)
+        SELECT DISTINCT ON (gc.linked_player_id)
+          gc.linked_player_id,
+          gc.guest_id,
+          COALESCE(gc.linked_at, gc.updated_at, NOW())
+        FROM guest_credentials gc
+        JOIN players p ON p.player_id = gc.linked_player_id
+        WHERE gc.linked_player_id IS NOT NULL
+        ORDER BY gc.linked_player_id, COALESCE(gc.linked_at, gc.updated_at, NOW()) ASC, gc.guest_id ASC
+        ON CONFLICT DO NOTHING;
+
+        INSERT INTO schema_migrations (migration_id)
+        VALUES ('guest_migration_guard_v1_20260814')
+        ON CONFLICT (migration_id) DO NOTHING;
+      END IF;
+    END
+    $guest_migration_guard_backfill$;
 
     -- 90 günlük pasif guest temizliğinde bütün tabloyu taramak yerine önce unlinked + eski
     -- credential adaylarını ucuz biçimde daralt. Aktif guest timestamp'i en fazla haftada bir dokunulur.
@@ -1494,14 +1634,6 @@ function sendLeaderboardError(
   });
 }
 
-function isStablePlayGamesLeaderboardId(playerId) {
-  return String(playerId || "").startsWith("pg_");
-}
-
-function isLegacyLocalLeaderboardId(playerId) {
-  return String(playerId || "").startsWith("local_");
-}
-
 async function ensurePlayerScoreRow(client, playerId) {
   await client.query(
     `INSERT INTO player_scores (player_id)
@@ -1512,136 +1644,10 @@ async function ensurePlayerScoreRow(client, playerId) {
 }
 
 /**
- * Eski local_ kimliğine bağlı skorları kalıcı pg_ kimliğine taşır.
- * Aynı hesabın iki farklı kurulumda iki satıra bölünmesini engeller.
- */
-async function mergeLegacyPlayerIntoStablePlayer(
-  client,
-  legacyPlayerId,
-  stablePlayerId,
-  username,
-  country
-) {
-  if (legacyPlayerId === stablePlayerId) return;
-
-  const temporaryUsername =
-    `__migration_${crypto.randomBytes(12).toString("hex")}`;
-
-  // Hedef oyuncu satırı yoksa geçici, benzersiz bir adla oluşturulur.
-  await client.query(
-    `INSERT INTO players (
-       player_id,
-       username,
-       country,
-       created_at,
-       updated_at
-     )
-     VALUES ($1, $2, $3, NOW(), NOW())
-     ON CONFLICT (player_id)
-     DO UPDATE SET
-       country = EXCLUDED.country,
-       updated_at = NOW()`,
-    [stablePlayerId, temporaryUsername, country]
-  );
-
-  // Toplam skorlar aynı hesabın kopyaları kabul edildiği için toplanmaz;
-  // en yüksek olan korunur. Böylece çift sayım yapılmaz.
-  await client.query(
-    `INSERT INTO player_scores
-       (
-         player_id,
-         general_score,
-         infinite_score,
-         monthly_key,
-         monthly_general_score,
-         monthly_infinite_score,
-         monthly_updated_at,
-         updated_at
-       )
-     SELECT
-       $2,
-       general_score,
-       infinite_score,
-       monthly_key,
-       monthly_general_score,
-       monthly_infinite_score,
-       monthly_updated_at,
-       updated_at
-     FROM player_scores
-     WHERE player_id = $1
-     ON CONFLICT (player_id)
-     DO UPDATE SET
-       general_score = GREATEST(
-         player_scores.general_score,
-         EXCLUDED.general_score
-       ),
-       infinite_score = GREATEST(
-         player_scores.infinite_score,
-         EXCLUDED.infinite_score
-       ),
-       monthly_key = CASE
-         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN player_scores.monthly_key
-         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_key
-         ELSE player_scores.monthly_key
-       END,
-       monthly_general_score = CASE
-         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN
-           GREATEST(player_scores.monthly_general_score, EXCLUDED.monthly_general_score)
-         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_general_score
-         ELSE player_scores.monthly_general_score
-       END,
-       monthly_infinite_score = CASE
-         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN
-           GREATEST(player_scores.monthly_infinite_score, EXCLUDED.monthly_infinite_score)
-         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_infinite_score
-         ELSE player_scores.monthly_infinite_score
-       END,
-       monthly_updated_at = CASE
-         WHEN player_scores.monthly_key = EXCLUDED.monthly_key THEN
-           GREATEST(player_scores.monthly_updated_at, EXCLUDED.monthly_updated_at)
-         WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_updated_at
-         ELSE player_scores.monthly_updated_at
-       END,
-       updated_at = GREATEST(
-         player_scores.updated_at,
-         EXCLUDED.updated_at
-       )`,
-    [legacyPlayerId, stablePlayerId, currentMonthKey()]
-  );
-
-  // Eski oyuncu silinince ona bağlı eski skor satırları
-  // CASCADE ile temizlenir.
-  await client.query(
-    `DELETE FROM players
-     WHERE player_id = $1`,
-    [legacyPlayerId]
-  );
-
-  await client.query(
-    `UPDATE players
-     SET
-       username = $2,
-       country = $3,
-       updated_at = NOW()
-     WHERE player_id = $1`,
-    [stablePlayerId, username, country]
-  );
-
-  await ensurePlayerScoreRow(client, stablePlayerId);
-
-  console.log("Leaderboard identity migrated:", {
-    legacyPlayerId,
-    stablePlayerId,
-    username,
-  });
-}
-
-/**
- * Kullanıcı adı yalnızca kullanıcı adı kaydetme/değiştirme sırasında
- * sahiplenilir.
+ * Kullanıcı adı yalnızca kullanıcı adı kaydetme/değiştirme sırasında sahiplenilir.
  *
- * Yeni pg_ kimliğine geçişte aynı ada bağlı eski local_ satırı
- * otomatik birleştirilir.
+ * Güvenlik: kullanıcı adı hesap sahipliğinin kanıtı değildir. Bu nedenle eski local_ satırlar
+ * artık yalnız aynı kullanıcı adına sahip diye otomatik olarak pg_ hesabına taşınmaz.
  */
 async function claimOrCreatePlayer(
   client,
@@ -1664,33 +1670,10 @@ async function claimOrCreatePlayer(
     [username, playerId]
   );
 
-  const foreignOwners = ownersResult.rows.map(
-    (row) => String(row.player_id)
-  );
-
-  const migratableLegacyOwners = foreignOwners.filter(
-    (ownerPlayerId) =>
-      isStablePlayGamesLeaderboardId(playerId) &&
-      isLegacyLocalLeaderboardId(ownerPlayerId)
-  );
-
-  const blockingOwners = foreignOwners.filter(
-    (ownerPlayerId) =>
-      !migratableLegacyOwners.includes(ownerPlayerId)
-  );
-
-  if (blockingOwners.length > 0) {
+  // local_ dahil başka bir oyuncunun aynı adı kullanması halinde migration yapılmaz.
+  // Eski hesap aktarımı gerekiyorsa ayrıca sahiplik kanıtlı, tek kullanımlık migration akışı kurulmalıdır.
+  if (ownersResult.rowCount > 0) {
     throw usernameTakenError();
-  }
-
-  for (const legacyPlayerId of migratableLegacyOwners) {
-    await mergeLegacyPlayerIntoStablePlayer(
-      client,
-      legacyPlayerId,
-      playerId,
-      username,
-      country
-    );
   }
 
   await client.query(
@@ -1718,8 +1701,8 @@ async function claimOrCreatePlayer(
  * Böylece geçici/eski kullanıcı adı verisi skor güncellemesini
  * 409 hatasıyla durduramaz.
  *
- * Oyuncu kimliği henüz sunucuda yoksa ilk kayıt veya
- * legacy -> pg_ geçişi yapılır.
+ * Oyuncu kimliği henüz sunucuda yoksa normal ilk kayıt yapılır.
+ * Kullanıcı adına bakarak legacy hesap birleştirmesi yapılmaz.
  */
 async function ensurePlayerForScore(
   client,
@@ -3959,8 +3942,11 @@ async function authenticateGuestPlayer(client, guestIdRaw, guestSecretRaw) {
   }
 
   if (row.linked_player_id) {
-    await ensureAuthenticatedPlayer(client, row.linked_player_id);
-    return String(row.linked_player_id);
+    // Guest sırrı, PGS hesabı bağlandıktan sonra kalıcı alternatif giriş anahtarı olarak kullanılamaz.
+    const error = new Error("Bu misafir hesabı Play Games hesabına bağlandı. Play Games ile tekrar oturum açın.");
+    error.statusCode = 409;
+    error.publicCode = "GUEST_ALREADY_LINKED";
+    throw error;
   }
 
   await ensureAuthenticatedPlayer(client, guestId);
@@ -4003,14 +3989,43 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
     [guestId]
   );
 
+  // Silinmiş/boş guest kimliği hedef hesabın tek migration hakkını tüketmez.
   if (guestPlayer.rowCount === 0) {
-    await client.query(
-      `UPDATE guest_credentials
-       SET linked_player_id = $2, linked_at = NOW(), updated_at = NOW()
-       WHERE guest_id = $1`,
-      [guestId, playGamesPlayerId]
+    return { migrated: false, reason: "EMPTY_GUEST_NOT_MIGRATED" };
+  }
+
+  // Hedef Play Games hesabı ve kaynak guest için tek kullanımlık migration slotunu atomik olarak al.
+  // Aynı anda iki istek gelse bile PRIMARY KEY/UNIQUE + ON CONFLICT yalnız birinin ilerlemesini sağlar.
+  const migrationClaim = await client.query(
+    `INSERT INTO play_games_guest_migrations (target_player_id, guest_id, migrated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT DO NOTHING
+     RETURNING target_player_id, guest_id`,
+    [playGamesPlayerId, guestId]
+  );
+
+  if (migrationClaim.rowCount === 0) {
+    const existingTarget = await client.query(
+      `SELECT guest_id FROM play_games_guest_migrations WHERE target_player_id = $1`,
+      [playGamesPlayerId]
     );
-    return { migrated: false, reason: "EMPTY_GUEST_LINKED" };
+    if (existingTarget.rowCount > 0) {
+      const existingGuestId = String(existingTarget.rows[0]?.guest_id || "");
+      return {
+        migrated: existingGuestId === guestId,
+        reason: existingGuestId === guestId ? "ALREADY_MIGRATED" : "TARGET_ALREADY_MIGRATED",
+      };
+    }
+
+    const existingGuest = await client.query(
+      `SELECT target_player_id FROM play_games_guest_migrations WHERE guest_id = $1`,
+      [guestId]
+    );
+    if (existingGuest.rowCount > 0) {
+      return { migrated: false, reason: "GUEST_ALREADY_MIGRATED" };
+    }
+
+    return { migrated: false, reason: "MIGRATION_CONFLICT" };
   }
 
   // Kullanıcı tarafından seçilmiş misafir profilini, PGS hedefinde henüz kullanıcı adı
@@ -4347,7 +4362,7 @@ async function awardRealtimeRoom(room, winner, loser) {
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
 }
 
-app.post("/auth/guest", async (req, res) => {
+app.post("/auth/guest", guestAuthRateLimit, async (req, res) => {
   if (!requireDatabase(res)) return;
   const guestId = normalizeGuestId(req.body.guestId);
   const guestSecret = normalizeGuestSecret(req.body.guestSecret);
@@ -4382,7 +4397,7 @@ app.post("/auth/guest", async (req, res) => {
   }
 });
 
-app.post("/auth/play-games", async (req, res) => {
+app.post("/auth/play-games", playGamesAuthRateLimit, async (req, res) => {
   const authCode = safeText(req.body.authCode, "", 4096);
   const guestId = normalizeGuestId(req.body.guestId);
   const guestSecret = normalizeGuestSecret(req.body.guestSecret);
@@ -4455,7 +4470,7 @@ function disconnectSupersededGameplaySockets(playerId, newestSessionId) {
   }
 }
 
-app.post("/game-session/acquire", requireAuth, async (req, res) => {
+app.post("/game-session/acquire", requireAuth, gameplayAcquireRateLimit, async (req, res) => {
   if (!requireDatabase(res)) return;
   const deviceId = normalizeGameplayDeviceId(req.body.deviceId);
   if (!deviceId) {
@@ -4606,7 +4621,7 @@ app.get("/player/state", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/game/hundred/start", requireAuth, requireGameplaySession, async (req, res) => {
+app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const fresh = req.body.fresh === true;
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
@@ -4795,7 +4810,7 @@ app.post("/game/tournament/reset", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res) => {
+app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const tournamentMode = req.body.mode === "tournament";
   const matchMode = safeText(req.body.matchMode, "quick", 32);
@@ -4942,7 +4957,7 @@ app.post("/game/bot/start", requireAuth, requireGameplaySession, async (req, res
   }
 });
 
-app.post("/game/challenges/start", requireAuth, requireGameplaySession, async (req, res) => {
+app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const mode = safeText(req.body.mode, "", 32);
   if (mode !== "infinite") {
@@ -5012,7 +5027,7 @@ app.post("/game/challenges/start", requireAuth, requireGameplaySession, async (r
   }
 });
 
-app.post("/game/challenges/complete", requireAuth, requireGameplaySession, async (req, res) => {
+app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const challengeId = safeText(req.body.challengeId, "", 128);
   if (!challengeId) {
@@ -5785,6 +5800,17 @@ const io = new Server(server, {
         'origin:',
         req.headers.origin || '-'
       );
+    }
+    const clientIp = forwardedClientIp(req);
+    const limit = consumeSecurityRateLimit(
+      "socket-handshake",
+      clientIp,
+      Math.max(10, Math.min(200, Number(process.env.SOCKET_HANDSHAKE_RATE_LIMIT_PER_MINUTE || 40) || 40)),
+      60_000
+    );
+    if (!limit.allowed) {
+      callback("RATE_LIMITED", false);
+      return;
     }
     callback(null, true);
   },
@@ -7307,6 +7333,53 @@ io.on("connection", (socket) => {
     "transport:",
     socket.conn.transport.name
   );
+
+  const socketClientIp = forwardedClientIp(socket.request);
+  const sensitiveSocketEvents = new Set([
+    "create_open_table",
+    "start_open_table_bot",
+    "join_match",
+    "resume_match",
+    "create_friend_room",
+    "join_friend_room",
+    "player_finished",
+  ]);
+
+  socket.use((packet, next) => {
+    const eventName = String(packet?.[0] || "unknown").slice(0, 80);
+    const identity = socket.data?.playerId || socketClientIp;
+    const generalLimit = consumeSecurityRateLimit(
+      "socket-packet",
+      identity,
+      Math.max(60, Math.min(2_000, Number(process.env.SOCKET_PACKET_RATE_LIMIT_10S || 300) || 300)),
+      10_000
+    );
+    if (!generalLimit.allowed) {
+      socket.emit("match_error", {
+        code: "RATE_LIMITED",
+        message: "Çok fazla gerçek zamanlı istek gönderildi. Kısa süre sonra tekrar deneyin.",
+      });
+      return;
+    }
+
+    if (sensitiveSocketEvents.has(eventName)) {
+      const sensitiveLimit = consumeSecurityRateLimit(
+        `socket-sensitive:${eventName}`,
+        identity,
+        Math.max(10, Math.min(300, Number(process.env.SOCKET_SENSITIVE_RATE_LIMIT_10S || 60) || 60)),
+        10_000
+      );
+      if (!sensitiveLimit.allowed) {
+        socket.emit("match_error", {
+          code: "RATE_LIMITED",
+          message: "Bu işlem çok sık tekrarlandı. Kısa süre sonra tekrar deneyin.",
+        });
+        return;
+      }
+    }
+
+    next();
+  });
 
   socket.on("client_capabilities", (payload = {}) => {
     if (payload.scopedLobbyEvents === true) {
