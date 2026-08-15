@@ -5270,32 +5270,41 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
        ORDER BY created_at ASC FOR UPDATE`,
       [req.auth.sub, challengeMode]
     );
-    for (const activeChallenge of activeResult.rows) {
-      const elapsedServerMs = Math.max(
-        0,
-        Date.now() - new Date(activeChallenge.created_at).getTime()
-      );
-      const normalOutcome = botOutcomeForElapsed(
-        activeChallenge.result?.plan || {},
-        elapsedServerMs,
-        false
-      );
-      const expiredAt = new Date(activeChallenge.expires_at).getTime();
-      const isExpiredUnfinishedTwoPlayerBot =
-        activeChallenge.mode === "two_player_bot" &&
-        Number.isFinite(expiredAt) &&
-        Date.now() >= expiredAt &&
-        !normalOutcome.resolvable;
+    const tournamentActiveChallenges = tournamentMode ? activeResult.rows : [];
 
-      if (isExpiredUnfinishedTwoPlayerBot) {
-        await settleTwoPlayerBotChallengeAsDrawInTransaction(
-          client,
-          activeChallenge,
-          req.auth.sub,
-          elapsedServerMs
+    // Normal iki oyunculu bot maçında yeni challenge başlatmak, önceki aktif challenge'ı
+    // mevcut kurallarla kapatır. Turnuvada ise HTTP cevabı istemciye ulaşmamış olabilir;
+    // aynı aşamadaki aktif challenge'ı "forfeit" saymak gizli hak kaybına ve sonsuz retry
+    // döngüsüne yol açıyordu. Turnuva aktif challenge'ları aşağıda stage doğrulamasından
+    // sonra idempotent biçimde yeniden kullanılacaktır.
+    if (!tournamentMode) {
+      for (const activeChallenge of activeResult.rows) {
+        const elapsedServerMs = Math.max(
+          0,
+          Date.now() - new Date(activeChallenge.created_at).getTime()
         );
-      } else {
-        await settleBotChallengeAsForfeitInTransaction(client, activeChallenge, req.auth.sub);
+        const normalOutcome = botOutcomeForElapsed(
+          activeChallenge.result?.plan || {},
+          elapsedServerMs,
+          false
+        );
+        const expiredAt = new Date(activeChallenge.expires_at).getTime();
+        const isExpiredUnfinishedTwoPlayerBot =
+          activeChallenge.mode === "two_player_bot" &&
+          Number.isFinite(expiredAt) &&
+          Date.now() >= expiredAt &&
+          !normalOutcome.resolvable;
+
+        if (isExpiredUnfinishedTwoPlayerBot) {
+          await settleTwoPlayerBotChallengeAsDrawInTransaction(
+            client,
+            activeChallenge,
+            req.auth.sub,
+            elapsedServerMs
+          );
+        } else {
+          await settleBotChallengeAsForfeitInTransaction(client, activeChallenge, req.auth.sub);
+        }
       }
     }
 
@@ -5333,6 +5342,65 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         ticketCost: TOURNAMENT_ENTRY_TICKET_COST,
         entryActive: selectedTournament.entryActive,
       };
+
+      const nowMs = Date.now();
+      const reusableChallenge = [...tournamentActiveChallenges].reverse().find((challenge) => {
+        const expiresAt = new Date(challenge.expires_at).getTime();
+        return normalizedNormalGameKey(challenge?.puzzle?.gameKey) === baseGameKey &&
+          Number(challenge.stage) === stage &&
+          Number.isFinite(expiresAt) &&
+          expiresAt > nowMs;
+      }) || null;
+
+      // Aynı aşama için oluşturulmuş challenge'ın HTTP cevabı kaybolduysa yenisini yaratma.
+      // İstemci tekrar /game/bot/start çağırdığında aynı challenge/puzzle/plan geri verilir.
+      if (reusableChallenge) {
+        for (const challenge of tournamentActiveChallenges) {
+          if (challenge.challenge_id === reusableChallenge.challenge_id) continue;
+          await client.query(
+            `UPDATE secure_game_challenges
+             SET completed_at = NOW(),
+                 result = COALESCE(result, '{}'::jsonb) || $2::jsonb
+             WHERE challenge_id = $1 AND completed_at IS NULL`,
+            [challenge.challenge_id, JSON.stringify({
+              status: "superseded",
+              outcomeReason: "tournament_retry_superseded",
+            })]
+          );
+        }
+        const plan = reusableChallenge.result?.plan || {};
+        await client.query("COMMIT");
+        res.json({
+          ok: true,
+          challengeId: reusableChallenge.challenge_id,
+          mode: "tournament_bot",
+          stage,
+          puzzle: publicPuzzleForClient(reusableChallenge.puzzle),
+          finishMs: Number(plan.finishMs || 0),
+          leaveMs: Number(plan.leaveMs || 0),
+          stakePoints: Math.max(0, Number(reusableChallenge.wager_points || 0)),
+          matchMode: safeText(reusableChallenge.result?.matchMode, matchMode, 32),
+          tournament: tournamentResponse,
+          expiresAtMillis: new Date(reusableChallenge.expires_at).getTime(),
+          reused: true,
+        });
+        return;
+      }
+
+      // Artık geçerli olmayan eski turnuva challenge'larını hak düşürmeden kapat.
+      // Bunlar response-loss/retry artığıdır; oyuncu vazgeçmiş sayılmaz.
+      for (const challenge of tournamentActiveChallenges) {
+        await client.query(
+          `UPDATE secure_game_challenges
+           SET completed_at = NOW(),
+               result = COALESCE(result, '{}'::jsonb) || $2::jsonb
+           WHERE challenge_id = $1 AND completed_at IS NULL`,
+          [challenge.challenge_id, JSON.stringify({
+            status: "superseded",
+            outcomeReason: "tournament_stale_challenge",
+          })]
+        );
+      }
     }
 
     const puzzle = generatePuzzleForGame(baseGameKey, difficulty);
