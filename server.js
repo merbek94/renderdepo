@@ -2014,105 +2014,103 @@ function generateSecurePuzzle(difficultyValue) {
   return { difficulty, target: 20, numbers: shuffled([2, 4, 5]) };
 }
 
+const EQUAL_SUM_TARGET_TEMPLATES = Object.freeze({
+  12: Object.freeze([6, 3, 2, 1, 1, 2, 4, 5, 3, 6, 1, 2, 2, 1, 5, 4]),
+  13: Object.freeze([7, 1, 3, 2, 1, 4, 2, 6, 3, 2, 7, 1, 2, 6, 1, 4]),
+  14: Object.freeze([2, 7, 1, 4, 4, 2, 5, 3, 5, 1, 2, 6, 3, 4, 6, 1]),
+  15: Object.freeze([7, 4, 3, 1, 2, 6, 4, 3, 5, 3, 1, 6, 1, 2, 7, 5]),
+  16: Object.freeze([3, 10, 1, 2, 5, 2, 8, 1, 1, 3, 5, 7, 7, 1, 2, 6]),
+  17: Object.freeze([7, 5, 3, 2, 6, 2, 5, 4, 3, 1, 7, 6, 1, 9, 2, 5]),
+  18: Object.freeze([6, 9, 2, 1, 4, 2, 7, 5, 5, 6, 4, 3, 3, 1, 5, 9]),
+  19: Object.freeze([10, 4, 2, 3, 1, 7, 3, 8, 5, 3, 4, 7, 3, 5, 10, 1]),
+  20: Object.freeze([2, 9, 1, 8, 8, 5, 3, 4, 9, 4, 2, 5, 1, 2, 14, 3]),
+  21: Object.freeze([4, 2, 7, 8, 10, 5, 4, 2, 6, 10, 1, 4, 1, 4, 9, 7]),
+  22: Object.freeze([2, 7, 10, 3, 1, 6, 5, 10, 12, 5, 1, 4, 7, 4, 6, 5]),
+  23: Object.freeze([1, 14, 6, 2, 8, 6, 5, 4, 12, 2, 1, 8, 2, 1, 11, 9]),
+  24: Object.freeze([2, 4, 7, 11, 5, 14, 4, 1, 6, 5, 3, 10, 11, 1, 10, 2]),
+  25: Object.freeze([1, 12, 7, 5, 5, 3, 9, 8, 9, 2, 4, 10, 10, 8, 5, 2]),
+  26: Object.freeze([2, 1, 13, 10, 14, 2, 7, 3, 6, 15, 4, 1, 4, 8, 2, 12]),
+  27: Object.freeze([6, 2, 7, 12, 4, 7, 11, 5, 1, 12, 6, 8, 16, 6, 3, 2]),
+  28: Object.freeze([21, 4, 2, 1, 2, 5, 1, 20, 4, 10, 12, 2, 1, 9, 13, 5]),
+  29: Object.freeze([11, 1, 7, 10, 10, 13, 2, 4, 1, 11, 8, 9, 7, 4, 12, 6]),
+  30: Object.freeze([3, 2, 10, 15, 20, 5, 4, 1, 5, 10, 11, 4, 2, 13, 5, 10]),
+  31: Object.freeze([4, 17, 8, 2, 5, 1, 2, 23, 15, 9, 6, 1, 7, 4, 15, 5]),
+  32: Object.freeze([8, 15, 2, 7, 13, 9, 4, 6, 6, 2, 19, 5, 5, 6, 7, 14]),
+  33: Object.freeze([1, 18, 10, 4, 12, 7, 11, 3, 15, 2, 5, 11, 5, 6, 7, 15]),
+  34: Object.freeze([18, 6, 3, 7, 5, 12, 9, 8, 4, 1, 14, 15, 7, 15, 8, 4]),
+  35: Object.freeze([21, 3, 1, 10, 4, 6, 13, 12, 8, 4, 17, 6, 2, 22, 4, 7]),
+  36: Object.freeze([4, 14, 6, 12, 13, 1, 14, 8, 5, 18, 7, 6, 14, 3, 9, 10]),
+  37: Object.freeze([13, 6, 8, 10, 16, 2, 13, 6, 2, 3, 12, 20, 6, 26, 4, 1]),
+  38: Object.freeze([9, 24, 3, 2, 21, 3, 5, 9, 3, 2, 7, 26, 5, 9, 23, 1]),
+  39: Object.freeze([2, 6, 7, 24, 10, 19, 6, 4, 8, 1, 21, 9, 19, 13, 5, 2]),
+  40: Object.freeze([26, 1, 4, 9, 11, 10, 14, 5, 2, 14, 1, 23, 1, 15, 21, 3])
+});
+
 function generateEqualSumPuzzle(difficultyValue) {
   const difficulty = secureDifficulty(difficultyValue);
-  const size = 6;
+  const size = 4;
 
-  /*
-   * Sabit toplamlı ama aynı 6'lı kümeyi tekrar etmeyen matris:
-   *
-   * value(r,c) = offset + scale * latinRank(r,c) + rowFactor[r] * columnFactor[c]
-   *
-   * factor toplamları 0 olduğu için bütün satır/sütun toplamları eşittir.
-   * scale > en büyük perturbasyon farkı olduğundan aynı satır/sütunda tekrar oluşmaz.
-   * Çarpım perturbasyonu nedeniyle satırlar ve sütunlar aynı altı sayının yalnızca
-   * permütasyonu değildir; her satırın ve her sütunun sayı kümesi ayrıdır.
-   */
-  const factorPool = [-2, -1, -1, 1, 1, 2];
-  let solution = null;
-  let target = 0;
+  // Hedef artık 34/38 ile sınırlı değildir; 12..40 arasındaki her tam sayı seçilebilir.
+  const target = secureRandomInt(12, 41);
+  const template = EQUAL_SUM_TARGET_TEMPLATES[target];
+  if (!Array.isArray(template) || template.length !== size * size) {
+    throw new Error("Eşit Toplam hedef şablonu bulunamadı.");
+  }
 
-  for (let attempt = 0; attempt < 500 && !solution; attempt += 1) {
-    const offset = secureRandomInt(5, 11);
-    const scale = secureRandomInt(9, 14);
-    const rowFactors = shuffled(factorPool);
-    const columnFactors = shuffled(factorPool);
-    const rowOrder = shuffled(Array.from({ length: size }, (_, i) => i));
-    const columnOrder = shuffled(Array.from({ length: size }, (_, i) => i));
-    const shift = secureRandomInt(0, size);
+  const rowOrder = shuffled(Array.from({ length: size }, (_, i) => i));
+  const columnOrder = shuffled(Array.from({ length: size }, (_, i) => i));
+  const transpose = secureRandomInt(0, 2) === 1;
 
-    const candidate = Array(size * size).fill(0);
-    for (let visualRow = 0; visualRow < size; visualRow += 1) {
-      for (let visualCol = 0; visualCol < size; visualCol += 1) {
-        const latinRank = (
-          rowOrder[visualRow] +
-          columnOrder[visualCol] +
-          shift
-        ) % size;
-        candidate[visualRow * size + visualCol] =
-          offset +
-          scale * latinRank +
-          rowFactors[visualRow] * columnFactors[visualCol];
-      }
-    }
-
-    const rows = Array.from({ length: size }, (_, row) =>
-      candidate.slice(row * size, (row + 1) * size)
-    );
-    const columns = Array.from({ length: size }, (_, col) =>
-      Array.from({ length: size }, (_, row) => candidate[row * size + col])
-    );
-    const candidateTarget = rows[0].reduce((sum, value) => sum + value, 0);
-    const lines = rows.concat(columns);
-    const validLines = lines.every((values) =>
-      values.every((value) => Number.isInteger(value) && value > 0) &&
-      new Set(values).size === size &&
-      values.reduce((sum, value) => sum + value, 0) === candidateTarget
-    );
-    const rowSetCount = new Set(
-      rows.map((values) => [...values].sort((a, b) => a - b).join(","))
-    ).size;
-    const columnSetCount = new Set(
-      columns.map((values) => [...values].sort((a, b) => a - b).join(","))
-    ).size;
-
-    if (validLines && rowSetCount === size && columnSetCount === size) {
-      solution = candidate;
-      target = candidateTarget;
+  const solution = Array(size * size).fill(0);
+  for (let visualRow = 0; visualRow < size; visualRow += 1) {
+    for (let visualCol = 0; visualCol < size; visualCol += 1) {
+      const sourceRow = rowOrder[visualRow];
+      const sourceCol = columnOrder[visualCol];
+      const sourceIndex = transpose
+        ? sourceCol * size + sourceRow
+        : sourceRow * size + sourceCol;
+      solution[visualRow * size + visualCol] = template[sourceIndex];
     }
   }
 
-  if (!solution) {
-    // Deterministik güvenli yedek: her satır/sütun 165 eder, çizgi içinde tekrar
-    // yoktur ve altı satır/sütunun sayı kümeleri birbirinden farklıdır.
-    solution = [
-      25, 9, 46, 12, 34, 39,
-      40, 21, 16, 33, 49, 6,
-      3, 37, 36, 52, 12, 25,
-      31, 12, 7, 24, 40, 51,
-      51, 34, 21, 40, 6, 13,
-      15, 52, 39, 4, 24, 31,
-    ];
-    target = 165;
+  const rows = Array.from({ length: size }, (_, row) =>
+    solution.slice(row * size, (row + 1) * size)
+  );
+  const columns = Array.from({ length: size }, (_, col) =>
+    Array.from({ length: size }, (_, row) => solution[row * size + col])
+  );
+  const lines = rows.concat(columns);
+  const distinctRowSets = new Set(rows.map((values) => [...values].sort((a, b) => a - b).join(","))).size;
+  const distinctColumnSets = new Set(columns.map((values) => [...values].sort((a, b) => a - b).join(","))).size;
+  if (
+    target < 12 || target > 40 ||
+    !lines.every((values) =>
+      values.every((value) => Number.isInteger(value) && value > 0) &&
+      new Set(values).size === size &&
+      values.reduce((sum, value) => sum + value, 0) === target
+    ) ||
+    distinctRowSets < 2 ||
+    distinctColumnSets < 2
+  ) {
+    throw new Error("Eşit Toplam 4x4 bulmacası üretilemedi.");
   }
 
   const rowFixedCount = Array(size).fill(0);
   const colFixedCount = Array(size).fill(0);
   const fixedIndices = [];
   let guard = 0;
-  while (fixedIndices.length < 18 && guard < 20000) {
+  while (fixedIndices.length < 8 && guard < 10000) {
     guard += 1;
     const index = secureRandomInt(0, size * size);
     if (fixedIndices.includes(index)) continue;
     const row = Math.floor(index / size);
     const col = index % size;
-    if (rowFixedCount[row] >= 4 || colFixedCount[col] >= 4) continue;
+    if (rowFixedCount[row] >= 3 || colFixedCount[col] >= 3) continue;
     fixedIndices.push(index);
     rowFixedCount[row] += 1;
     colFixedCount[col] += 1;
   }
-  if (fixedIndices.length !== 18) {
-    // Deterministik dama deseni: 18 sabit hücre, her satır/sütunda tam 3 adet.
+  if (fixedIndices.length !== 8) {
     fixedIndices.splice(0, fixedIndices.length);
     for (let row = 0; row < size; row += 1) {
       for (let col = 0; col < size; col += 1) {
@@ -2134,7 +2132,6 @@ function generateEqualSumPuzzle(difficultyValue) {
     target,
     fixedCells,
     numbers,
-    // secure challenge tablosunda doğrulama için tutulur; publicPuzzleForClient bunu istemciye göndermez.
     solution,
   };
 }
@@ -4037,19 +4034,20 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
 
 function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValuesRaw = null) {
   if (puzzle?.gameKey === "equal_sum") {
-    const size = Number(puzzle.size || 6);
+    const size = Number(puzzle.size || 4);
     const expected = Array.isArray(puzzle.solution) ? puzzle.solution.map(Number) : [];
     const grid = Array.isArray(gridValuesRaw) ? gridValuesRaw.map(Number) : [];
-    if (size !== 6 || expected.length !== size * size || grid.length !== size * size) return false;
+    if (size !== 4 || expected.length !== size * size || grid.length !== size * size) return false;
     if (!grid.every((value) => Number.isInteger(value))) return false;
     const fixedCells = Array.isArray(puzzle.fixedCells) ? puzzle.fixedCells : [];
-    if (fixedCells.length !== 18) return false;
+    if (fixedCells.length !== 8) return false;
     for (const cell of fixedCells) {
       const index = Number(cell?.index);
       const value = Number(cell?.value);
       if (!Number.isInteger(index) || index < 0 || index >= size * size || grid[index] !== value) return false;
     }
     const target = Number(puzzle.target);
+    if (!Number.isInteger(target) || target <= 0 || target > 40) return false;
     const rows = [];
     const columns = [];
     for (let row = 0; row < size; row += 1) {
@@ -4074,7 +4072,7 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
       if (new Set(columnValues).size !== size || sum !== target) return false;
       columns.push(columnValues);
     }
-    // Aynı 6'lı sayı kümesinin bütün satır/sütunlarda yalnız sırası değiştirilerek
+    // Aynı 4'lü sayı kümesinin bütün satır/sütunlarda yalnız sırası değiştirilerek
     // tekrar edilmesine izin verme. İstemci çözüm kuralıyla birebir aynı doğrulama.
     const rowSetCount = new Set(
       rows.map((values) => [...values].sort((a, b) => a - b).join(","))
