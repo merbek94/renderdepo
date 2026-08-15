@@ -4072,15 +4072,16 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
       if (new Set(columnValues).size !== size || sum !== target) return false;
       columns.push(columnValues);
     }
-    // Aynı 4'lü sayı kümesinin bütün satır/sütunlarda yalnız sırası değiştirilerek
-    // tekrar edilmesine izin verme. İstemci çözüm kuralıyla birebir aynı doğrulama.
+    // Bütün satır/sütunların tek bir aynı 4'lü sayı kümesinin yalnızca permütasyonu
+    // olmasına izin verme. Farklı iki çizginin aynı kümeyi paylaşması ise geçerlidir;
+    // hedef 12/13 gibi küçük toplamlar için bu matematiksel olarak zorunlu olabilir.
     const rowSetCount = new Set(
       rows.map((values) => [...values].sort((a, b) => a - b).join(","))
     ).size;
     const columnSetCount = new Set(
       columns.map((values) => [...values].sort((a, b) => a - b).join(","))
     ).size;
-    if (rowSetCount !== size || columnSetCount !== size) return false;
+    if (rowSetCount < 2 || columnSetCount < 2) return false;
 
     const expectedMultiset = [...expected].sort((a, b) => a - b);
     const actualMultiset = [...grid].sort((a, b) => a - b);
