@@ -5057,10 +5057,23 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
         error.publicCode = "HUNDRED_DAILY_RIGHT_EXHAUSTED";
         throw error;
       } */
+
+      // 100 kişilik oyun hakkı tüketimi yukarıda bilerek devre dışı bırakılmış olsa bile
+      // koşunun authoritative sunucu durumu mutlaka başlatılmalıdır. Aksi halde challenge
+      // stage=1 üretilirken player_progress hundred_active=false / hundred_stage=0 kalır
+      // ve doğru çözüm HUNDRED_STATE_MISMATCH ile reddedilir.
+      await client.query(
+        `UPDATE player_progress SET
+           hundred_active = TRUE,
+           hundred_stage = 1,
+           updated_at = NOW()
+         WHERE player_id = $1`,
+        [req.auth.sub]
+      );
     }
 
-    // access satırı transaction başında FOR UPDATE ile okundu. Fresh başlangıçta az önce
-    // stage=1 yazdık; devam oyununda da access.stage zaten kilitli satırdan geldi.
+    // access satırı transaction başında FOR UPDATE ile okundu. Fresh başlangıçta
+    // authoritative stage=1 yukarıda yazılır; devam oyununda access.stage kilitli satırdan gelir.
     const activeAfterStart = fresh ? true : access.active;
     if (!activeAfterStart) {
       const error = new Error("100 kişilik oyun aktif değil.");
@@ -5213,7 +5226,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
   try {
     await client.query("BEGIN");
     const requestedDifficulty = secureDifficulty(req.body.difficulty);
-    if (!immediateBotMode) {
+    if (!immediateBotMode && !tournamentMode) {
       await consumeBotFallbackEligibilityInTransaction(
         client,
         req.auth.sub,
@@ -5221,6 +5234,10 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         requestedDifficulty
       );
     }
+    // Turnuvada istemci zaten 20-37 saniye gerçek oyuncu arıyor. Socket.IO bağlantısı
+    // Render uyanması/transport sorunu nedeniyle sunucu kuyruğuna hiç ulaşamazsa eski kod
+    // HTTP bot fallback'ini sonsuza kadar BOT_FALLBACK_NOT_READY ile reddediyordu.
+    // Bu nedenle yalnız turnuva bot fallback'i socket-kuyruk işaretine bağımlı değildir.
 
     let stakePoints = 0;
     let finishProfile = null;
