@@ -2017,24 +2017,83 @@ function generateSecurePuzzle(difficultyValue) {
 function generateEqualSumPuzzle(difficultyValue) {
   const difficulty = secureDifficulty(difficultyValue);
   const size = 6;
-  // Aynı satır veya sütunda sayı tekrarı olmasın: 2..9 havuzundan
-  // altı farklı sayı seçilir. Latin-kare döngüsü bu altı sayının her satır
-  // ve her sütunda tam birer kez görünmesini garanti eder.
-  const baseValues = shuffled([2, 3, 4, 5, 6, 7, 8, 9]).slice(0, size);
-  const target = baseValues.reduce((sum, value) => sum + value, 0);
 
-  const rowShift = secureRandomInt(0, size);
-  const columnShift = secureRandomInt(0, size);
-  const rowOrder = shuffled(Array.from({ length: size }, (_, i) => i));
-  const columnOrder = shuffled(Array.from({ length: size }, (_, i) => i));
-  const solution = Array(size * size).fill(0);
-  for (let visualRow = 0; visualRow < size; visualRow += 1) {
-    for (let visualCol = 0; visualCol < size; visualCol += 1) {
-      const row = rowOrder[visualRow];
-      const col = columnOrder[visualCol];
-      const baseIndex = (row + col + rowShift + columnShift) % size;
-      solution[visualRow * size + visualCol] = baseValues[baseIndex];
+  /*
+   * Sabit toplamlı ama aynı 6'lı kümeyi tekrar etmeyen matris:
+   *
+   * value(r,c) = offset + scale * latinRank(r,c) + rowFactor[r] * columnFactor[c]
+   *
+   * factor toplamları 0 olduğu için bütün satır/sütun toplamları eşittir.
+   * scale > en büyük perturbasyon farkı olduğundan aynı satır/sütunda tekrar oluşmaz.
+   * Çarpım perturbasyonu nedeniyle satırlar ve sütunlar aynı altı sayının yalnızca
+   * permütasyonu değildir; her satırın ve her sütunun sayı kümesi ayrıdır.
+   */
+  const factorPool = [-2, -1, -1, 1, 1, 2];
+  let solution = null;
+  let target = 0;
+
+  for (let attempt = 0; attempt < 500 && !solution; attempt += 1) {
+    const offset = secureRandomInt(5, 11);
+    const scale = secureRandomInt(9, 14);
+    const rowFactors = shuffled(factorPool);
+    const columnFactors = shuffled(factorPool);
+    const rowOrder = shuffled(Array.from({ length: size }, (_, i) => i));
+    const columnOrder = shuffled(Array.from({ length: size }, (_, i) => i));
+    const shift = secureRandomInt(0, size);
+
+    const candidate = Array(size * size).fill(0);
+    for (let visualRow = 0; visualRow < size; visualRow += 1) {
+      for (let visualCol = 0; visualCol < size; visualCol += 1) {
+        const latinRank = (
+          rowOrder[visualRow] +
+          columnOrder[visualCol] +
+          shift
+        ) % size;
+        candidate[visualRow * size + visualCol] =
+          offset +
+          scale * latinRank +
+          rowFactors[visualRow] * columnFactors[visualCol];
+      }
     }
+
+    const rows = Array.from({ length: size }, (_, row) =>
+      candidate.slice(row * size, (row + 1) * size)
+    );
+    const columns = Array.from({ length: size }, (_, col) =>
+      Array.from({ length: size }, (_, row) => candidate[row * size + col])
+    );
+    const candidateTarget = rows[0].reduce((sum, value) => sum + value, 0);
+    const lines = rows.concat(columns);
+    const validLines = lines.every((values) =>
+      values.every((value) => Number.isInteger(value) && value > 0) &&
+      new Set(values).size === size &&
+      values.reduce((sum, value) => sum + value, 0) === candidateTarget
+    );
+    const rowSetCount = new Set(
+      rows.map((values) => [...values].sort((a, b) => a - b).join(","))
+    ).size;
+    const columnSetCount = new Set(
+      columns.map((values) => [...values].sort((a, b) => a - b).join(","))
+    ).size;
+
+    if (validLines && rowSetCount === size && columnSetCount === size) {
+      solution = candidate;
+      target = candidateTarget;
+    }
+  }
+
+  if (!solution) {
+    // Deterministik güvenli yedek: her satır/sütun 165 eder, çizgi içinde tekrar
+    // yoktur ve altı satır/sütunun sayı kümeleri birbirinden farklıdır.
+    solution = [
+      25, 9, 46, 12, 34, 39,
+      40, 21, 16, 33, 49, 6,
+      3, 37, 36, 52, 12, 25,
+      31, 12, 7, 24, 40, 51,
+      51, 34, 21, 40, 6, 13,
+      15, 52, 39, 4, 24, 31,
+    ];
+    target = 165;
   }
 
   const rowFixedCount = Array(size).fill(0);
@@ -3991,6 +4050,8 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
       if (!Number.isInteger(index) || index < 0 || index >= size * size || grid[index] !== value) return false;
     }
     const target = Number(puzzle.target);
+    const rows = [];
+    const columns = [];
     for (let row = 0; row < size; row += 1) {
       const rowValues = [];
       let sum = 0;
@@ -4000,6 +4061,7 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
         sum += value;
       }
       if (new Set(rowValues).size !== size || sum !== target) return false;
+      rows.push(rowValues);
     }
     for (let col = 0; col < size; col += 1) {
       const columnValues = [];
@@ -4010,7 +4072,18 @@ function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, gridValue
         sum += value;
       }
       if (new Set(columnValues).size !== size || sum !== target) return false;
+      columns.push(columnValues);
     }
+    // Aynı 6'lı sayı kümesinin bütün satır/sütunlarda yalnız sırası değiştirilerek
+    // tekrar edilmesine izin verme. İstemci çözüm kuralıyla birebir aynı doğrulama.
+    const rowSetCount = new Set(
+      rows.map((values) => [...values].sort((a, b) => a - b).join(","))
+    ).size;
+    const columnSetCount = new Set(
+      columns.map((values) => [...values].sort((a, b) => a - b).join(","))
+    ).size;
+    if (rowSetCount !== size || columnSetCount !== size) return false;
+
     const expectedMultiset = [...expected].sort((a, b) => a - b);
     const actualMultiset = [...grid].sort((a, b) => a - b);
     return expectedMultiset.every((value, index) => value === actualMultiset[index]);
