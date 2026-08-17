@@ -599,11 +599,47 @@ async function initDatabase() {
     END
     $multi_game_progress_backfill_v1$;
 
-    ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check;
-    ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-    ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2 CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
-    ALTER TABLE player_progress DROP CONSTRAINT IF EXISTS player_progress_hundred_daily_base_remaining_check_v1;
-    ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_daily_base_remaining_check_v1 CHECK (hundred_daily_base_remaining BETWEEN 0 AND 2);
+    -- Bu constraintler initDatabase her Render restartında yeniden çalıştığı için tamamen idempotent olmalı.
+    -- Önce eski sürümden kalmış sınır dışı değerleri düzelt; ardından eski constraint adlarını temizle.
+    UPDATE player_progress
+      SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 2)
+      WHERE hundred_rewarded_rights < 0 OR hundred_rewarded_rights > 2;
+    UPDATE player_progress
+      SET hundred_daily_base_remaining = LEAST(GREATEST(hundred_daily_base_remaining, 0), 2)
+      WHERE hundred_daily_base_remaining < 0 OR hundred_daily_base_remaining > 2;
+
+    ALTER TABLE player_progress
+      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check;
+    ALTER TABLE player_progress
+      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
+
+    -- PostgreSQL ADD CONSTRAINT IF NOT EXISTS desteklemediği için pg_constraint ile koru.
+    -- Önceki yarım deploy v2 constraint'ini oluşturmuşsa ikinci kez eklemeye çalışma.
+    DO $global_right_constraints_v2$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'player_progress_hundred_rewarded_rights_check_v2'
+          AND conrelid = 'player_progress'::regclass
+      ) THEN
+        ALTER TABLE player_progress
+          ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
+          CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'player_progress_hundred_daily_base_remaining_check_v1'
+          AND conrelid = 'player_progress'::regclass
+      ) THEN
+        ALTER TABLE player_progress
+          ADD CONSTRAINT player_progress_hundred_daily_base_remaining_check_v1
+          CHECK (hundred_daily_base_remaining BETWEEN 0 AND 2);
+      END IF;
+    END
+    $global_right_constraints_v2$;
 
     -- Büyük UPDATE/constraint normalizasyonları her Render restartında değil yalnızca bir kez çalışır.
     DO $progress_normalization_v3$
@@ -644,11 +680,19 @@ async function initDatabase() {
         UPDATE player_progress
           SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 2)
           WHERE hundred_rewarded_rights < 0 OR hundred_rewarded_rights > 2;
+        -- Eski v1 adını artık tekrar oluşturma. Yukarıdaki ortak idempotent blok v2'yi yönetir.
         ALTER TABLE player_progress
           DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-        ALTER TABLE player_progress
-          ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v1
-          CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'player_progress_hundred_rewarded_rights_check_v2'
+            AND conrelid = 'player_progress'::regclass
+        ) THEN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
+            CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+        END IF;
 
         INSERT INTO schema_migrations (migration_id)
         VALUES ('progress_normalization_v3_20260813')
