@@ -610,6 +610,8 @@ async function initDatabase() {
     ALTER TABLE player_progress
       DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
     ALTER TABLE player_progress
+      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v2;
+    ALTER TABLE player_progress
       ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
       CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
 
