@@ -7,6 +7,9 @@ const { Pool } = require("pg");
 
 const app = express();
 
+const SERVER_BUILD_ID = "shared-progress-constraint-fix-v5-20260818";
+console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
+
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
 // Farklı bir topoloji kullanıyorsan TRUST_PROXY_HOPS ortam değişkenini buna göre ayarla.
 const TRUST_PROXY_HOPS = Math.max(0, Math.min(5, Number(process.env.TRUST_PROXY_HOPS || 1) || 1));
@@ -558,9 +561,13 @@ async function initDatabase() {
           WHERE tournament_tickets < 0 OR tournament_tickets > 9999;
         ALTER TABLE player_progress
           DROP CONSTRAINT IF EXISTS player_progress_tournament_tickets_check_v1;
-        ALTER TABLE player_progress
-          ADD CONSTRAINT player_progress_tournament_tickets_check_v1
-          CHECK (tournament_tickets BETWEEN 0 AND 9999);
+        BEGIN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_tournament_tickets_check_v1
+            CHECK (tournament_tickets BETWEEN 0 AND 9999);
+        EXCEPTION WHEN duplicate_object THEN
+          NULL;
+        END;
 
         UPDATE player_progress
           SET tournament_stage = LEAST(GREATEST(tournament_stage, 1), 8)
@@ -569,18 +576,26 @@ async function initDatabase() {
           DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check;
         ALTER TABLE player_progress
           DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check_v2;
-        ALTER TABLE player_progress
-          ADD CONSTRAINT player_progress_tournament_stage_check_v2
-          CHECK (tournament_stage BETWEEN 1 AND 8);
+        BEGIN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_tournament_stage_check_v2
+            CHECK (tournament_stage BETWEEN 1 AND 8);
+        EXCEPTION WHEN duplicate_object THEN
+          NULL;
+        END;
 
         UPDATE player_progress
           SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 2)
           WHERE hundred_rewarded_rights < 0 OR hundred_rewarded_rights > 1;
         ALTER TABLE player_progress
           DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-        ALTER TABLE player_progress
-          ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v1
-          CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+        BEGIN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v1
+            CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+        EXCEPTION WHEN duplicate_object THEN
+          NULL;
+        END;
 
         INSERT INTO schema_migrations (migration_id)
         VALUES ('progress_normalization_v3_20260813')
@@ -595,25 +610,65 @@ async function initDatabase() {
         WHEN hundred_daily_base_used THEN 1
         ELSE 0
       END;
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_hundred_daily_base_used_count_check;
-    ALTER TABLE player_progress
-      ADD CONSTRAINT player_progress_hundred_daily_base_used_count_check
-      CHECK (hundred_daily_base_used_count BETWEEN 0 AND 2);
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_tournament_rewarded_tickets_today_check;
-    ALTER TABLE player_progress
-      ADD CONSTRAINT player_progress_tournament_rewarded_tickets_today_check
-      CHECK (tournament_rewarded_tickets_today BETWEEN 0 AND 15);
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check;
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-    ALTER TABLE player_progress
-      DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v2;
-    ALTER TABLE player_progress
-      ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
-      CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+
+    -- Bu constraint'ler her Render restartında silinip yeniden oluşturulmaz.
+    -- Var olan doğru constraint korunur; yalnız eksikse eklenir. Böylece eski/yeni
+    -- instance'ların kısa süre aynı anda initDatabase() çalıştırması duplicate_object
+    -- (PostgreSQL 42710) hatasına yol açmaz.
+    DO $shared_progress_constraints_v5$
+    BEGIN
+      -- Eski adlar artık kullanılmıyor; varsa kaldırmak güvenlidir.
+      ALTER TABLE player_progress
+        DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check;
+      ALTER TABLE player_progress
+        DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'player_progress_hundred_daily_base_used_count_check'
+          AND conrelid = 'player_progress'::regclass
+      ) THEN
+        BEGIN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_hundred_daily_base_used_count_check
+            CHECK (hundred_daily_base_used_count BETWEEN 0 AND 2);
+        EXCEPTION WHEN duplicate_object THEN
+          NULL;
+        END;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'player_progress_tournament_rewarded_tickets_today_check'
+          AND conrelid = 'player_progress'::regclass
+      ) THEN
+        BEGIN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_tournament_rewarded_tickets_today_check
+            CHECK (tournament_rewarded_tickets_today BETWEEN 0 AND 15);
+        EXCEPTION WHEN duplicate_object THEN
+          NULL;
+        END;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'player_progress_hundred_rewarded_rights_check_v2'
+          AND conrelid = 'player_progress'::regclass
+      ) THEN
+        BEGIN
+          ALTER TABLE player_progress
+            ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
+            CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+        EXCEPTION WHEN duplicate_object THEN
+          NULL;
+        END;
+      END IF;
+    END
+    $shared_progress_constraints_v5$;
 
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS game_rights INTEGER NOT NULL DEFAULT 10;
