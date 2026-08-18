@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "shared-progress-constraint-fix-v5-20260818";
+const SERVER_BUILD_ID = "player-game-progress-schema-fix-v6-20260818";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -765,13 +765,40 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (player_id, game_key)
     );
+    -- CREATE TABLE IF NOT EXISTS mevcut tabloyu değiştirmez. Eski/yarım migration ile
+    -- player_game_progress daha önce oluşmuşsa eksik kolonların tamamını burada tamamla.
+    -- Bu blok tekrar çalıştırılabilir; mevcut kolonlara dokunmaz.
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS infinite_run_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS hundred_active BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS stats JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
     CREATE INDEX IF NOT EXISTS idx_player_game_progress_game
       ON player_game_progress (game_key, player_id);
-
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0;
 
     -- Eski tek oyun sürümündeki Hedef Sayıyı Bul ilerlemesini ilk geçişte koru.
     INSERT INTO player_game_progress (
