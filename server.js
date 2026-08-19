@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "shared-game-shell-reconnect-bot-v7-20260818";
+const SERVER_BUILD_ID = "shared-game-shell-generic-state-v8-20260819";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2005,6 +2005,7 @@ const GAME_DEFINITIONS = Object.freeze({
     botCalibrationMinMs: 90 * 1000,
     botCalibrationMaxMs: 119 * 1000,
     botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: (stage) => Number(stage || 1) <= 5 ? "Medium" : "Hard",
   }),
   equal_sum: Object.freeze({
     key: "equal_sum",
@@ -2019,18 +2020,31 @@ const GAME_DEFINITIONS = Object.freeze({
     botCalibrationMaxMs: 297_500,
     // 6. oyundan itibaren oyuncunun o oyundaki ortalaması ±7 sn.
     botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
   }),
 });
 
+function unsupportedGameError(value) {
+  const raw = String(value ?? "").trim().slice(0, 96);
+  const error = new Error(`Desteklenmeyen oyun anahtarı: ${raw || "(boş)"}`);
+  error.statusCode = 400;
+  error.publicCode = "UNSUPPORTED_GAME";
+  return error;
+}
+
 function normalizeBaseGameKey(value) {
-  const cleaned = String(value || "target_number").trim().toLowerCase().slice(0, 96);
+  // Eski istemciler gameKey göndermiyorsa Hedef Sayıyı Bul geriye dönük varsayılan olmaya devam eder.
+  // Fakat açıkça gönderilmiş bilinmeyen bir anahtar ASLA target_number'a sessizce çevrilmez.
+  const raw = String(value ?? "").trim();
+  const cleaned = (raw || "target_number").toLowerCase().slice(0, 96);
   const withoutStage = cleaned.replace(/_stage_\d+$/, "");
   const base = withoutStage.replace(/_(?:tournament|hundred)$/, "");
-  return GAME_DEFINITIONS[base] ? base : "target_number";
+  if (!GAME_DEFINITIONS[base]) throw unsupportedGameError(raw || base);
+  return base;
 }
 
 function gameDefinition(value) {
-  return GAME_DEFINITIONS[normalizeBaseGameKey(value)] || GAME_DEFINITIONS.target_number;
+  return GAME_DEFINITIONS[normalizeBaseGameKey(value)];
 }
 
 function gameModeKey(value, mode) {
@@ -2039,6 +2053,27 @@ function gameModeKey(value, mode) {
   if (mode === "hundred") return `${base}_hundred`;
   return base;
 }
+
+// HTTP tarafında gameKey taşıyan bütün oyun isteklerini handler'a girmeden önce doğrula.
+// Böylece yeni Android oyunu Render'a eklenmeyi unutursa yanlışlıkla Hedef Sayıyı Bul verisine yazılmaz.
+app.use((req, res, next) => {
+  if (!String(req.path || "").startsWith("/game")) return next();
+  const candidates = [req.body?.gameKey, req.query?.gameKey];
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null || String(candidate).trim() === "") continue;
+    try {
+      normalizeBaseGameKey(candidate);
+    } catch (error) {
+      res.status(error.statusCode || 400).json({
+        ok: false,
+        code: error.publicCode || "UNSUPPORTED_GAME",
+        message: error.message || "Desteklenmeyen oyun.",
+      });
+      return;
+    }
+  }
+  next();
+});
 
 function lineHasFourDistinctValues(values) {
   return Array.isArray(values) && values.length === 4 && new Set(values.map(Number)).size === 4;
@@ -2136,9 +2171,7 @@ function generateEqualSumPuzzle() {
 }
 
 function generatePuzzleForGame(gameKey, difficultyValue) {
-  const base = normalizeBaseGameKey(gameKey);
-  if (base === "equal_sum") return generateEqualSumPuzzle();
-  return { ...generateSecurePuzzle(difficultyValue), gameKey: "target_number", initialGrid: [] };
+  return gameHandler(gameKey).createPuzzle(difficultyValue);
 }
 
 function generateSecurePuzzle(difficultyValue) {
@@ -3519,9 +3552,8 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number
     BOT_MIN_FINISH_MS,
     Math.min(profile.averageFinishMs, absoluteMaxMs)
   );
-  // Hedef Sayıyı Bul eski ±4 sn davranışını korur; diğer/yeni oyunların varsayılanı ±7 sn'dir.
-  const defaultVarianceMs = config.key === "target_number" ? 4_000 : 7_000;
-  const varianceMs = Math.max(0, Number(config.botAverageVarianceMs ?? defaultVarianceMs));
+  // Varyans da diğer bot süreleri gibi yalnız oyun tanımından gelir.
+  const varianceMs = Math.max(0, Number(config.botAverageVarianceMs ?? 7_000));
   const minimumFinishMs = Math.max(
     BOT_MIN_FINISH_MS,
     averageFinishMs - varianceMs
@@ -3859,19 +3891,59 @@ function validateEqualSumChallengeAnswer(puzzle, numberSlotsRaw) {
   return new Set(signatures).size === signatures.length;
 }
 
-function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw) {
-  if (normalizeBaseGameKey(puzzle?.gameKey) === "equal_sum") {
-    return validateEqualSumChallengeAnswer(puzzle, numberSlotsRaw);
+function normalizeGameAnswer(numberSlotsRaw, operatorsRaw, answerRaw) {
+  const answer = answerRaw && typeof answerRaw === "object" && !Array.isArray(answerRaw)
+    ? { ...answerRaw }
+    : {};
+  if (!Array.isArray(answer.numberSlots) && Array.isArray(numberSlotsRaw)) {
+    answer.numberSlots = numberSlotsRaw;
   }
+  if (!Array.isArray(answer.operators) && Array.isArray(operatorsRaw)) {
+    answer.operators = operatorsRaw;
+  }
+  return answer;
+}
+
+function validateTargetNumberChallengeAnswer(puzzle, answer = {}) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  const numberSlots = Array.isArray(numberSlotsRaw) ? numberSlotsRaw.map(Number) : [];
-  const operators = Array.isArray(operatorsRaw) ? operatorsRaw.map(String) : [];
+  const numberSlots = Array.isArray(answer.numberSlots) ? answer.numberSlots.map(Number) : [];
+  const operators = Array.isArray(answer.operators) ? answer.operators.map(String) : [];
   if (numberSlots.length !== numbers.length || operators.length !== numbers.length - 1) return false;
   const sorted = [...numberSlots].sort((a, b) => a - b);
   if (!sorted.every((value, index) => Number.isInteger(value) && value === index)) return false;
   const orderedNumbers = numberSlots.map((index) => numbers[index]);
   const result = evaluateExpression(orderedNumbers, operators);
   return result !== null && Math.abs(result - Number(puzzle.target)) < 0.0001;
+}
+
+const GAME_HANDLERS = Object.freeze({
+  target_number: Object.freeze({
+    key: "target_number",
+    createPuzzle: (difficultyValue) => ({
+      ...generateSecurePuzzle(difficultyValue),
+      gameKey: "target_number",
+      initialGrid: [],
+    }),
+    validateAnswer: (puzzle, answer) => validateTargetNumberChallengeAnswer(puzzle, answer),
+  }),
+  equal_sum: Object.freeze({
+    key: "equal_sum",
+    createPuzzle: () => generateEqualSumPuzzle(),
+    validateAnswer: (puzzle, answer) =>
+      validateEqualSumChallengeAnswer(puzzle, Array.isArray(answer?.numberSlots) ? answer.numberSlots : []),
+  }),
+});
+
+function gameHandler(value) {
+  const base = normalizeBaseGameKey(value);
+  const handler = GAME_HANDLERS[base];
+  if (!handler) throw unsupportedGameError(base);
+  return handler;
+}
+
+function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, answerRaw) {
+  const answer = normalizeGameAnswer(numberSlotsRaw, operatorsRaw, answerRaw);
+  return gameHandler(puzzle?.gameKey).validateAnswer(puzzle, answer);
 }
 
 async function ensureAuthenticatedPlayer(client, playerId) {
@@ -5236,8 +5308,11 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
       [req.auth.sub, gameKey]
     );
     const stage = Math.max(1, Math.min(Number(progressResult.rows[0]?.infinite_next_stage || 1), 1000));
-    const difficulty = gameKey === "equal_sum" ? "Standard" : (stage <= 5 ? "Medium" : "Hard");
-    const puzzle = generatePuzzleForGame(gameKey, difficulty || requestedDifficulty);
+    const difficultyResolver = gameDefinition(gameKey).infiniteDifficultyForStage;
+    const difficulty = typeof difficultyResolver === "function"
+      ? secureDifficulty(difficultyResolver(stage, requestedDifficulty))
+      : requestedDifficulty;
+    const puzzle = generatePuzzleForGame(gameKey, difficulty);
 
     await client.query(
       `WITH superseded AS (
@@ -5313,7 +5388,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       error.publicCode = "HUNDRED_STAGE_EXPIRED";
       throw error;
     }
-    if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators)) {
+    if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer)) {
       const error = new Error("Oyun sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
     }
 
@@ -7581,6 +7656,20 @@ io.on("connection", (socket) => {
   socket.use((packet, next) => {
     const eventName = String(packet?.[0] || "unknown").slice(0, 80);
     const identity = socket.data?.playerId || socketClientIp;
+
+    const incomingGameKey = packet?.[1]?.gameKey;
+    if (incomingGameKey !== undefined && incomingGameKey !== null && String(incomingGameKey).trim() !== "") {
+      try {
+        normalizeBaseGameKey(incomingGameKey);
+      } catch (error) {
+        socket.emit("match_error", {
+          code: error.publicCode || "UNSUPPORTED_GAME",
+          message: error.message || "Desteklenmeyen oyun.",
+        });
+        return;
+      }
+    }
+
     const generalLimit = consumeSecurityRateLimit(
       "socket-packet",
       identity,
@@ -8584,7 +8673,7 @@ io.on("connection", (socket) => {
         socket.emit("match_error", { code: "MATCH_NOT_STARTED", message: "Hazırlık geri sayımı henüz tamamlanmadı." });
         return;
       }
-      if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators)) {
+      if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators, payload.answer)) {
         socket.emit("match_error", { code: "INVALID_SOLUTION", message: "Gönderilen işlem sunucuda doğrulanamadı." });
         return;
       }
