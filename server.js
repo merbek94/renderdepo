@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "player-game-progress-schema-fix-v6-20260818";
+const SERVER_BUILD_ID = "shared-game-shell-reconnect-bot-v7-20260818";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -1999,16 +1999,26 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "HEDEF SAYIYI BUL",
     roundDurationMs: 2 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
+    // Bot algoritması ortaktır; yalnız bu değerler oyuna özeldir.
     botFinishMinMs: 24 * 1000,
     botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
   }),
   equal_sum: Object.freeze({
     key: "equal_sum",
     displayName: "EŞİT TOPLAM",
-    roundDurationMs: 2 * 60 * 1000,
+    // Normal / sonsuz / ikili / turnuva tur süresi 5 dakika.
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 32 * 1000,
-    botFinishMaxMs: 112 * 1000,
+    // İlk 5 kalibrasyon: Hedef Sayıyı Bul'un 90-119 sn temel aralığının tam 2.5 katı.
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
+    botCalibrationMinMs: 225 * 1000,
+    botCalibrationMaxMs: 297_500,
+    // 6. oyundan itibaren oyuncunun o oyundaki ortalaması ±7 sn.
+    botAverageVarianceMs: 7 * 1000,
   }),
 });
 
@@ -3404,11 +3414,7 @@ function secureRandomInt(minInclusive, maxExclusive) {
 }
 
 const BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES = 5;
-const BOT_CALIBRATION_MIN_FINISH_MS = 90 * 1000;
-const BOT_CALIBRATION_MAX_FINISH_MS = 119_000;
-const BOT_AVERAGE_VARIANCE_MS = 4 * 1000;
 const BOT_MIN_FINISH_MS = 1_000;
-const BOT_MAX_FINISH_MS = 119_000;
 
 function normalizeTwoPlayerFinishProfile(profile = {}) {
   const parsedFinishCount = Number(profile.finishCount || 0);
@@ -3482,42 +3488,53 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs, roundCountValue = 
   }
 }
 
-function createTwoPlayerBotFinishMs(finishProfile = {}, maxFinishMs = BOT_MAX_FINISH_MS) {
+/**
+ * Bot bitirme algoritması bütün oyunlarda aynıdır.
+ * Değişen tek şey GAME_DEFINITIONS içindeki kalibrasyon aralığı, alt/üst sınır ve varyanstır.
+ */
+function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number") {
   const profile = normalizeTwoPlayerFinishProfile(finishProfile);
-  const safeMaxFinishMs = Math.max(
-    BOT_MIN_FINISH_MS,
-    Math.min(Number(maxFinishMs || BOT_MAX_FINISH_MS), BOT_MAX_FINISH_MS)
-  );
+  const config = gameDefinition(gameKey);
+  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 1) - 1_000);
 
-  // İlk 5 normal ikili oyun bot için kalibrasyon oyunlarıdır.
-  // 6. oyundan itibaren tek/2/3 elli bütün bot maçlarında aynı profil kullanılır:
-  // bot, oyuncunun ikili oyun bitirme ortalamasının -4 / +4 saniye aralığında bitirir.
+  // İlk 5 normal ikili oyun kalibrasyondur. Burada temel kalibrasyon aralığı kullanılır;
+  // createGameAwareBotPlan en sonda oyunun kendi min/max sınırını uygular. Bu iki aşamalı
+  // yapı Hedef Sayıyı Bul'un eski davranışını aynen korur.
   if (
     profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
     profile.averageFinishMs === null
   ) {
-    const calibrationMinMs = Math.min(BOT_CALIBRATION_MIN_FINISH_MS, safeMaxFinishMs);
-    const calibrationMaxMs = Math.min(BOT_CALIBRATION_MAX_FINISH_MS, safeMaxFinishMs);
+    const calibrationMinMs = Math.max(
+      BOT_MIN_FINISH_MS,
+      Math.min(Number(config.botCalibrationMinMs || BOT_MIN_FINISH_MS), absoluteMaxMs)
+    );
+    const calibrationMaxMs = Math.max(
+      calibrationMinMs,
+      Math.min(Number(config.botCalibrationMaxMs || absoluteMaxMs), absoluteMaxMs)
+    );
     return secureRandomInt(calibrationMinMs, calibrationMaxMs + 1);
   }
 
   const averageFinishMs = Math.max(
     BOT_MIN_FINISH_MS,
-    Math.min(profile.averageFinishMs, safeMaxFinishMs)
+    Math.min(profile.averageFinishMs, absoluteMaxMs)
   );
+  // Hedef Sayıyı Bul eski ±4 sn davranışını korur; diğer/yeni oyunların varsayılanı ±7 sn'dir.
+  const defaultVarianceMs = config.key === "target_number" ? 4_000 : 7_000;
+  const varianceMs = Math.max(0, Number(config.botAverageVarianceMs ?? defaultVarianceMs));
   const minimumFinishMs = Math.max(
     BOT_MIN_FINISH_MS,
-    averageFinishMs - BOT_AVERAGE_VARIANCE_MS
+    averageFinishMs - varianceMs
   );
   const maximumFinishMs = Math.min(
-    safeMaxFinishMs,
-    averageFinishMs + BOT_AVERAGE_VARIANCE_MS
+    absoluteMaxMs,
+    averageFinishMs + varianceMs
   );
 
   return secureRandomInt(minimumFinishMs, maximumFinishMs + 1);
 }
 
-function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
+function createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile = {}) {
   const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
   const roll = secureRandomInt(0, 10000);
   if (roll < 560) {
@@ -3528,21 +3545,21 @@ function createSecureTwoPlayerBotPlan(difficulty, finishProfile = {}) {
   }
 
   return {
-    finishMs: createTwoPlayerBotFinishMs(finishProfile),
+    finishMs: createTwoPlayerBotFinishMs(finishProfile, gameKey),
     leaveMs: null,
   };
 }
 
 function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
   const config = gameDefinition(gameKey);
-  const plan = createSecureTwoPlayerBotPlan(difficulty, finishProfile);
+  const plan = createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile);
   if (plan.finishMs === null || plan.finishMs === undefined) return plan;
+  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 1) - 1_000);
+  const gameMinMs = Math.max(BOT_MIN_FINISH_MS, Math.min(Number(config.botFinishMinMs || BOT_MIN_FINISH_MS), absoluteMaxMs));
+  const gameMaxMs = Math.max(gameMinMs, Math.min(Number(config.botFinishMaxMs || absoluteMaxMs), absoluteMaxMs));
   return {
     ...plan,
-    finishMs: Math.max(
-      config.botFinishMinMs,
-      Math.min(Number(plan.finishMs || config.botFinishMinMs), config.botFinishMaxMs)
-    ),
+    finishMs: Math.max(gameMinMs, Math.min(Number(plan.finishMs), gameMaxMs)),
   };
 }
 
