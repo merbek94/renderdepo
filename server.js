@@ -2214,7 +2214,7 @@ function challengeRewards(mode, stage) {
 }
 
 const TOURNAMENT_STAGE_REWARDS = [50, 150, 350, 1000, 2500, 7000, 18000, 50000];
-const TOURNAMENT_ENTRY_TICKET_COST = 5;
+const TOURNAMENT_ENTRY_TICKET_COST = 0;
 const TOURNAMENT_TICKET_MAX = 9999;
 const TOURNAMENT_REWARDED_TICKETS_PER_AD = 5;
 const TOURNAMENT_REWARDED_DAILY_MAX = 15;
@@ -4960,7 +4960,7 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
         throw error;
       }
 
-      if (access.baseRightsRemaining > 0) {
+     /* if (access.baseRightsRemaining > 0) { */
         await client.query(
           `UPDATE player_progress SET
              hundred_daily_base_used_count = LEAST(hundred_daily_base_used_count + 1, $2),
@@ -5296,7 +5296,7 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
       await client.query(
         `UPDATE player_game_progress
          SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
+         000
         [req.auth.sub, gameKey]
       );
     }
