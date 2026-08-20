@@ -4960,7 +4960,7 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
         throw error;
       }
 
-     /* if (access.baseRightsRemaining > 0) { 
+      if (access.baseRightsRemaining > 0) { 
         await client.query(
           `UPDATE player_progress SET
              hundred_daily_base_used_count = LEAST(hundred_daily_base_used_count + 1, $2),
@@ -4990,15 +4990,7 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
         error.statusCode = 409;
         error.publicCode = "HUNDRED_DAILY_RIGHT_EXHAUSTED";
         throw error;
-      } */
-	  await client.query(
-    `UPDATE player_game_progress
-     SET hundred_active = TRUE,
-         hundred_stage = 1,
-         updated_at = NOW()
-     WHERE player_id = $1 AND game_key = $2`,
-    [req.auth.sub, gameKey]
-  );
+      }
     }
 
     // access satırı transaction başında FOR UPDATE ile okundu. Fresh başlangıçta az önce
