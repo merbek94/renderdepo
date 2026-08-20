@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "total-equals-shared-system-v9-20260820";
+const SERVER_BUILD_ID = "total-equals-pair-columns-v11-20260820";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2184,383 +2184,98 @@ function generateEqualSumPuzzle() {
   };
 }
 
-const TOTAL_EQUALS_GRID_SIZE = 8;
-const TOTAL_EQUALS_CELL_COUNT = 64;
+const TOTAL_EQUALS_PAIR_COUNT = 20;
+const TOTAL_EQUALS_NUMBER_COUNT = TOTAL_EQUALS_PAIR_COUNT * 2;
+const TOTAL_EQUALS_TARGET_MIN = 21;
+const TOTAL_EQUALS_TARGET_MAX = 40;
 
-function totalEqualsNeighbors(index) {
-  if (!Number.isInteger(index) || index < 0 || index >= TOTAL_EQUALS_CELL_COUNT) return [];
-  const row = Math.floor(index / TOTAL_EQUALS_GRID_SIZE);
-  const col = index % TOTAL_EQUALS_GRID_SIZE;
-  const result = [];
-  if (row > 0) result.push(index - TOTAL_EQUALS_GRID_SIZE);
-  if (row < TOTAL_EQUALS_GRID_SIZE - 1) result.push(index + TOTAL_EQUALS_GRID_SIZE);
-  if (col > 0) result.push(index - 1);
-  if (col < TOTAL_EQUALS_GRID_SIZE - 1) result.push(index + 1);
-  return result;
+function totalEqualsSplitPuzzle(puzzle) {
+  const target = Number(puzzle?.target);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (!Number.isInteger(target) || target < TOTAL_EQUALS_TARGET_MIN || target > TOTAL_EQUALS_TARGET_MAX) return null;
+  if (numbers.length !== TOTAL_EQUALS_NUMBER_COUNT || numbers.some((value) => !Number.isInteger(value))) return null;
+  const left = numbers.slice(0, TOTAL_EQUALS_PAIR_COUNT);
+  const right = numbers.slice(TOTAL_EQUALS_PAIR_COUNT);
+  if (left.some((value) => value <= 0 || value >= target)) return null;
+  if (right.some((value) => value <= 0 || value >= target)) return null;
+  if (new Set(left).size !== TOTAL_EQUALS_PAIR_COUNT) return null;
+  if (new Set(right).size !== TOTAL_EQUALS_PAIR_COUNT) return null;
+
+  const expectedRight = left.map((value) => target - value).sort((a, b) => a - b);
+  const actualRight = [...right].sort((a, b) => a - b);
+  if (!expectedRight.every((value, index) => value === actualRight[index])) return null;
+
+  // İki taraf bağımsız karışık görünür; doğru çift başlangıçta aynı satıra denk gelmez.
+  if (left.some((value, index) => value + right[index] === target)) return null;
+  return { target, left, right };
 }
 
-function totalEqualsFirstAdjacentMatch(board, target) {
-  for (let index = 0; index < TOTAL_EQUALS_CELL_COUNT; index += 1) {
-    const value = board[index];
-    if (!Number.isInteger(value)) continue;
-    const neighbors = totalEqualsNeighbors(index).sort((a, b) => a - b);
-    for (const neighbor of neighbors) {
-      if (neighbor <= index) continue;
-      if (Number.isInteger(board[neighbor]) && value + board[neighbor] === target) {
-        return { firstIndex: index, secondIndex: neighbor };
-      }
-    }
-  }
-  return null;
-}
-
-function totalEqualsHasAdjacentMatch(board, target) {
-  return totalEqualsFirstAdjacentMatch(board, target) !== null;
-}
-
-function totalEqualsHasBalancedComplements(board, target) {
-  if (!Array.isArray(board) || board.length !== TOTAL_EQUALS_CELL_COUNT) return false;
-  const counts = new Map();
-  for (const value of board) {
-    if (!Number.isInteger(value) || value <= 0 || value >= target) return false;
-    counts.set(value, (counts.get(value) || 0) + 1);
-  }
-  for (const [value, count] of counts.entries()) {
-    if ((counts.get(target - value) || 0) !== count) return false;
-  }
-  return true;
-}
-
-function totalEqualsPreviewMove(boardRaw, from, to) {
-  const board = Array.isArray(boardRaw) ? [...boardRaw] : [];
-  if (board.length !== TOTAL_EQUALS_CELL_COUNT) return null;
-  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0 ||
-      from >= TOTAL_EQUALS_CELL_COUNT || to >= TOTAL_EQUALS_CELL_COUNT || from === to) return null;
-  const moving = board[from];
-  if (!Number.isInteger(moving)) return null;
-  const fromRow = Math.floor(from / TOTAL_EQUALS_GRID_SIZE);
-  const fromCol = from % TOTAL_EQUALS_GRID_SIZE;
-  const toRow = Math.floor(to / TOTAL_EQUALS_GRID_SIZE);
-  const toCol = to % TOTAL_EQUALS_GRID_SIZE;
-  if (fromRow !== toRow && fromCol !== toCol) return null;
-  const distance = Math.abs(fromRow - toRow) + Math.abs(fromCol - toCol);
-  if (distance <= 0) return null;
-  const step = fromCol === toCol
-    ? (toRow > fromRow ? TOTAL_EQUALS_GRID_SIZE : -TOTAL_EQUALS_GRID_SIZE)
-    : (toCol > fromCol ? 1 : -1);
-
-  if (distance > 1) {
-    let cursor = from + step;
-    while (true) {
-      if (board[cursor] !== null && board[cursor] !== undefined) return null;
-      if (cursor === to) break;
-      cursor += step;
-    }
+function derangeTotalEqualsRight(left, target) {
+  const complements = left.map((value) => target - value);
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const candidate = shuffled(complements);
+    if (candidate.every((value, index) => left[index] + value !== target)) return candidate;
   }
 
-  if (board[to] !== null && board[to] !== undefined) {
-    if (distance !== 1) return null;
-    board[from] = board[to];
-    board[to] = moving;
-  } else {
-    board[from] = null;
-    board[to] = moving;
-  }
-  return board;
-}
-
-function totalEqualsGravity(boardRaw) {
-  const board = Array.isArray(boardRaw) ? boardRaw : [];
-  const result = Array(TOTAL_EQUALS_CELL_COUNT).fill(null);
-  for (let col = 0; col < TOTAL_EQUALS_GRID_SIZE; col += 1) {
-    const surviving = [];
-    for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
-      const value = board[row * TOTAL_EQUALS_GRID_SIZE + col];
-      if (value !== null && value !== undefined) surviving.push(value);
-    }
-    const firstRow = TOTAL_EQUALS_GRID_SIZE - surviving.length;
-    surviving.forEach((value, offset) => {
-      result[(firstRow + offset) * TOTAL_EQUALS_GRID_SIZE + col] = value;
-    });
-  }
-  return result;
-}
-
-function totalEqualsCompactRowsLeft(boardRaw) {
-  const board = Array.isArray(boardRaw) ? boardRaw : [];
-  const result = Array(TOTAL_EQUALS_CELL_COUNT).fill(null);
-  for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
-    const surviving = [];
-    for (let col = 0; col < TOTAL_EQUALS_GRID_SIZE; col += 1) {
-      const value = board[row * TOTAL_EQUALS_GRID_SIZE + col];
-      if (value !== null && value !== undefined) surviving.push(value);
-    }
-    surviving.forEach((value, col) => {
-      result[row * TOTAL_EQUALS_GRID_SIZE + col] = value;
-    });
-  }
-  return result;
-}
-
-function totalEqualsColumnHeights(board) {
-  return Array.from({ length: TOTAL_EQUALS_GRID_SIZE }, (_, col) => {
-    let height = 0;
-    for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
-      if (board[row * TOTAL_EQUALS_GRID_SIZE + col] !== null &&
-          board[row * TOTAL_EQUALS_GRID_SIZE + col] !== undefined) height += 1;
-    }
-    return height;
-  });
-}
-
-function totalEqualsBoardsEqual(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-/**
- * Bir yok oluştan sonra: aşağı düşür -> satırları sola kapat -> tekrar düşür ->
- * yükseklik farkı >=2 olan sütunlardan (fark-1) üst taşı en kısa/en yakın sütunlara
- * tek tek aktar. Aktarım satır boşluğu üretirse aynı yapısal döngüde tekrar sola kapatılır.
- */
-function totalEqualsSettleStructure(boardRaw) {
-  let current = Array.isArray(boardRaw) ? [...boardRaw] : [];
-  if (current.length !== TOTAL_EQUALS_CELL_COUNT) return null;
-
-  current = totalEqualsGravity(current);
-  current = totalEqualsCompactRowsLeft(current);
-  current = totalEqualsGravity(current);
-
-  for (let guard = 0; guard < TOTAL_EQUALS_CELL_COUNT; guard += 1) {
-    const heights = totalEqualsColumnHeights(current);
-    const maxHeight = Math.max(...heights);
-    const minHeight = Math.min(...heights);
-    if (maxHeight - minHeight < 2) return current;
-
-    const sourceColumns = heights.map((height, col) => ({ height, col }))
-      .filter((item) => item.height === maxHeight)
-      .map((item) => item.col);
-    const minimumColumns = heights.map((height, col) => ({ height, col }))
-      .filter((item) => item.height === minHeight)
-      .map((item) => item.col);
-
-    sourceColumns.sort((a, b) => {
-      const aDistance = Math.min(...minimumColumns.map((col) => Math.abs(col - a)));
-      const bDistance = Math.min(...minimumColumns.map((col) => Math.abs(col - b)));
-      return aDistance - bDistance || a - b;
-    });
-    const source = sourceColumns[0];
-    if (!Number.isInteger(source)) return current;
-
-    // Örnek: 3 hücre fark varsa aynı yüksek sütundan 2 üst taş aktarılır.
-    const transferCount = Math.max(1, maxHeight - minHeight - 1);
-    for (let transfer = 0; transfer < transferCount; transfer += 1) {
-      const liveHeights = totalEqualsColumnHeights(current);
-      let sourceTopRow = -1;
-      for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
-        if (current[row * TOTAL_EQUALS_GRID_SIZE + source] !== null &&
-            current[row * TOTAL_EQUALS_GRID_SIZE + source] !== undefined) {
-          sourceTopRow = row;
-          break;
-        }
-      }
-      if (sourceTopRow < 0) break;
-
-      const destinationMinHeight = Math.min(...liveHeights.filter((_, col) => col !== source));
-      const destinationCandidates = liveHeights.map((height, col) => ({ height, col }))
-        .filter((item) => item.col !== source && item.height === destinationMinHeight)
-        .map((item) => item.col)
-        .sort((a, b) => Math.abs(a - source) - Math.abs(b - source) || a - b);
-      const destination = destinationCandidates[0];
-      if (!Number.isInteger(destination)) break;
-      const destinationRow = TOTAL_EQUALS_GRID_SIZE - liveHeights[destination] - 1;
-      if (destinationRow < 0 || destinationRow >= TOTAL_EQUALS_GRID_SIZE) break;
-
-      const sourceIndex = sourceTopRow * TOTAL_EQUALS_GRID_SIZE + source;
-      const destinationIndex = destinationRow * TOTAL_EQUALS_GRID_SIZE + destination;
-      current[destinationIndex] = current[sourceIndex];
-      current[sourceIndex] = null;
-    }
-
-    current = totalEqualsGravity(current);
-    current = totalEqualsCompactRowsLeft(current);
-    current = totalEqualsGravity(current);
-  }
-  return current;
-}
-
-function totalEqualsApplyAutomaticCascade(boardRaw, target) {
-  let board = totalEqualsSettleStructure(boardRaw);
-  if (!board) return null;
-
-  for (let guard = 0; guard < TOTAL_EQUALS_CELL_COUNT / 2; guard += 1) {
-    const match = totalEqualsFirstAdjacentMatch(board, target);
-    if (!match) return board;
-    board = [...board];
-    board[match.firstIndex] = null;
-    board[match.secondIndex] = null;
-    board = totalEqualsSettleStructure(board);
-    if (!board) return null;
-  }
-  return board;
-}
-
-function totalEqualsApplyMove(boardRaw, target, from, to) {
-  const preview = totalEqualsPreviewMove(boardRaw, from, to);
-  if (!preview) return null;
-  const movingValue = preview[to];
-  if (!Number.isInteger(movingValue)) return null;
-  const partnerIndex = totalEqualsNeighbors(to)
-    .sort((a, b) => a - b)
-    .find((neighbor) => Number.isInteger(preview[neighbor]) && movingValue + preview[neighbor] === target);
-  if (partnerIndex === undefined) return null;
-
-  preview[to] = null;
-  preview[partnerIndex] = null;
-  return totalEqualsApplyAutomaticCascade(preview, target);
-}
-
-function totalEqualsValidMoves(board, target) {
-  const moves = [];
-  for (let from = 0; from < TOTAL_EQUALS_CELL_COUNT; from += 1) {
-    if (!Number.isInteger(board[from])) continue;
-    const fromRow = Math.floor(from / TOTAL_EQUALS_GRID_SIZE);
-    const fromCol = from % TOTAL_EQUALS_GRID_SIZE;
-    for (const step of [-TOTAL_EQUALS_GRID_SIZE, TOTAL_EQUALS_GRID_SIZE, -1, 1]) {
-      let to = from + step;
-      while (
-        to >= 0 && to < TOTAL_EQUALS_CELL_COUNT &&
-        (Math.abs(step) === TOTAL_EQUALS_GRID_SIZE ? to % TOTAL_EQUALS_GRID_SIZE === fromCol : Math.floor(to / TOTAL_EQUALS_GRID_SIZE) === fromRow)
-      ) {
-        const next = totalEqualsApplyMove(board, target, from, to);
-        if (next) moves.push({ from, to, board: next });
-        if (board[to] !== null && board[to] !== undefined) break;
-        to += step;
-      }
-    }
-  }
-  return moves;
-}
-
-function totalEqualsCanSolveBoard(initialBoard, target) {
-  // Zincirleme yok oluş bir manuel hamlede birden fazla çift temizleyebilir. Rastgele çözüm
-  // denemeleri yalnız sunucunun ürettiği başlangıç tahtasının gerçekten oynanabilirliğini doğrular.
-  for (let trial = 0; trial < 48; trial += 1) {
-    let board = [...initialBoard];
-    for (let stepIndex = 0; stepIndex < 32; stepIndex += 1) {
-      if (board.every((value) => value === null)) return true;
-      const moves = totalEqualsValidMoves(board, target);
-      if (moves.length === 0) break;
-      const selected = moves[secureRandomInt(0, moves.length)];
-      board = selected.board;
-    }
-    if (board.every((value) => value === null)) return true;
-  }
-  return false;
-}
-
-function generateTotalEqualsBoard(target) {
-  const canonicalTypes = shuffled(Array.from({ length: Math.floor(target / 2) }, (_, index) => index + 1));
-  const split = Math.max(1, Math.floor(canonicalTypes.length / 2));
-  const groupA = canonicalTypes.slice(0, split);
-  const groupB = canonicalTypes.slice(split);
-  if (groupB.length === 0) groupB.push(groupA.pop());
-
-  const phase = secureRandomInt(0, 4);
-  const slots = [[], [], [], []];
-  for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
-    for (let col = 0; col < TOTAL_EQUALS_GRID_SIZE; col += 1) {
-      const colorClass = (row + col + phase) % 4;
-      slots[colorClass].push(row * TOTAL_EQUALS_GRID_SIZE + col);
-    }
-  }
-  for (let colorClass = 0; colorClass < 4; colorClass += 1) slots[colorClass] = shuffled(slots[colorClass]);
-
-  const board = Array(TOTAL_EQUALS_CELL_COUNT).fill(null);
-  for (let index = 0; index < 16; index += 1) {
-    const aType = groupA[secureRandomInt(0, groupA.length)];
-    let a = aType;
-    let aComplement = target - aType;
-    if (secureRandomInt(0, 2) === 1) [a, aComplement] = [aComplement, a];
-    board[slots[0][index]] = a;
-    board[slots[2][index]] = aComplement;
-
-    const bType = groupB[secureRandomInt(0, groupB.length)];
-    let b = bType;
-    let bComplement = target - bType;
-    if (secureRandomInt(0, 2) === 1) [b, bComplement] = [bComplement, b];
-    board[slots[1][index]] = b;
-    board[slots[3][index]] = bComplement;
-  }
-  return board;
+  // Benzersiz complementler için bir hücrelik döndürme her satırdaki doğru eşleşmeyi kesin bozar.
+  return complements.slice(1).concat(complements[0]);
 }
 
 function generateTotalEqualsPuzzle() {
-  for (let attempt = 0; attempt < 48; attempt += 1) {
-    const target = secureRandomInt(9, 17);
-    const board = generateTotalEqualsBoard(target);
-    if (board.length !== TOTAL_EQUALS_CELL_COUNT || board.some((value) => !Number.isInteger(value))) continue;
-    if (totalEqualsHasAdjacentMatch(board, target)) continue;
-    if (!totalEqualsCanSolveBoard(board, target)) continue;
-    return {
-      gameKey: "total_equals",
-      difficulty: "Standard",
-      target,
-      numbers: board,
-      initialGrid: [],
-    };
-  }
-
-  // Yapısal olarak komşu eşleşmesiz yedek. Ana üretici çözülebilirlik kontrolünü geçtiğinde kullanılır;
-  // bu blok yalnız olağanüstü RNG/CPU durumlarında server'ın cevap üretmeye devam etmesi içindir.
-  const target = 13;
-  const values = [2, 4, 11, 9];
-  const board = Array.from({ length: TOTAL_EQUALS_CELL_COUNT }, (_, index) => {
-    const row = Math.floor(index / TOTAL_EQUALS_GRID_SIZE);
-    const col = index % TOTAL_EQUALS_GRID_SIZE;
-    return values[(row + col) % 4];
-  });
-  return { gameKey: "total_equals", difficulty: "Standard", target, numbers: board, initialGrid: [] };
+  const target = secureRandomInt(TOTAL_EQUALS_TARGET_MIN, TOTAL_EQUALS_TARGET_MAX + 1);
+  const candidates = shuffled(Array.from({ length: target - 1 }, (_, index) => index + 1));
+  const left = shuffled(candidates.slice(0, TOTAL_EQUALS_PAIR_COUNT));
+  const right = derangeTotalEqualsRight(left, target);
+  return {
+    gameKey: "total_equals",
+    difficulty: "Standard",
+    target,
+    numbers: [...left, ...right],
+    initialGrid: [],
+  };
 }
 
-function normalizeTotalEqualsMoves(answer = {}) {
-  if (Array.isArray(answer.moves)) {
-    return answer.moves.map((move) => ({
-      from: Number(move?.from),
-      to: Number(move?.to),
+function normalizeTotalEqualsMatches(answer = {}) {
+  if (Array.isArray(answer.matches)) {
+    return answer.matches.map((match) => ({
+      leftIndex: Number(match?.leftIndex),
+      rightIndex: Number(match?.rightIndex),
     }));
   }
-  if (Array.isArray(answer.operators)) {
-    return answer.operators.map((raw) => {
-      const match = String(raw || "").match(/^(\d{1,2}):(\d{1,2})$/);
-      return match ? { from: Number(match[1]), to: Number(match[2]) } : { from: NaN, to: NaN };
-    });
+
+  // Yeni istemcide kullanılmaz; generic state'in numberSlots biçimini eski istemci/server
+  // geçişlerinde okuyabilmek için yalnız uyumluluk yolu olarak tutulur.
+  if (Array.isArray(answer.numberSlots) && answer.numberSlots.length === TOTAL_EQUALS_PAIR_COUNT) {
+    return answer.numberSlots.map((rightIndex, leftIndex) => ({
+      leftIndex,
+      rightIndex: Number(rightIndex),
+    }));
   }
   return [];
 }
 
 function validateTotalEqualsChallengeAnswer(puzzle, answer = {}) {
-  const target = Number(puzzle?.target);
-  const initialBoard = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  if (!Number.isInteger(target) || target < 9 || target > 16) return false;
-  if (initialBoard.length !== TOTAL_EQUALS_CELL_COUNT || initialBoard.some((value) => !Number.isInteger(value))) return false;
-  if (!totalEqualsHasBalancedComplements(initialBoard, target)) return false;
-  if (totalEqualsHasAdjacentMatch(initialBoard, target)) return false;
-  const moves = normalizeTotalEqualsMoves(answer);
-  // Zincirleme otomatik yok oluşlar hamle geçmişine yazılmaz; yalnız gerçek kullanıcı sürüklemeleri gelir.
-  if (moves.length < 1 || moves.length > 32) return false;
+  const parsed = totalEqualsSplitPuzzle(puzzle);
+  if (!parsed) return false;
+  const matches = normalizeTotalEqualsMatches(answer);
+  if (matches.length !== TOTAL_EQUALS_PAIR_COUNT) return false;
 
-  let board = [...initialBoard];
-  for (const move of moves) {
-    if (!Number.isInteger(move.from) || !Number.isInteger(move.to)) return false;
-    const next = totalEqualsApplyMove(board, target, move.from, move.to);
-    if (!next) return false;
-    board = next;
+  const usedLeft = new Set();
+  const usedRight = new Set();
+  for (const match of matches) {
+    const leftIndex = Number(match.leftIndex);
+    const rightIndex = Number(match.rightIndex);
+    if (!Number.isInteger(leftIndex) || !Number.isInteger(rightIndex)) return false;
+    if (leftIndex < 0 || leftIndex >= TOTAL_EQUALS_PAIR_COUNT) return false;
+    if (rightIndex < 0 || rightIndex >= TOTAL_EQUALS_PAIR_COUNT) return false;
+    if (usedLeft.has(leftIndex) || usedRight.has(rightIndex)) return false;
+    if (parsed.left[leftIndex] + parsed.right[rightIndex] !== parsed.target) return false;
+    usedLeft.add(leftIndex);
+    usedRight.add(rightIndex);
   }
-  return board.every((value) => value === null);
-}
 
+  return usedLeft.size === TOTAL_EQUALS_PAIR_COUNT && usedRight.size === TOTAL_EQUALS_PAIR_COUNT;
+}
 function generatePuzzleForGame(gameKey, difficultyValue) {
   return gameHandler(gameKey).createPuzzle(difficultyValue);
 }
