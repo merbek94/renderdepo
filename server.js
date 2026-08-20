@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "total-equals-15-pairs-v12-20260820";
+const SERVER_BUILD_ID = "total-equals-pair-columns-v11-20260820";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2184,7 +2184,7 @@ function generateEqualSumPuzzle() {
   };
 }
 
-const TOTAL_EQUALS_PAIR_COUNT = 15;
+const TOTAL_EQUALS_PAIR_COUNT = 20;
 const TOTAL_EQUALS_NUMBER_COUNT = TOTAL_EQUALS_PAIR_COUNT * 2;
 const TOTAL_EQUALS_TARGET_MIN = 21;
 const TOTAL_EQUALS_TARGET_MAX = 40;
