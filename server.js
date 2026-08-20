@@ -2029,8 +2029,10 @@ const GAME_DEFINITIONS = Object.freeze({
     hundredStageDurationMs: 90 * 1000,
     botFinishMinMs: 1 * 1000,
     botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
+    // Toplam Eşittir ilk 5 bot kalibrasyonu 4-5 dakika. Gerçek bitiş süresi
+    // createTwoPlayerBotFinishMs içinde tur sonundan 1 sn önce güvenli biçimde sınırlandırılır.
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
     botAverageVarianceMs: 7 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
@@ -2197,15 +2199,23 @@ function totalEqualsNeighbors(index) {
   return result;
 }
 
-function totalEqualsHasAdjacentMatch(board, target) {
+function totalEqualsFirstAdjacentMatch(board, target) {
   for (let index = 0; index < TOTAL_EQUALS_CELL_COUNT; index += 1) {
     const value = board[index];
     if (!Number.isInteger(value)) continue;
-    for (const neighbor of totalEqualsNeighbors(index)) {
-      if (neighbor > index && Number.isInteger(board[neighbor]) && value + board[neighbor] === target) return true;
+    const neighbors = totalEqualsNeighbors(index).sort((a, b) => a - b);
+    for (const neighbor of neighbors) {
+      if (neighbor <= index) continue;
+      if (Number.isInteger(board[neighbor]) && value + board[neighbor] === target) {
+        return { firstIndex: index, secondIndex: neighbor };
+      }
     }
   }
-  return false;
+  return null;
+}
+
+function totalEqualsHasAdjacentMatch(board, target) {
+  return totalEqualsFirstAdjacentMatch(board, target) !== null;
 }
 
 function totalEqualsHasBalancedComplements(board, target) {
@@ -2259,6 +2269,143 @@ function totalEqualsPreviewMove(boardRaw, from, to) {
   return board;
 }
 
+function totalEqualsGravity(boardRaw) {
+  const board = Array.isArray(boardRaw) ? boardRaw : [];
+  const result = Array(TOTAL_EQUALS_CELL_COUNT).fill(null);
+  for (let col = 0; col < TOTAL_EQUALS_GRID_SIZE; col += 1) {
+    const surviving = [];
+    for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
+      const value = board[row * TOTAL_EQUALS_GRID_SIZE + col];
+      if (value !== null && value !== undefined) surviving.push(value);
+    }
+    const firstRow = TOTAL_EQUALS_GRID_SIZE - surviving.length;
+    surviving.forEach((value, offset) => {
+      result[(firstRow + offset) * TOTAL_EQUALS_GRID_SIZE + col] = value;
+    });
+  }
+  return result;
+}
+
+function totalEqualsCompactRowsLeft(boardRaw) {
+  const board = Array.isArray(boardRaw) ? boardRaw : [];
+  const result = Array(TOTAL_EQUALS_CELL_COUNT).fill(null);
+  for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
+    const surviving = [];
+    for (let col = 0; col < TOTAL_EQUALS_GRID_SIZE; col += 1) {
+      const value = board[row * TOTAL_EQUALS_GRID_SIZE + col];
+      if (value !== null && value !== undefined) surviving.push(value);
+    }
+    surviving.forEach((value, col) => {
+      result[row * TOTAL_EQUALS_GRID_SIZE + col] = value;
+    });
+  }
+  return result;
+}
+
+function totalEqualsColumnHeights(board) {
+  return Array.from({ length: TOTAL_EQUALS_GRID_SIZE }, (_, col) => {
+    let height = 0;
+    for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
+      if (board[row * TOTAL_EQUALS_GRID_SIZE + col] !== null &&
+          board[row * TOTAL_EQUALS_GRID_SIZE + col] !== undefined) height += 1;
+    }
+    return height;
+  });
+}
+
+function totalEqualsBoardsEqual(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Bir yok oluştan sonra: aşağı düşür -> satırları sola kapat -> tekrar düşür ->
+ * yükseklik farkı >=2 olan sütunlardan (fark-1) üst taşı en kısa/en yakın sütunlara
+ * tek tek aktar. Aktarım satır boşluğu üretirse aynı yapısal döngüde tekrar sola kapatılır.
+ */
+function totalEqualsSettleStructure(boardRaw) {
+  let current = Array.isArray(boardRaw) ? [...boardRaw] : [];
+  if (current.length !== TOTAL_EQUALS_CELL_COUNT) return null;
+
+  current = totalEqualsGravity(current);
+  current = totalEqualsCompactRowsLeft(current);
+  current = totalEqualsGravity(current);
+
+  for (let guard = 0; guard < TOTAL_EQUALS_CELL_COUNT; guard += 1) {
+    const heights = totalEqualsColumnHeights(current);
+    const maxHeight = Math.max(...heights);
+    const minHeight = Math.min(...heights);
+    if (maxHeight - minHeight < 2) return current;
+
+    const sourceColumns = heights.map((height, col) => ({ height, col }))
+      .filter((item) => item.height === maxHeight)
+      .map((item) => item.col);
+    const minimumColumns = heights.map((height, col) => ({ height, col }))
+      .filter((item) => item.height === minHeight)
+      .map((item) => item.col);
+
+    sourceColumns.sort((a, b) => {
+      const aDistance = Math.min(...minimumColumns.map((col) => Math.abs(col - a)));
+      const bDistance = Math.min(...minimumColumns.map((col) => Math.abs(col - b)));
+      return aDistance - bDistance || a - b;
+    });
+    const source = sourceColumns[0];
+    if (!Number.isInteger(source)) return current;
+
+    // Örnek: 3 hücre fark varsa aynı yüksek sütundan 2 üst taş aktarılır.
+    const transferCount = Math.max(1, maxHeight - minHeight - 1);
+    for (let transfer = 0; transfer < transferCount; transfer += 1) {
+      const liveHeights = totalEqualsColumnHeights(current);
+      let sourceTopRow = -1;
+      for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
+        if (current[row * TOTAL_EQUALS_GRID_SIZE + source] !== null &&
+            current[row * TOTAL_EQUALS_GRID_SIZE + source] !== undefined) {
+          sourceTopRow = row;
+          break;
+        }
+      }
+      if (sourceTopRow < 0) break;
+
+      const destinationMinHeight = Math.min(...liveHeights.filter((_, col) => col !== source));
+      const destinationCandidates = liveHeights.map((height, col) => ({ height, col }))
+        .filter((item) => item.col !== source && item.height === destinationMinHeight)
+        .map((item) => item.col)
+        .sort((a, b) => Math.abs(a - source) - Math.abs(b - source) || a - b);
+      const destination = destinationCandidates[0];
+      if (!Number.isInteger(destination)) break;
+      const destinationRow = TOTAL_EQUALS_GRID_SIZE - liveHeights[destination] - 1;
+      if (destinationRow < 0 || destinationRow >= TOTAL_EQUALS_GRID_SIZE) break;
+
+      const sourceIndex = sourceTopRow * TOTAL_EQUALS_GRID_SIZE + source;
+      const destinationIndex = destinationRow * TOTAL_EQUALS_GRID_SIZE + destination;
+      current[destinationIndex] = current[sourceIndex];
+      current[sourceIndex] = null;
+    }
+
+    current = totalEqualsGravity(current);
+    current = totalEqualsCompactRowsLeft(current);
+    current = totalEqualsGravity(current);
+  }
+  return current;
+}
+
+function totalEqualsApplyAutomaticCascade(boardRaw, target) {
+  let board = totalEqualsSettleStructure(boardRaw);
+  if (!board) return null;
+
+  for (let guard = 0; guard < TOTAL_EQUALS_CELL_COUNT / 2; guard += 1) {
+    const match = totalEqualsFirstAdjacentMatch(board, target);
+    if (!match) return board;
+    board = [...board];
+    board[match.firstIndex] = null;
+    board[match.secondIndex] = null;
+    board = totalEqualsSettleStructure(board);
+    if (!board) return null;
+  }
+  return board;
+}
+
 function totalEqualsApplyMove(boardRaw, target, from, to) {
   const preview = totalEqualsPreviewMove(boardRaw, from, to);
   if (!preview) return null;
@@ -2271,19 +2418,7 @@ function totalEqualsApplyMove(boardRaw, target, from, to) {
 
   preview[to] = null;
   preview[partnerIndex] = null;
-  const finalBoard = Array(TOTAL_EQUALS_CELL_COUNT).fill(null);
-  for (let col = 0; col < TOTAL_EQUALS_GRID_SIZE; col += 1) {
-    const surviving = [];
-    for (let row = 0; row < TOTAL_EQUALS_GRID_SIZE; row += 1) {
-      const value = preview[row * TOTAL_EQUALS_GRID_SIZE + col];
-      if (value !== null && value !== undefined) surviving.push(value);
-    }
-    const firstRow = TOTAL_EQUALS_GRID_SIZE - surviving.length;
-    surviving.forEach((value, offset) => {
-      finalBoard[(firstRow + offset) * TOTAL_EQUALS_GRID_SIZE + col] = value;
-    });
-  }
-  return finalBoard;
+  return totalEqualsApplyAutomaticCascade(preview, target);
 }
 
 function totalEqualsValidMoves(board, target) {
@@ -2309,9 +2444,9 @@ function totalEqualsValidMoves(board, target) {
 }
 
 function totalEqualsCanSolveBoard(initialBoard, target) {
-  // Üretim sırasında kısa rastgele çözüm denemeleri. Her geçerli hamle tam iki taşı sildiği için
-  // en fazla 32 adım vardır; başarısız üretim doğrudan yeniden oluşturulur.
-  for (let trial = 0; trial < 24; trial += 1) {
+  // Zincirleme yok oluş bir manuel hamlede birden fazla çift temizleyebilir. Rastgele çözüm
+  // denemeleri yalnız sunucunun ürettiği başlangıç tahtasının gerçekten oynanabilirliğini doğrular.
+  for (let trial = 0; trial < 48; trial += 1) {
     let board = [...initialBoard];
     for (let stepIndex = 0; stepIndex < 32; stepIndex += 1) {
       if (board.every((value) => value === null)) return true;
@@ -2362,7 +2497,7 @@ function generateTotalEqualsBoard(target) {
 }
 
 function generateTotalEqualsPuzzle() {
-  for (let attempt = 0; attempt < 32; attempt += 1) {
+  for (let attempt = 0; attempt < 48; attempt += 1) {
     const target = secureRandomInt(9, 17);
     const board = generateTotalEqualsBoard(target);
     if (board.length !== TOTAL_EQUALS_CELL_COUNT || board.some((value) => !Number.isInteger(value))) continue;
@@ -2377,8 +2512,8 @@ function generateTotalEqualsPuzzle() {
     };
   }
 
-  // Yapısal olarak garantili yedek: tamamlayıcı sınıflar 0↔2 ve 1↔3'tür,
-  // komşu hücreler hiçbir zaman bu karşıt sınıflarda değildir.
+  // Yapısal olarak komşu eşleşmesiz yedek. Ana üretici çözülebilirlik kontrolünü geçtiğinde kullanılır;
+  // bu blok yalnız olağanüstü RNG/CPU durumlarında server'ın cevap üretmeye devam etmesi içindir.
   const target = 13;
   const values = [2, 4, 11, 9];
   const board = Array.from({ length: TOTAL_EQUALS_CELL_COUNT }, (_, index) => {
@@ -2396,7 +2531,6 @@ function normalizeTotalEqualsMoves(answer = {}) {
       to: Number(move?.to),
     }));
   }
-  // Ortak istemcinin eski multiplayer callback'i de kullanılabilsin: hamleler operators alanında "from:to".
   if (Array.isArray(answer.operators)) {
     return answer.operators.map((raw) => {
       const match = String(raw || "").match(/^(\d{1,2}):(\d{1,2})$/);
@@ -2414,7 +2548,8 @@ function validateTotalEqualsChallengeAnswer(puzzle, answer = {}) {
   if (!totalEqualsHasBalancedComplements(initialBoard, target)) return false;
   if (totalEqualsHasAdjacentMatch(initialBoard, target)) return false;
   const moves = normalizeTotalEqualsMoves(answer);
-  if (moves.length !== 32) return false;
+  // Zincirleme otomatik yok oluşlar hamle geçmişine yazılmaz; yalnız gerçek kullanıcı sürüklemeleri gelir.
+  if (moves.length < 1 || moves.length > 32) return false;
 
   let board = [...initialBoard];
   for (const move of moves) {
