@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "next-number-v13-20260821";
+const SERVER_BUILD_ID = "next-number-v14-progressive-rules-ui-20260821";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2042,7 +2042,7 @@ const GAME_DEFINITIONS = Object.freeze({
     // Normal / sonsuz / ikili / turnuva tur süresi 2 dakika.
     roundDurationMs: 2 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Bot motoru ortaktır; profil Hedef Sayıyı Bul ile aynı başlangıç kalibrasyonunu kullanır.
+    // Bot profili Hedef Sayıyı Bul ile birebir aynıdır: ilk 5 tur 90-119 sn, sonrasında oyuncu ortalamasının ±4 sn çevresi.
     botFinishMinMs: 24 * 1000,
     botFinishMaxMs: 105 * 1000,
     botCalibrationMinMs: 90 * 1000,
@@ -2293,6 +2293,11 @@ function validateTotalEqualsChallengeAnswer(puzzle, answer = {}) {
 
 const NEXT_NUMBER_MIN_VALUE = 0;
 const NEXT_NUMBER_MAX_VALUE = 99;
+const NEXT_NUMBER_MIN_OFFSET = 1;
+const NEXT_NUMBER_MAX_OFFSET = 10;
+// 0: klasik sabit y. ±1/±2/±3: her geçişte y'nin düzenli artıp/azaldığı yeni örüntüler.
+// 0 iki kez tutulduğu için klasik kural da yeterince sık görünmeye devam eder.
+const NEXT_NUMBER_OFFSET_STEPS = Object.freeze([0, 0, 1, -1, 2, -2, 3, -3]);
 
 function nextNumberStep(value, multiplier, offset, ruleType) {
   switch (ruleType) {
@@ -2304,18 +2309,32 @@ function nextNumberStep(value, multiplier, offset, ruleType) {
   }
 }
 
+function generateNextNumberOffsetSeries() {
+  // Üç geçişin y değerlerinin tamamı 1..10 aralığında kalmak zorunda.
+  // Böylece örn. 4,5,6 / 4,3,2 / 3,6,9 / 6,4,2 gibi diziler doğal olarak oluşur.
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const firstOffset = secureRandomInt(NEXT_NUMBER_MIN_OFFSET, NEXT_NUMBER_MAX_OFFSET + 1);
+    const step = NEXT_NUMBER_OFFSET_STEPS[secureRandomInt(0, NEXT_NUMBER_OFFSET_STEPS.length)];
+    const offsets = [firstOffset, firstOffset + step, firstOffset + (2 * step)];
+    if (offsets.every((value) => Number.isInteger(value) && value >= NEXT_NUMBER_MIN_OFFSET && value <= NEXT_NUMBER_MAX_OFFSET)) {
+      return offsets;
+    }
+  }
+  return [2, 2, 2];
+}
+
 function generateNextNumberPuzzle() {
   const ruleTypes = ["multiply_plus", "multiply_minus", "plus_then_multiply", "minus_then_multiply"];
 
-  for (let attempt = 0; attempt < 5000; attempt += 1) {
+  for (let attempt = 0; attempt < 7000; attempt += 1) {
     const multiplier = secureRandomInt(2, 13); // x = 2..12; x her zaman en az 2.
-    const offset = secureRandomInt(1, 21);    // y = 1..20; 100 altı koşulu aşağıda ayrıca zorunlu.
+    const offsets = generateNextNumberOffsetSeries(); // Her y en fazla 10.
     const ruleType = ruleTypes[secureRandomInt(0, ruleTypes.length)];
     const first = secureRandomInt(0, 21);
     const sequence = [first];
 
     for (let index = 0; index < 3; index += 1) {
-      const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offset, ruleType);
+      const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offsets[index], ruleType);
       if (!Number.isInteger(next) || next < NEXT_NUMBER_MIN_VALUE || next > NEXT_NUMBER_MAX_VALUE) break;
       sequence.push(next);
     }
@@ -2332,12 +2351,13 @@ function generateNextNumberPuzzle() {
     };
   }
 
-  // Aşırı beklenmedik RNG koşulunda bile geçerli, kullanıcının verdiği örnekle uyumlu güvenli fallback.
+  // RNG'nin olağan dışı biçimde geçerli dizi üretememesi durumunda da tüm yeni kurallara uyan fallback.
+  // 3 -> 8 -> 19 -> 42 : 2x+2, 2x+3, 2x+4.
   return {
     gameKey: "next_number",
     difficulty: "Standard",
-    target: 28,
-    numbers: [2, 4, 10],
+    target: 42,
+    numbers: [3, 8, 19],
     initialGrid: [],
   };
 }
