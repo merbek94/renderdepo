@@ -2293,11 +2293,13 @@ function validateTotalEqualsChallengeAnswer(puzzle, answer = {}) {
 
 const NEXT_NUMBER_MIN_VALUE = 0;
 const NEXT_NUMBER_MAX_VALUE = 99;
-const NEXT_NUMBER_MIN_OFFSET = 1;
-const NEXT_NUMBER_MAX_OFFSET = 10;
+const NEXT_NUMBER_MIN_FIXED_OFFSET = 1;
+const NEXT_NUMBER_MAX_FIXED_OFFSET = 5;
 
-// Sabit olmayan y yalnızca bu altı desen olabilir.
-// Böylece 1-4-7, 2-5-8, 7-5-3 gibi başka aritmetik diziler kesinlikle üretilemez.
+// Sabit olmayan y yalnızca bu altı desen olabilir ve yalnızca "sayı × x ± y"
+// kurallarında kullanılır. Böylece 1-4-7, 2-5-8, 7-5-3 gibi başka
+// aritmetik diziler üretilemez. "(sayı ± y) × x" kurallarında ise y her
+// üç geçişte de sabittir. Sabit y değeri bütün kural türlerinde 1..5'tir.
 const NEXT_NUMBER_VARIABLE_OFFSET_SERIES = Object.freeze([
   Object.freeze([1, 2, 3]),
   Object.freeze([3, 2, 1]),
@@ -2317,15 +2319,22 @@ function nextNumberStep(value, multiplier, offset, ruleType) {
   }
 }
 
-function generateNextNumberOffsetSeries() {
-  // Sabit kural korunur: y, 1..10 arasından seçilir ve üç geçişte aynı kalır.
-  // Sabit olmayan kural ise yalnızca kullanıcının izin verdiği altı kapalı desenden seçilir.
-  const useFixedOffset = secureRandomInt(0, 2) === 0;
+function generateNextNumberOffsetSeries(ruleType) {
+  // Önce y eklenip/çıkarılıp sonra çarpılan kurallarda değişken y YOKTUR.
+  // Örn. (sayı + 3) × 2 ise sonraki iki geçiş de yine +3 kullanır.
+  const mustUseFixedOffset =
+    ruleType === "plus_then_multiply" || ruleType === "minus_then_multiply";
+
+  const useFixedOffset = mustUseFixedOffset || secureRandomInt(0, 2) === 0;
   if (useFixedOffset) {
-    const offset = secureRandomInt(NEXT_NUMBER_MIN_OFFSET, NEXT_NUMBER_MAX_OFFSET + 1);
+    const offset = secureRandomInt(
+      NEXT_NUMBER_MIN_FIXED_OFFSET,
+      NEXT_NUMBER_MAX_FIXED_OFFSET + 1
+    );
     return [offset, offset, offset];
   }
 
+  // Değişken y yalnızca sayı × x + y / sayı × x - y kurallarında kullanılır.
   const pattern = NEXT_NUMBER_VARIABLE_OFFSET_SERIES[
     secureRandomInt(0, NEXT_NUMBER_VARIABLE_OFFSET_SERIES.length)
   ];
@@ -2337,8 +2346,8 @@ function generateNextNumberPuzzle() {
 
   for (let attempt = 0; attempt < 7000; attempt += 1) {
     const multiplier = secureRandomInt(2, 13); // x = 2..12; x her zaman en az 2.
-    const offsets = generateNextNumberOffsetSeries(); // Her y en fazla 10.
     const ruleType = ruleTypes[secureRandomInt(0, ruleTypes.length)];
+    const offsets = generateNextNumberOffsetSeries(ruleType);
     const first = secureRandomInt(0, 21);
     const sequence = [first];
 
