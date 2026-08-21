@@ -2295,9 +2295,17 @@ const NEXT_NUMBER_MIN_VALUE = 0;
 const NEXT_NUMBER_MAX_VALUE = 99;
 const NEXT_NUMBER_MIN_OFFSET = 1;
 const NEXT_NUMBER_MAX_OFFSET = 10;
-// 0: klasik sabit y. ±1/±2/±3: her geçişte y'nin düzenli artıp/azaldığı yeni örüntüler.
-// 0 iki kez tutulduğu için klasik kural da yeterince sık görünmeye devam eder.
-const NEXT_NUMBER_OFFSET_STEPS = Object.freeze([0, 0, 1, -1, 2, -2, 3, -3]);
+
+// Sabit olmayan y yalnızca bu altı desen olabilir.
+// Böylece 1-4-7, 2-5-8, 7-5-3 gibi başka aritmetik diziler kesinlikle üretilemez.
+const NEXT_NUMBER_VARIABLE_OFFSET_SERIES = Object.freeze([
+  Object.freeze([1, 2, 3]),
+  Object.freeze([3, 2, 1]),
+  Object.freeze([2, 4, 6]),
+  Object.freeze([6, 4, 2]),
+  Object.freeze([3, 6, 9]),
+  Object.freeze([9, 6, 3]),
+]);
 
 function nextNumberStep(value, multiplier, offset, ruleType) {
   switch (ruleType) {
@@ -2310,17 +2318,18 @@ function nextNumberStep(value, multiplier, offset, ruleType) {
 }
 
 function generateNextNumberOffsetSeries() {
-  // Üç geçişin y değerlerinin tamamı 1..10 aralığında kalmak zorunda.
-  // Böylece örn. 4,5,6 / 4,3,2 / 3,6,9 / 6,4,2 gibi diziler doğal olarak oluşur.
-  for (let attempt = 0; attempt < 64; attempt += 1) {
-    const firstOffset = secureRandomInt(NEXT_NUMBER_MIN_OFFSET, NEXT_NUMBER_MAX_OFFSET + 1);
-    const step = NEXT_NUMBER_OFFSET_STEPS[secureRandomInt(0, NEXT_NUMBER_OFFSET_STEPS.length)];
-    const offsets = [firstOffset, firstOffset + step, firstOffset + (2 * step)];
-    if (offsets.every((value) => Number.isInteger(value) && value >= NEXT_NUMBER_MIN_OFFSET && value <= NEXT_NUMBER_MAX_OFFSET)) {
-      return offsets;
-    }
+  // Sabit kural korunur: y, 1..10 arasından seçilir ve üç geçişte aynı kalır.
+  // Sabit olmayan kural ise yalnızca kullanıcının izin verdiği altı kapalı desenden seçilir.
+  const useFixedOffset = secureRandomInt(0, 2) === 0;
+  if (useFixedOffset) {
+    const offset = secureRandomInt(NEXT_NUMBER_MIN_OFFSET, NEXT_NUMBER_MAX_OFFSET + 1);
+    return [offset, offset, offset];
   }
-  return [2, 2, 2];
+
+  const pattern = NEXT_NUMBER_VARIABLE_OFFSET_SERIES[
+    secureRandomInt(0, NEXT_NUMBER_VARIABLE_OFFSET_SERIES.length)
+  ];
+  return [...pattern];
 }
 
 function generateNextNumberPuzzle() {
@@ -2351,13 +2360,13 @@ function generateNextNumberPuzzle() {
     };
   }
 
-  // RNG'nin olağan dışı biçimde geçerli dizi üretememesi durumunda da tüm yeni kurallara uyan fallback.
-  // 3 -> 8 -> 19 -> 42 : 2x+2, 2x+3, 2x+4.
+  // RNG'nin olağan dışı biçimde geçerli dizi üretememesi durumunda da izin verilen sabit kurala uyan fallback.
+  // 3 -> 8 -> 18 -> 38 : her adım 2x+2.
   return {
     gameKey: "next_number",
     difficulty: "Standard",
-    target: 42,
-    numbers: [3, 8, 19],
+    target: 38,
+    numbers: [3, 8, 18],
     initialGrid: [],
   };
 }
