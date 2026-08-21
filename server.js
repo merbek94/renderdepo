@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "next-number-v14-progressive-rules-ui-20260821";
+const SERVER_BUILD_ID = "equation-hunt-v15-seven-families-20260821";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2050,6 +2050,20 @@ const GAME_DEFINITIONS = Object.freeze({
     botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
+  equation_hunt: Object.freeze({
+    key: "equation_hunt",
+    displayName: "DENKLEM AVI",
+    // Denklem Avı da ortak 2 dakikalık rekabet temposunu kullanır.
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Ortak bot motorunda Hedef Sayıyı Bul / Sonraki Sayı profili kullanılır.
+    botFinishMinMs: 24 * 1000,
+    botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
 });
 
 function unsupportedGameError(value) {
@@ -2389,6 +2403,295 @@ function validateNextNumberChallengeAnswer(puzzle, answer = {}) {
   if (numbers.some((value) => value < NEXT_NUMBER_MIN_VALUE || value > NEXT_NUMBER_MAX_VALUE)) return false;
   if (new Set([...numbers, target]).size !== 4) return false;
   return Number.isInteger(submitted) && submitted === target;
+}
+
+
+const EQUATION_HUNT_MAX_LINEAR_SOLUTION = 20;
+const EQUATION_HUNT_MAX_QUADRATIC_SOLUTION = 10;
+
+function equationHuntRandomSign() {
+  return secureRandomInt(0, 2) === 0 ? -1 : 1;
+}
+
+function equationHuntRandomSignedNonZero(maxAbs) {
+  return equationHuntRandomSign() * secureRandomInt(1, maxAbs + 1);
+}
+
+function equationHuntQuadraticParams(solution) {
+  const direct = secureRandomInt(0, 2) === 0;
+  if (direct) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const coefficient = secureRandomInt(1, 4); // 1..3
+      const constant = equationHuntRandomSignedNonZero(12);
+      if (coefficient * solution * solution + constant > 0) {
+        return [0, coefficient, constant];
+      }
+    }
+  }
+
+  // (v ± k)². +k her zaman tek pozitif kök verir.
+  // -k yalnız seçilen çözüm >= 2k ise kullanılır; böylece ikinci kök pozitif olamaz.
+  const canUseMinus = solution >= 2;
+  if (canUseMinus && secureRandomInt(0, 2) === 0) {
+    const maxK = Math.min(5, Math.floor(solution / 2));
+    if (maxK >= 1) {
+      const k = secureRandomInt(1, maxK + 1);
+      return [1, -k, 0];
+    }
+  }
+  const k = secureRandomInt(1, 6);
+  return [1, k, 0];
+}
+
+function generateEquationHuntPuzzle() {
+  // Önce aileyi seçip o aile içinde geçerli parametre bulunana kadar tekrar dene.
+  // Böylece üretimi daha kolay olan bir denklem tipi diğer tipleri istatistiksel olarak ezmez;
+  // yedi aile uzun vadede yaklaşık eşit olasılıkla gelir.
+  const family = secureRandomInt(1, 8);
+  const pairIndex = secureRandomInt(0, 3);
+  const maxSolution = family === 7
+    ? EQUATION_HUNT_MAX_QUADRATIC_SOLUTION
+    : EQUATION_HUNT_MAX_LINEAR_SOLUTION;
+
+  for (let attempt = 0; attempt < 8000; attempt += 1) {
+    const firstSolution = secureRandomInt(1, maxSolution + 1);
+    const secondSolution = secureRandomInt(1, maxSolution + 1);
+    let params = null;
+
+    if (family === 1) {
+      // ax ± by = r
+      // cx ± dy = s
+      const a = secureRandomInt(1, 6);
+      const b = secureRandomInt(1, 6);
+      const c = secureRandomInt(1, 6);
+      const d = secureRandomInt(1, 6);
+      const signB = equationHuntRandomSign();
+      const signD = equationHuntRandomSign();
+      const signedB = signB * b;
+      const signedD = signD * d;
+      const determinant = a * signedD - c * signedB;
+      const rhs1 = a * firstSolution + signedB * secondSolution;
+      const rhs2 = c * firstSolution + signedD * secondSolution;
+      if (determinant === 0 || rhs1 <= 0 || rhs2 <= 0) continue;
+      params = [a, signB, b, c, signD, d];
+    } else if (family === 2) {
+      // ax ± b = r
+      // cy ± d = s
+      const a = secureRandomInt(1, 6);
+      const c = secureRandomInt(1, 6);
+      const signB = equationHuntRandomSign();
+      const signD = equationHuntRandomSign();
+      const b = secureRandomInt(1, 21);
+      const d = secureRandomInt(1, 21);
+      if (a * firstSolution + signB * b <= 0) continue;
+      if (c * secondSolution + signD * d <= 0) continue;
+      params = [a, signB, b, c, signD, d];
+    } else if (family === 3) {
+      // ax + b = cx + d
+      // ey + f = gy + h
+      const a = secureRandomInt(1, 6);
+      const c = secureRandomInt(1, 6);
+      const e = secureRandomInt(1, 6);
+      const g = secureRandomInt(1, 6);
+      if (a === c || e === g) continue;
+      const b = equationHuntRandomSignedNonZero(12);
+      const f = equationHuntRandomSignedNonZero(12);
+      const d = (a - c) * firstSolution + b;
+      const h = (e - g) * secondSolution + f;
+      if (d === 0 || h === 0 || Math.abs(d) > 40 || Math.abs(h) > 40) continue;
+      if (a * firstSolution + b <= 0 || c * firstSolution + d <= 0) continue;
+      if (e * secondSolution + f <= 0 || g * secondSolution + h <= 0) continue;
+      params = [a, b, c, d, e, f, g, h];
+    } else if (family === 4) {
+      // ax + p = by + q
+      // cx + r = dy + s
+      const a = secureRandomInt(1, 6);
+      const b = secureRandomInt(1, 6);
+      const c = secureRandomInt(1, 6);
+      const d = secureRandomInt(1, 6);
+      if (a * d - b * c === 0) continue;
+      const p = equationHuntRandomSignedNonZero(12);
+      const r = equationHuntRandomSignedNonZero(12);
+      const q = a * firstSolution + p - b * secondSolution;
+      const s = c * firstSolution + r - d * secondSolution;
+      if (q === 0 || s === 0 || Math.abs(q) > 50 || Math.abs(s) > 50) continue;
+      if (a * firstSolution + p <= 0 || c * firstSolution + r <= 0) continue;
+      if (b * secondSolution + q <= 0 || d * secondSolution + s <= 0) continue;
+      params = [a, p, b, q, c, r, d, s];
+    } else if (family === 5) {
+      // a(x ± p) = r
+      // b(y ± q) = s
+      const a = secureRandomInt(1, 6);
+      const b = secureRandomInt(1, 6);
+      const p = equationHuntRandomSignedNonZero(8);
+      const q = equationHuntRandomSignedNonZero(8);
+      if (firstSolution + p <= 0 || secondSolution + q <= 0) continue;
+      params = [a, p, b, q];
+    } else if (family === 6) {
+      // a(x ± p) + b(x ± q) = r
+      // c(y ± r) + d(y ± s) = t
+      const a = secureRandomInt(1, 6);
+      const b = secureRandomInt(1, 6);
+      const c = secureRandomInt(1, 6);
+      const d = secureRandomInt(1, 6);
+      const p = equationHuntRandomSignedNonZero(6);
+      const q = equationHuntRandomSignedNonZero(6);
+      const r = equationHuntRandomSignedNonZero(6);
+      const s = equationHuntRandomSignedNonZero(6);
+      if (firstSolution + p <= 0 || firstSolution + q <= 0) continue;
+      if (secondSolution + r <= 0 || secondSolution + s <= 0) continue;
+      if (a * (firstSolution + p) + b * (firstSolution + q) <= 0) continue;
+      if (c * (secondSolution + r) + d * (secondSolution + s) <= 0) continue;
+      params = [a, p, b, q, c, r, d, s];
+    } else if (family === 7) {
+      params = [
+        ...equationHuntQuadraticParams(firstSolution),
+        ...equationHuntQuadraticParams(secondSolution),
+      ];
+    }
+
+    if (!params) continue;
+
+    const puzzle = {
+      gameKey: "equation_hunt",
+      difficulty: "Standard",
+      target: firstSolution,
+      // [aile, değişkenÇifti, ikinciÇözüm, ...denklemParametreleri]
+      numbers: [family, pairIndex, secondSolution, ...params],
+      initialGrid: [],
+    };
+    if (isEquationHuntPuzzleEncodingValid(puzzle)) return puzzle;
+  }
+
+  // Güvenli fallback: 2x + 5 = 11, 3y - 4 = 8 => x=3, y=4.
+  return {
+    gameKey: "equation_hunt",
+    difficulty: "Standard",
+    target: 3,
+    numbers: [2, 0, 4, 2, 1, 5, 3, -1, 4],
+    initialGrid: [],
+  };
+}
+
+function isEquationHuntPuzzleEncodingValid(puzzle) {
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const firstSolution = Number(puzzle?.target);
+  if (numbers.length < 3 || !numbers.every(Number.isInteger) || !Number.isInteger(firstSolution)) return false;
+
+  const family = numbers[0];
+  const pairIndex = numbers[1];
+  const secondSolution = numbers[2];
+  if (family < 1 || family > 7 || pairIndex < 0 || pairIndex > 2) return false;
+
+  const maxSolution = family === 7
+    ? EQUATION_HUNT_MAX_QUADRATIC_SOLUTION
+    : EQUATION_HUNT_MAX_LINEAR_SOLUTION;
+  if (firstSolution < 1 || firstSolution > maxSolution) return false;
+  if (secondSolution < 1 || secondSolution > maxSolution) return false;
+
+  const coefficient = (value, max = 5) => Number.isInteger(value) && value >= 1 && value <= max;
+  const sign = (value) => value === -1 || value === 1;
+  const nonZeroRange = (value, maxAbs) =>
+    Number.isInteger(value) && value !== 0 && Math.abs(value) <= maxAbs;
+
+  if (family === 1) {
+    if (numbers.length !== 9) return false;
+    const [a, signB, b, c, signD, d] = numbers.slice(3);
+    const signedB = signB * b;
+    const signedD = signD * d;
+    return coefficient(a) && sign(signB) && coefficient(b) &&
+      coefficient(c) && sign(signD) && coefficient(d) &&
+      a * signedD - c * signedB !== 0 &&
+      a * firstSolution + signedB * secondSolution > 0 &&
+      c * firstSolution + signedD * secondSolution > 0;
+  }
+
+  if (family === 2) {
+    if (numbers.length !== 9) return false;
+    const [a, signB, b, c, signD, d] = numbers.slice(3);
+    return coefficient(a) && sign(signB) && b >= 1 && b <= 20 &&
+      coefficient(c) && sign(signD) && d >= 1 && d <= 20 &&
+      a * firstSolution + signB * b > 0 &&
+      c * secondSolution + signD * d > 0;
+  }
+
+  if (family === 3) {
+    if (numbers.length !== 11) return false;
+    const [a, b, c, d, e, f, g, h] = numbers.slice(3);
+    return coefficient(a) && coefficient(c) && a !== c &&
+      coefficient(e) && coefficient(g) && e !== g &&
+      nonZeroRange(b, 40) && nonZeroRange(d, 40) &&
+      nonZeroRange(f, 40) && nonZeroRange(h, 40) &&
+      a * firstSolution + b === c * firstSolution + d &&
+      e * secondSolution + f === g * secondSolution + h;
+  }
+
+  if (family === 4) {
+    if (numbers.length !== 11) return false;
+    const [a, p, b, q, c, r, d, s] = numbers.slice(3);
+    return coefficient(a) && coefficient(b) && coefficient(c) && coefficient(d) &&
+      a * d - b * c !== 0 &&
+      nonZeroRange(p, 50) && nonZeroRange(q, 50) &&
+      nonZeroRange(r, 50) && nonZeroRange(s, 50) &&
+      a * firstSolution + p === b * secondSolution + q &&
+      c * firstSolution + r === d * secondSolution + s &&
+      a * firstSolution + p > 0 &&
+      c * firstSolution + r > 0;
+  }
+
+  if (family === 5) {
+    if (numbers.length !== 7) return false;
+    const [a, p, b, q] = numbers.slice(3);
+    return coefficient(a) && coefficient(b) &&
+      nonZeroRange(p, 8) && nonZeroRange(q, 8) &&
+      firstSolution + p > 0 &&
+      secondSolution + q > 0;
+  }
+
+  if (family === 6) {
+    if (numbers.length !== 11) return false;
+    const [a, p, b, q, c, r, d, s] = numbers.slice(3);
+    return coefficient(a) && coefficient(b) && coefficient(c) && coefficient(d) &&
+      nonZeroRange(p, 6) && nonZeroRange(q, 6) &&
+      nonZeroRange(r, 6) && nonZeroRange(s, 6) &&
+      firstSolution + p > 0 && firstSolution + q > 0 &&
+      secondSolution + r > 0 && secondSolution + s > 0 &&
+      a * (firstSolution + p) + b * (firstSolution + q) > 0 &&
+      c * (secondSolution + r) + d * (secondSolution + s) > 0;
+  }
+
+  if (family === 7) {
+    if (numbers.length !== 9) return false;
+
+    const validQuadratic = (solution, kind, firstParam, secondParam) => {
+      if (kind === 0) {
+        return coefficient(firstParam, 3) &&
+          nonZeroRange(secondParam, 12) &&
+          firstParam * solution * solution + secondParam > 0;
+      }
+      if (kind === 1) {
+        return nonZeroRange(firstParam, 5) &&
+          secondParam === 0 &&
+          solution + firstParam > 0 &&
+          (firstParam > 0 || solution >= 2 * Math.abs(firstParam));
+      }
+      return false;
+    };
+
+    return validQuadratic(firstSolution, numbers[3], numbers[4], numbers[5]) &&
+      validQuadratic(secondSolution, numbers[6], numbers[7], numbers[8]);
+  }
+
+  return false;
+}
+
+function validateEquationHuntChallengeAnswer(puzzle, answer = {}) {
+  if (!isEquationHuntPuzzleEncodingValid(puzzle)) return false;
+  const firstValue = Number(answer?.firstValue);
+  const secondValue = Number(answer?.secondValue);
+  if (!Number.isInteger(firstValue) || !Number.isInteger(secondValue)) return false;
+  return firstValue === Number(puzzle.target) &&
+    secondValue === Number(puzzle.numbers[2]);
 }
 
 function generatePuzzleForGame(gameKey, difficultyValue) {
@@ -4162,6 +4465,11 @@ const GAME_HANDLERS = Object.freeze({
     key: "next_number",
     createPuzzle: () => generateNextNumberPuzzle(),
     validateAnswer: (puzzle, answer) => validateNextNumberChallengeAnswer(puzzle, answer),
+  }),
+  equation_hunt: Object.freeze({
+    key: "equation_hunt",
+    createPuzzle: () => generateEquationHuntPuzzle(),
+    validateAnswer: (puzzle, answer) => validateEquationHuntChallengeAnswer(puzzle, answer),
   }),
 });
 
