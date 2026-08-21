@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "total-equals-pair-columns-v12-20260820";
+const SERVER_BUILD_ID = "next-number-v13-20260821";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2036,6 +2036,20 @@ const GAME_DEFINITIONS = Object.freeze({
     botAverageVarianceMs: 7 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
+  next_number: Object.freeze({
+    key: "next_number",
+    displayName: "SONRAKİ SAYI",
+    // Normal / sonsuz / ikili / turnuva tur süresi 2 dakika.
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Bot motoru ortaktır; profil Hedef Sayıyı Bul ile aynı başlangıç kalibrasyonunu kullanır.
+    botFinishMinMs: 24 * 1000,
+    botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
 });
 
 function unsupportedGameError(value) {
@@ -2276,6 +2290,69 @@ function validateTotalEqualsChallengeAnswer(puzzle, answer = {}) {
 
   return usedLeft.size === TOTAL_EQUALS_PAIR_COUNT && usedRight.size === TOTAL_EQUALS_PAIR_COUNT;
 }
+
+const NEXT_NUMBER_MIN_VALUE = 0;
+const NEXT_NUMBER_MAX_VALUE = 99;
+
+function nextNumberStep(value, multiplier, offset, ruleType) {
+  switch (ruleType) {
+    case "multiply_plus": return value * multiplier + offset;
+    case "multiply_minus": return value * multiplier - offset;
+    case "plus_then_multiply": return (value + offset) * multiplier;
+    case "minus_then_multiply": return (value - offset) * multiplier;
+    default: return Number.NaN;
+  }
+}
+
+function generateNextNumberPuzzle() {
+  const ruleTypes = ["multiply_plus", "multiply_minus", "plus_then_multiply", "minus_then_multiply"];
+
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
+    const multiplier = secureRandomInt(2, 13); // x = 2..12; x her zaman en az 2.
+    const offset = secureRandomInt(1, 21);    // y = 1..20; 100 altı koşulu aşağıda ayrıca zorunlu.
+    const ruleType = ruleTypes[secureRandomInt(0, ruleTypes.length)];
+    const first = secureRandomInt(0, 21);
+    const sequence = [first];
+
+    for (let index = 0; index < 3; index += 1) {
+      const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offset, ruleType);
+      if (!Number.isInteger(next) || next < NEXT_NUMBER_MIN_VALUE || next > NEXT_NUMBER_MAX_VALUE) break;
+      sequence.push(next);
+    }
+
+    if (sequence.length !== 4) continue;
+    if (new Set(sequence).size !== 4) continue;
+
+    return {
+      gameKey: "next_number",
+      difficulty: "Standard",
+      target: sequence[3],
+      numbers: sequence.slice(0, 3),
+      initialGrid: [],
+    };
+  }
+
+  // Aşırı beklenmedik RNG koşulunda bile geçerli, kullanıcının verdiği örnekle uyumlu güvenli fallback.
+  return {
+    gameKey: "next_number",
+    difficulty: "Standard",
+    target: 28,
+    numbers: [2, 4, 10],
+    initialGrid: [],
+  };
+}
+
+function validateNextNumberChallengeAnswer(puzzle, answer = {}) {
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const target = Number(puzzle?.target);
+  const submitted = Number(answer?.nextNumber);
+  if (numbers.length !== 3 || numbers.some((value) => !Number.isInteger(value))) return false;
+  if (!Number.isInteger(target) || target < NEXT_NUMBER_MIN_VALUE || target > NEXT_NUMBER_MAX_VALUE) return false;
+  if (numbers.some((value) => value < NEXT_NUMBER_MIN_VALUE || value > NEXT_NUMBER_MAX_VALUE)) return false;
+  if (new Set([...numbers, target]).size !== 4) return false;
+  return Number.isInteger(submitted) && submitted === target;
+}
+
 function generatePuzzleForGame(gameKey, difficultyValue) {
   return gameHandler(gameKey).createPuzzle(difficultyValue);
 }
@@ -4042,6 +4119,11 @@ const GAME_HANDLERS = Object.freeze({
     key: "total_equals",
     createPuzzle: () => generateTotalEqualsPuzzle(),
     validateAnswer: (puzzle, answer) => validateTotalEqualsChallengeAnswer(puzzle, answer),
+  }),
+  next_number: Object.freeze({
+    key: "next_number",
+    createPuzzle: () => generateNextNumberPuzzle(),
+    validateAnswer: (puzzle, answer) => validateNextNumberChallengeAnswer(puzzle, answer),
   }),
 });
 
