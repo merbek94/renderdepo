@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "shortest-path-v1-20260822";
+const SERVER_BUILD_ID = "shortest-path-5nodes-v2-20260822";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2067,7 +2067,7 @@ const GAME_DEFINITIONS = Object.freeze({
   shortest_path: Object.freeze({
     key: "shortest_path",
     displayName: "EN KISA YOL",
-    // A-J açık Hamilton en-kısa-yol oyunu; başlangıç noktasına geri dönme yok.
+    // A-E açık Hamilton en-kısa-yol oyunu; her noktanın tam 2 bağlantısı var ve başlangıca dönüş yok.
     roundDurationMs: 2 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
     // Hedef Sayıyı Bul ile birebir aynı bot profili.
@@ -2589,16 +2589,17 @@ function validateConsecutiveChallengeAnswer(puzzle, answer = {}) {
 }
 
 // ============================================================================
-// EN KISA YOL — 10 düğümlü açık Hamilton en-kısa-yol oyunu
+// EN KISA YOL — 5 düğümlü açık Hamilton en-kısa-yol oyunu
 // numbers encoding:
-// [version=1, A.x,A.y, ... J.x,J.y, edgeCount, from,to,distance, ...]
+// [version=2, A.x,A.y, ... E.x,E.y, edgeCount, from,to,distance, ...]
+// Her noktanın TAM 2 bağlantısı vardır. Böylece grafik 5 düğümlü tek bir çevrimdir.
 // target: bütün düğümleri tam bir kez gezen EN KISA açık yolun toplam mesafesi.
 // ============================================================================
-const SHORTEST_PATH_NODE_COUNT = 10;
-const SHORTEST_PATH_VERSION = 1;
-const SHORTEST_PATH_HEADER_SIZE = 22;
-const SHORTEST_PATH_MIN_EDGES = 14;
-const SHORTEST_PATH_MAX_EDGES = 26;
+const SHORTEST_PATH_NODE_COUNT = 5;
+const SHORTEST_PATH_VERSION = 2;
+const SHORTEST_PATH_HEADER_SIZE = 12;
+const SHORTEST_PATH_MIN_EDGES = 5;
+const SHORTEST_PATH_MAX_EDGES = 5;
 
 function shortestPathPairKey(a, b) {
   const low = Math.min(a, b);
@@ -2629,7 +2630,7 @@ function shortestPathDecodePuzzle(puzzle) {
   );
   if (!nonCollinear) return null;
 
-  const edgeCount = numbers[21];
+  const edgeCount = numbers[SHORTEST_PATH_HEADER_SIZE - 1];
   if (!Number.isInteger(edgeCount) || edgeCount < SHORTEST_PATH_MIN_EDGES || edgeCount > SHORTEST_PATH_MAX_EDGES) return null;
   if (numbers.length !== SHORTEST_PATH_HEADER_SIZE + edgeCount * 3) return null;
 
@@ -2655,7 +2656,7 @@ function shortestPathDecodePuzzle(puzzle) {
     degrees[b] += 1;
     edges.push({ a, b, distance });
   }
-  if (degrees.some((degree) => degree < 2 || degree > 5)) return null;
+  if (degrees.some((degree) => degree !== 2)) return null;
 
   return { target, points, edges, edgeCount };
 }
@@ -2728,114 +2729,80 @@ function shortestPathEncode(points, edges) {
 }
 
 function shortestPathFallbackPuzzle() {
+  // Beşgen biçiminde, her düğümün tam iki komşusu bulunan okunaklı güvenli yedek tahta.
   const points = [
-    { x: 120, y: 170 }, { x: 320, y: 90 }, { x: 590, y: 150 }, { x: 830, y: 250 }, { x: 690, y: 430 },
-    { x: 860, y: 680 }, { x: 560, y: 780 }, { x: 300, y: 700 }, { x: 120, y: 520 }, { x: 420, y: 420 },
+    { x: 500, y: 110 },
+    { x: 835, y: 345 },
+    { x: 705, y: 790 },
+    { x: 295, y: 790 },
+    { x: 165, y: 345 },
   ];
   const triples = [
-    [0, 2, 13], [0, 8, 10], [1, 3, 15], [1, 4, 14], [1, 5, 23], [1, 7, 17],
-    [2, 5, 18], [2, 7, 19], [2, 9, 9], [3, 4, 7], [3, 6, 20], [3, 9, 16],
-    [4, 8, 21], [5, 8, 22], [5, 9, 24], [6, 7, 8], [6, 8, 25], [6, 9, 11],
+    [0, 1, 11],
+    [1, 2, 19],
+    [2, 3, 31],
+    [3, 4, 43],
+    [4, 0, 57],
   ];
   const edges = triples.map(([a, b, distance]) => ({ a, b, distance }));
   const numbers = shortestPathEncode(points, edges);
-  const decodedWithoutTarget = shortestPathDecodePuzzle({ target: 111, numbers });
-  const target = shortestPathOptimalDistanceFromDecoded(decodedWithoutTarget) || 111;
+  const decodedWithoutTarget = shortestPathDecodePuzzle({ target: 1, numbers });
+  const target = shortestPathOptimalDistanceFromDecoded(decodedWithoutTarget) || 104;
   return { gameKey: "shortest_path", difficulty: "Standard", target, numbers, initialGrid: [] };
 }
 
 function generateShortestPathPuzzle() {
-  // Dengeli, telefonda kolay okunur ama tek doğru üzerinde olmayan temel konumlar.
+  // Beş düğüm telefonda rahat seçilebilsin diye geniş bir beşgen yerleşimi kullanılır.
+  // Etiketlerin hangi konuma düştüğü ve çevrim sırası her oyunda karıştırılır.
   const basePoints = [
-    [105, 145], [300, 85], [555, 155], [835, 245], [730, 445],
-    [855, 700], [580, 825], [315, 735], [105, 545], [410, 420],
+    [500, 105],
+    [840, 345],
+    [710, 805],
+    [290, 805],
+    [160, 345],
   ];
 
-  for (let attempt = 0; attempt < 500; attempt += 1) {
-    // Aynı harita hissini azaltmak için konumları etiketlere karıştır ve küçük güvenli jitter uygula.
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     const points = shuffled(basePoints).map(([x, y]) => ({
-      x: Math.max(60, Math.min(940, x + secureRandomInt(-18, 19))),
-      y: Math.max(60, Math.min(940, y + secureRandomInt(-18, 19))),
+      x: Math.max(60, Math.min(940, x + secureRandomInt(-24, 25))),
+      y: Math.max(60, Math.min(940, y + secureRandomInt(-24, 25))),
     }));
 
-    const degrees = Array(SHORTEST_PATH_NODE_COUNT).fill(0);
-    const selected = new Map();
-    const addEdge = (aRaw, bRaw) => {
+    // Rastgele bir 5'li çevrim oluştur. Çevrimde her düğümün derecesi tam 2'dir.
+    const cycle = shuffled(Array.from({ length: SHORTEST_PATH_NODE_COUNT }, (_, i) => i));
+    const rawEdges = [];
+    for (let index = 0; index < SHORTEST_PATH_NODE_COUNT; index += 1) {
+      const aRaw = cycle[index];
+      const bRaw = cycle[(index + 1) % SHORTEST_PATH_NODE_COUNT];
       const a = Math.min(aRaw, bRaw);
       const b = Math.max(aRaw, bRaw);
-      if (a === b || degrees[a] >= 5 || degrees[b] >= 5) return false;
-      const key = shortestPathPairKey(a, b);
-      if (selected.has(key)) return false;
-      selected.set(key, { a, b });
-      degrees[a] += 1;
-      degrees[b] += 1;
-      return true;
-    };
-
-    // Önce rastgele bir Hamilton omurgası: her üretilen haritanın en az bir tam rotası garanti edilir.
-    const backbone = shuffled(Array.from({ length: SHORTEST_PATH_NODE_COUNT }, (_, i) => i));
-    for (let i = 0; i < backbone.length - 1; i += 1) addEdge(backbone[i], backbone[i + 1]);
-
-    // Sonra mantıklı alternatifler. Geometrik olarak kısa bağlantıları biraz daha sık seç.
-    const allPairs = [];
-    for (let a = 0; a < SHORTEST_PATH_NODE_COUNT; a += 1) {
-      for (let b = a + 1; b < SHORTEST_PATH_NODE_COUNT; b += 1) {
-        if (selected.has(shortestPathPairKey(a, b))) continue;
-        const dx = points[a].x - points[b].x;
-        const dy = points[a].y - points[b].y;
-        allPairs.push({ a, b, geo: Math.hypot(dx, dy) });
-      }
-    }
-    allPairs.sort((x, y) => x.geo - y.geo);
-    const targetEdgeCount = secureRandomInt(17, 21); // 17..20; seyrek ama çok seçenekli.
-
-    // Önce derece 1 kalan uçları derece 2'ye çıkar.
-    for (const node of shuffled(Array.from({ length: SHORTEST_PATH_NODE_COUNT }, (_, i) => i))) {
-      if (degrees[node] >= 2) continue;
-      const candidates = allPairs.filter((pair) => (pair.a === node || pair.b === node) && !selected.has(shortestPathPairKey(pair.a, pair.b)));
-      for (const candidate of candidates.slice(0, 8)) {
-        if (addEdge(candidate.a, candidate.b)) break;
-      }
+      const dx = points[a].x - points[b].x;
+      const dy = points[a].y - points[b].y;
+      rawEdges.push({ a, b, geo: Math.hypot(dx, dy) });
     }
 
-    // Kalan alternatif yolları ekle; yakın çiftlerin yanı sıra birkaç çapraz bağlantı da doğal olarak gelir.
-    while (selected.size < targetEdgeCount) {
-      const available = allPairs.filter((pair) =>
-        !selected.has(shortestPathPairKey(pair.a, pair.b)) && degrees[pair.a] < 5 && degrees[pair.b] < 5
-      );
-      if (available.length === 0) break;
-      const band = Math.min(available.length, 12 + secureRandomInt(0, Math.min(12, available.length) + 1));
-      const candidate = available[secureRandomInt(0, band)];
-      if (!candidate || !addEdge(candidate.a, candidate.b)) break;
-    }
-
-    if (selected.size < 17 || degrees.some((degree) => degree < 2 || degree > 5)) continue;
-
-    // Yol uzunlukları birbirinden farklıdır. Geometrik sıralamayla ilişkilendirmek oyuncuya
-    // görsel-mantıksal ipucu verir, küçük sapma ise yalnız ekrana bakarak cevabı ezberlemeyi önler.
-    const selectedEdges = [...selected.values()].map((edge) => {
-      const dx = points[edge.a].x - points[edge.b].x;
-      const dy = points[edge.a].y - points[edge.b].y;
-      return { ...edge, geo: Math.hypot(dx, dy) };
-    }).sort((x, y) => x.geo - y.geo);
-    const edges = selectedEdges.map((edge, rank) => ({
-      a: edge.a,
-      b: edge.b,
-      distance: 6 + rank * 3 + secureRandomInt(0, 2),
-    }));
-    if (edges.some((edge) => edge.distance > 99)) continue;
+    // Yol uzunlukları benzersizdir ve çizimdeki yaklaşık geometrik uzunlukla ilişkili tutulur.
+    const edges = rawEdges
+      .sort((left, right) => left.geo - right.geo)
+      .map((edge, rank) => ({
+        a: edge.a,
+        b: edge.b,
+        distance: 10 + rank * 9 + secureRandomInt(0, 3),
+      }));
 
     const numbers = shortestPathEncode(points, edges);
-    // Decode için geçici pozitif target yeterlidir; ardından gerçek optimumu hesaplayıp tekrar doğrula.
     const firstDecode = shortestPathDecodePuzzle({ target: 1, numbers });
     if (!firstDecode) continue;
+
     const target = shortestPathOptimalDistanceFromDecoded(firstDecode);
     if (!Number.isInteger(target) || target <= 0) continue;
+
     const puzzle = { gameKey: "shortest_path", difficulty: "Standard", target, numbers, initialGrid: [] };
     const decoded = shortestPathDecodePuzzle(puzzle);
     if (!decoded) continue;
-    // Kullanıcı gerçek bir karar problemi görsün: yalnızca tek koridor değil, en az 16 yönlü tam rota olsun.
-    if (shortestPathHamiltonianRouteCount(decoded, 16) < 16) continue;
+
+    // 5'li çevrimde açık Hamilton yolu için yönleriyle birlikte 10 tam rota bulunur.
+    if (shortestPathHamiltonianRouteCount(decoded, 10) < 10) continue;
     if (shortestPathOptimalDistanceFromDecoded(decoded) !== target) continue;
     return puzzle;
   }
