@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "consecutive-grid-v1-20260822";
+const SERVER_BUILD_ID = "shortest-path-v1-20260822";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2064,6 +2064,20 @@ const GAME_DEFINITIONS = Object.freeze({
     botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
+  shortest_path: Object.freeze({
+    key: "shortest_path",
+    displayName: "EN KISA YOL",
+    // A-J açık Hamilton en-kısa-yol oyunu; başlangıç noktasına geri dönme yok.
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Hedef Sayıyı Bul ile birebir aynı bot profili.
+    botFinishMinMs: 24 * 1000,
+    botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
   consecutive: Object.freeze({
     key: "consecutive",
     displayName: "ARDIŞIK",
@@ -2572,6 +2586,284 @@ function validateConsecutiveChallengeAnswer(puzzle, answer = {}) {
 
   if (!grid.every((value, index) => value === Number(puzzle.numbers[index]))) return false;
   return consecutiveGridSolved(grid);
+}
+
+// ============================================================================
+// EN KISA YOL — 10 düğümlü açık Hamilton en-kısa-yol oyunu
+// numbers encoding:
+// [version=1, A.x,A.y, ... J.x,J.y, edgeCount, from,to,distance, ...]
+// target: bütün düğümleri tam bir kez gezen EN KISA açık yolun toplam mesafesi.
+// ============================================================================
+const SHORTEST_PATH_NODE_COUNT = 10;
+const SHORTEST_PATH_VERSION = 1;
+const SHORTEST_PATH_HEADER_SIZE = 22;
+const SHORTEST_PATH_MIN_EDGES = 14;
+const SHORTEST_PATH_MAX_EDGES = 26;
+
+function shortestPathPairKey(a, b) {
+  const low = Math.min(a, b);
+  const high = Math.max(a, b);
+  return `${low}:${high}`;
+}
+
+function shortestPathDecodePuzzle(puzzle) {
+  const target = Number(puzzle?.target);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (!Number.isInteger(target) || target <= 0) return null;
+  if (numbers.length < SHORTEST_PATH_HEADER_SIZE || numbers[0] !== SHORTEST_PATH_VERSION) return null;
+
+  const points = [];
+  for (let index = 0; index < SHORTEST_PATH_NODE_COUNT; index += 1) {
+    const x = numbers[1 + index * 2];
+    const y = numbers[2 + index * 2];
+    if (!Number.isInteger(x) || !Number.isInteger(y) || x < 60 || x > 940 || y < 60 || y > 940) return null;
+    points.push({ x, y });
+  }
+  if (new Set(points.map((p) => `${p.x}:${p.y}`)).size !== SHORTEST_PATH_NODE_COUNT) return null;
+
+  // Tüm noktaların tek doğru üzerinde olmasını reddet.
+  const p0 = points[0];
+  const p1 = points[1];
+  const nonCollinear = points.slice(2).some((p) =>
+    (p1.x - p0.x) * (p.y - p0.y) - (p1.y - p0.y) * (p.x - p0.x) !== 0
+  );
+  if (!nonCollinear) return null;
+
+  const edgeCount = numbers[21];
+  if (!Number.isInteger(edgeCount) || edgeCount < SHORTEST_PATH_MIN_EDGES || edgeCount > SHORTEST_PATH_MAX_EDGES) return null;
+  if (numbers.length !== SHORTEST_PATH_HEADER_SIZE + edgeCount * 3) return null;
+
+  const seenPairs = new Set();
+  const seenDistances = new Set();
+  const degrees = Array(SHORTEST_PATH_NODE_COUNT).fill(0);
+  const edges = [];
+  let cursor = SHORTEST_PATH_HEADER_SIZE;
+  for (let i = 0; i < edgeCount; i += 1) {
+    const rawA = numbers[cursor++];
+    const rawB = numbers[cursor++];
+    const distance = numbers[cursor++];
+    if (!Number.isInteger(rawA) || !Number.isInteger(rawB) || !Number.isInteger(distance)) return null;
+    if (rawA < 0 || rawA >= SHORTEST_PATH_NODE_COUNT || rawB < 0 || rawB >= SHORTEST_PATH_NODE_COUNT || rawA === rawB) return null;
+    if (distance < 2 || distance > 99) return null;
+    const a = Math.min(rawA, rawB);
+    const b = Math.max(rawA, rawB);
+    const key = shortestPathPairKey(a, b);
+    if (seenPairs.has(key) || seenDistances.has(distance)) return null;
+    seenPairs.add(key);
+    seenDistances.add(distance);
+    degrees[a] += 1;
+    degrees[b] += 1;
+    edges.push({ a, b, distance });
+  }
+  if (degrees.some((degree) => degree < 2 || degree > 5)) return null;
+
+  return { target, points, edges, edgeCount };
+}
+
+function shortestPathWeightMatrix(decoded) {
+  const inf = 1_000_000_000;
+  const matrix = Array.from({ length: SHORTEST_PATH_NODE_COUNT }, () => Array(SHORTEST_PATH_NODE_COUNT).fill(inf));
+  decoded.edges.forEach(({ a, b, distance }) => {
+    matrix[a][b] = distance;
+    matrix[b][a] = distance;
+  });
+  return { matrix, inf };
+}
+
+function shortestPathOptimalDistanceFromDecoded(decoded) {
+  if (!decoded) return null;
+  const { matrix, inf } = shortestPathWeightMatrix(decoded);
+  const fullMask = (1 << SHORTEST_PATH_NODE_COUNT) - 1;
+  const dp = Array.from({ length: 1 << SHORTEST_PATH_NODE_COUNT }, () => Array(SHORTEST_PATH_NODE_COUNT).fill(inf));
+  for (let start = 0; start < SHORTEST_PATH_NODE_COUNT; start += 1) dp[1 << start][start] = 0;
+
+  for (let mask = 1; mask <= fullMask; mask += 1) {
+    for (let last = 0; last < SHORTEST_PATH_NODE_COUNT; last += 1) {
+      const current = dp[mask][last];
+      if (current >= inf || (mask & (1 << last)) === 0) continue;
+      for (let next = 0; next < SHORTEST_PATH_NODE_COUNT; next += 1) {
+        if ((mask & (1 << next)) !== 0 || matrix[last][next] >= inf) continue;
+        const nextMask = mask | (1 << next);
+        const candidate = current + matrix[last][next];
+        if (candidate < dp[nextMask][next]) dp[nextMask][next] = candidate;
+      }
+    }
+  }
+  const best = Math.min(...dp[fullMask]);
+  return best < inf ? best : null;
+}
+
+function shortestPathHamiltonianRouteCount(decoded, stopAt = 32) {
+  if (!decoded) return 0;
+  const adjacency = Array.from({ length: SHORTEST_PATH_NODE_COUNT }, () => []);
+  decoded.edges.forEach(({ a, b }) => {
+    adjacency[a].push(b);
+    adjacency[b].push(a);
+  });
+  let count = 0;
+  function visit(last, mask, depth) {
+    if (count >= stopAt) return;
+    if (depth === SHORTEST_PATH_NODE_COUNT) {
+      count += 1;
+      return;
+    }
+    for (const next of adjacency[last]) {
+      if ((mask & (1 << next)) !== 0) continue;
+      visit(next, mask | (1 << next), depth + 1);
+      if (count >= stopAt) return;
+    }
+  }
+  for (let start = 0; start < SHORTEST_PATH_NODE_COUNT && count < stopAt; start += 1) {
+    visit(start, 1 << start, 1);
+  }
+  return count;
+}
+
+function shortestPathEncode(points, edges) {
+  const numbers = [SHORTEST_PATH_VERSION];
+  points.forEach((point) => numbers.push(point.x, point.y));
+  numbers.push(edges.length);
+  edges.forEach((edge) => numbers.push(edge.a, edge.b, edge.distance));
+  return numbers;
+}
+
+function shortestPathFallbackPuzzle() {
+  const points = [
+    { x: 120, y: 170 }, { x: 320, y: 90 }, { x: 590, y: 150 }, { x: 830, y: 250 }, { x: 690, y: 430 },
+    { x: 860, y: 680 }, { x: 560, y: 780 }, { x: 300, y: 700 }, { x: 120, y: 520 }, { x: 420, y: 420 },
+  ];
+  const triples = [
+    [0, 2, 13], [0, 8, 10], [1, 3, 15], [1, 4, 14], [1, 5, 23], [1, 7, 17],
+    [2, 5, 18], [2, 7, 19], [2, 9, 9], [3, 4, 7], [3, 6, 20], [3, 9, 16],
+    [4, 8, 21], [5, 8, 22], [5, 9, 24], [6, 7, 8], [6, 8, 25], [6, 9, 11],
+  ];
+  const edges = triples.map(([a, b, distance]) => ({ a, b, distance }));
+  const numbers = shortestPathEncode(points, edges);
+  const decodedWithoutTarget = shortestPathDecodePuzzle({ target: 111, numbers });
+  const target = shortestPathOptimalDistanceFromDecoded(decodedWithoutTarget) || 111;
+  return { gameKey: "shortest_path", difficulty: "Standard", target, numbers, initialGrid: [] };
+}
+
+function generateShortestPathPuzzle() {
+  // Dengeli, telefonda kolay okunur ama tek doğru üzerinde olmayan temel konumlar.
+  const basePoints = [
+    [105, 145], [300, 85], [555, 155], [835, 245], [730, 445],
+    [855, 700], [580, 825], [315, 735], [105, 545], [410, 420],
+  ];
+
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    // Aynı harita hissini azaltmak için konumları etiketlere karıştır ve küçük güvenli jitter uygula.
+    const points = shuffled(basePoints).map(([x, y]) => ({
+      x: Math.max(60, Math.min(940, x + secureRandomInt(-18, 19))),
+      y: Math.max(60, Math.min(940, y + secureRandomInt(-18, 19))),
+    }));
+
+    const degrees = Array(SHORTEST_PATH_NODE_COUNT).fill(0);
+    const selected = new Map();
+    const addEdge = (aRaw, bRaw) => {
+      const a = Math.min(aRaw, bRaw);
+      const b = Math.max(aRaw, bRaw);
+      if (a === b || degrees[a] >= 5 || degrees[b] >= 5) return false;
+      const key = shortestPathPairKey(a, b);
+      if (selected.has(key)) return false;
+      selected.set(key, { a, b });
+      degrees[a] += 1;
+      degrees[b] += 1;
+      return true;
+    };
+
+    // Önce rastgele bir Hamilton omurgası: her üretilen haritanın en az bir tam rotası garanti edilir.
+    const backbone = shuffled(Array.from({ length: SHORTEST_PATH_NODE_COUNT }, (_, i) => i));
+    for (let i = 0; i < backbone.length - 1; i += 1) addEdge(backbone[i], backbone[i + 1]);
+
+    // Sonra mantıklı alternatifler. Geometrik olarak kısa bağlantıları biraz daha sık seç.
+    const allPairs = [];
+    for (let a = 0; a < SHORTEST_PATH_NODE_COUNT; a += 1) {
+      for (let b = a + 1; b < SHORTEST_PATH_NODE_COUNT; b += 1) {
+        if (selected.has(shortestPathPairKey(a, b))) continue;
+        const dx = points[a].x - points[b].x;
+        const dy = points[a].y - points[b].y;
+        allPairs.push({ a, b, geo: Math.hypot(dx, dy) });
+      }
+    }
+    allPairs.sort((x, y) => x.geo - y.geo);
+    const targetEdgeCount = secureRandomInt(17, 21); // 17..20; seyrek ama çok seçenekli.
+
+    // Önce derece 1 kalan uçları derece 2'ye çıkar.
+    for (const node of shuffled(Array.from({ length: SHORTEST_PATH_NODE_COUNT }, (_, i) => i))) {
+      if (degrees[node] >= 2) continue;
+      const candidates = allPairs.filter((pair) => (pair.a === node || pair.b === node) && !selected.has(shortestPathPairKey(pair.a, pair.b)));
+      for (const candidate of candidates.slice(0, 8)) {
+        if (addEdge(candidate.a, candidate.b)) break;
+      }
+    }
+
+    // Kalan alternatif yolları ekle; yakın çiftlerin yanı sıra birkaç çapraz bağlantı da doğal olarak gelir.
+    while (selected.size < targetEdgeCount) {
+      const available = allPairs.filter((pair) =>
+        !selected.has(shortestPathPairKey(pair.a, pair.b)) && degrees[pair.a] < 5 && degrees[pair.b] < 5
+      );
+      if (available.length === 0) break;
+      const band = Math.min(available.length, 12 + secureRandomInt(0, Math.min(12, available.length) + 1));
+      const candidate = available[secureRandomInt(0, band)];
+      if (!candidate || !addEdge(candidate.a, candidate.b)) break;
+    }
+
+    if (selected.size < 17 || degrees.some((degree) => degree < 2 || degree > 5)) continue;
+
+    // Yol uzunlukları birbirinden farklıdır. Geometrik sıralamayla ilişkilendirmek oyuncuya
+    // görsel-mantıksal ipucu verir, küçük sapma ise yalnız ekrana bakarak cevabı ezberlemeyi önler.
+    const selectedEdges = [...selected.values()].map((edge) => {
+      const dx = points[edge.a].x - points[edge.b].x;
+      const dy = points[edge.a].y - points[edge.b].y;
+      return { ...edge, geo: Math.hypot(dx, dy) };
+    }).sort((x, y) => x.geo - y.geo);
+    const edges = selectedEdges.map((edge, rank) => ({
+      a: edge.a,
+      b: edge.b,
+      distance: 6 + rank * 3 + secureRandomInt(0, 2),
+    }));
+    if (edges.some((edge) => edge.distance > 99)) continue;
+
+    const numbers = shortestPathEncode(points, edges);
+    // Decode için geçici pozitif target yeterlidir; ardından gerçek optimumu hesaplayıp tekrar doğrula.
+    const firstDecode = shortestPathDecodePuzzle({ target: 1, numbers });
+    if (!firstDecode) continue;
+    const target = shortestPathOptimalDistanceFromDecoded(firstDecode);
+    if (!Number.isInteger(target) || target <= 0) continue;
+    const puzzle = { gameKey: "shortest_path", difficulty: "Standard", target, numbers, initialGrid: [] };
+    const decoded = shortestPathDecodePuzzle(puzzle);
+    if (!decoded) continue;
+    // Kullanıcı gerçek bir karar problemi görsün: yalnızca tek koridor değil, en az 16 yönlü tam rota olsun.
+    if (shortestPathHamiltonianRouteCount(decoded, 16) < 16) continue;
+    if (shortestPathOptimalDistanceFromDecoded(decoded) !== target) continue;
+    return puzzle;
+  }
+
+  return shortestPathFallbackPuzzle();
+}
+
+function validateShortestPathChallengeAnswer(puzzle, answer = {}) {
+  const decoded = shortestPathDecodePuzzle(puzzle);
+  if (!decoded) return false;
+  const optimum = shortestPathOptimalDistanceFromDecoded(decoded);
+  if (!Number.isInteger(optimum) || optimum !== decoded.target) return false;
+
+  const route = Array.isArray(answer?.route) ? answer.route.map(Number) : [];
+  const submittedDistance = Number(answer?.distance);
+  if (route.length !== SHORTEST_PATH_NODE_COUNT) return false;
+  if (!route.every((node) => Number.isInteger(node) && node >= 0 && node < SHORTEST_PATH_NODE_COUNT)) return false;
+  if (new Set(route).size !== SHORTEST_PATH_NODE_COUNT) return false;
+
+  const edgeMap = new Map(decoded.edges.map((edge) => [shortestPathPairKey(edge.a, edge.b), edge.distance]));
+  let total = 0;
+  for (let index = 0; index < route.length - 1; index += 1) {
+    const distance = edgeMap.get(shortestPathPairKey(route[index], route[index + 1]));
+    if (!Number.isInteger(distance)) return false;
+    total += distance;
+  }
+  // Bilerek son düğümden başlangıç düğümüne dönüş eklenmez: açık Hamilton yolu.
+  return Number.isInteger(submittedDistance) && submittedDistance === total && total === optimum;
 }
 
 const EQUATION_HUNT_MAX_LINEAR_SOLUTION = 20;
@@ -4643,6 +4935,11 @@ const GAME_HANDLERS = Object.freeze({
     key: "consecutive",
     createPuzzle: () => generateConsecutivePuzzle(),
     validateAnswer: (puzzle, answer) => validateConsecutiveChallengeAnswer(puzzle, answer),
+  }),
+  shortest_path: Object.freeze({
+    key: "shortest_path",
+    createPuzzle: () => generateShortestPathPuzzle(),
+    validateAnswer: (puzzle, answer) => validateShortestPathChallengeAnswer(puzzle, answer),
   }),
 });
 
