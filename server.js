@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "equation-hunt-v15-seven-families-20260821";
+const SERVER_BUILD_ID = "consecutive-grid-v1-20260822";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2064,6 +2064,20 @@ const GAME_DEFINITIONS = Object.freeze({
     botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
+  consecutive: Object.freeze({
+    key: "consecutive",
+    displayName: "ARDIŞIK",
+    // 15 taşlı 5x5 tahta için ortak rekabet süresi 5 dakika.
+    roundDurationMs: 5 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Ortak bot motoru; Toplam Eşittir ile aynı 4-5 dk kalibrasyon + oyuncu ortalamasının ±7 sn çevresi.
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
+    botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
 });
 
 function unsupportedGameError(value) {
@@ -2405,6 +2419,160 @@ function validateNextNumberChallengeAnswer(puzzle, answer = {}) {
   return Number.isInteger(submitted) && submitted === target;
 }
 
+
+
+const CONSECUTIVE_GRID_SIZE = 5;
+const CONSECUTIVE_CELL_COUNT = 25;
+const CONSECUTIVE_FIXED_COUNT = 10;
+const CONSECUTIVE_POOL_COUNT = 15;
+
+function consecutiveLineInfo(values) {
+  if (!Array.isArray(values) || values.length !== CONSECUTIVE_GRID_SIZE) return { valid: false, step: null };
+  const line = values.map(Number);
+  if (!line.every(Number.isInteger)) return { valid: false, step: null };
+  if (line[0] < 1 || line[0] >= 11) return { valid: false, step: null };
+  const step = line[1] - line[0];
+  if (!Number.isInteger(step) || step < 1 || step > 10) return { valid: false, step: null };
+  for (let index = 2; index < line.length; index += 1) {
+    if (line[index] - line[index - 1] !== step) return { valid: false, step: null };
+  }
+  return { valid: true, step };
+}
+
+function consecutiveGridSolved(gridRaw) {
+  if (!Array.isArray(gridRaw) || gridRaw.length !== CONSECUTIVE_CELL_COUNT) return false;
+  const grid = gridRaw.map(Number);
+  if (!grid.every((value) => Number.isInteger(value) && value > 0 && value <= 200)) return false;
+
+  const rowInfos = [];
+  const colInfos = [];
+  for (let row = 0; row < CONSECUTIVE_GRID_SIZE; row += 1) {
+    rowInfos.push(consecutiveLineInfo(grid.slice(row * CONSECUTIVE_GRID_SIZE, row * CONSECUTIVE_GRID_SIZE + CONSECUTIVE_GRID_SIZE)));
+  }
+  for (let col = 0; col < CONSECUTIVE_GRID_SIZE; col += 1) {
+    colInfos.push(consecutiveLineInfo(Array.from({ length: CONSECUTIVE_GRID_SIZE }, (_, row) => grid[row * CONSECUTIVE_GRID_SIZE + col])));
+  }
+  if (!rowInfos.every((item) => item.valid) || !colInfos.every((item) => item.valid)) return false;
+
+  // Her satırın kendi artış miktarı diğer satırlardan, her sütununki de diğer sütunlardan farklıdır.
+  if (new Set(rowInfos.map((item) => item.step)).size !== CONSECUTIVE_GRID_SIZE) return false;
+  if (new Set(colInfos.map((item) => item.step)).size !== CONSECUTIVE_GRID_SIZE) return false;
+  return true;
+}
+
+function consecutiveChooseInitialIndices() {
+  const first = shuffled([0, 1, 2, 3, 4]);
+  let second = null;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const candidate = shuffled([0, 1, 2, 3, 4]);
+    if (candidate.every((col, row) => col !== first[row])) {
+      second = candidate;
+      break;
+    }
+  }
+  if (!second) second = first.map((col) => (col + 1) % CONSECUTIVE_GRID_SIZE);
+
+  const selected = [];
+  for (let row = 0; row < CONSECUTIVE_GRID_SIZE; row += 1) {
+    selected.push(row * CONSECUTIVE_GRID_SIZE + first[row]);
+    selected.push(row * CONSECUTIVE_GRID_SIZE + second[row]);
+  }
+  return selected;
+}
+
+function generateConsecutivePuzzle() {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    // a(r,c) = start + verticalBase*r + horizontalBase*c + delta*r*c
+    // => satır adımı horizontalBase + delta*r, sütun adımı verticalBase + delta*c.
+    // Böylece her satır/sütun kendi içinde tam aritmetik dizi olur.
+    const delta = secureRandomInt(1, 3); // 1 veya 2
+    const horizontalBase = secureRandomInt(1, 3); // 1 veya 2
+    const verticalBase = secureRandomInt(1, 3);   // 1 veya 2
+    const maxStartByHorizontal = 10 - 4 * horizontalBase;
+    const maxStartByVertical = 10 - 4 * verticalBase;
+    const maxStart = Math.min(maxStartByHorizontal, maxStartByVertical, 6);
+    if (maxStart < 1) continue;
+    if (horizontalBase + 4 * delta > 10 || verticalBase + 4 * delta > 10) continue;
+    const start = secureRandomInt(1, maxStart + 1);
+
+    const solution = Array.from({ length: CONSECUTIVE_CELL_COUNT }, (_, index) => {
+      const row = Math.floor(index / CONSECUTIVE_GRID_SIZE);
+      const col = index % CONSECUTIVE_GRID_SIZE;
+      return start + verticalBase * row + horizontalBase * col + delta * row * col;
+    });
+    if (!consecutiveGridSolved(solution)) continue;
+
+    const fixedIndices = new Set(consecutiveChooseInitialIndices());
+    const initialGrid = solution.map((value, index) => fixedIndices.has(index) ? value : null);
+    const numbers = shuffled(solution.filter((_, index) => !fixedIndices.has(index)));
+    if (initialGrid.filter((value) => value !== null).length !== CONSECUTIVE_FIXED_COUNT) continue;
+    if (numbers.length !== CONSECUTIVE_POOL_COUNT) continue;
+
+    return {
+      gameKey: "consecutive",
+      difficulty: "Standard",
+      target: CONSECUTIVE_GRID_SIZE,
+      numbers: solution,
+      initialGrid,
+    };
+  }
+
+  const solution = Array.from({ length: CONSECUTIVE_CELL_COUNT }, (_, index) => {
+    const row = Math.floor(index / CONSECUTIVE_GRID_SIZE);
+    const col = index % CONSECUTIVE_GRID_SIZE;
+    return 1 + 2 * row + col + row * col;
+  });
+  const fallbackIndices = new Set([0, 1, 6, 7, 12, 13, 18, 19, 20, 24]);
+  return {
+    gameKey: "consecutive",
+    difficulty: "Standard",
+    target: CONSECUTIVE_GRID_SIZE,
+    numbers: solution,
+    initialGrid: solution.map((value, index) => fallbackIndices.has(index) ? value : null),
+  };
+}
+
+function isConsecutivePuzzleEncodingValid(puzzle) {
+  const target = Number(puzzle?.target);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (target !== CONSECUTIVE_GRID_SIZE || numbers.length !== CONSECUTIVE_CELL_COUNT || initialGrid.length !== CONSECUTIVE_CELL_COUNT) return false;
+  if (!numbers.every((value) => Number.isInteger(value) && value > 0 && value <= 200)) return false;
+  if (!consecutiveGridSolved(numbers)) return false;
+
+  let fixedCount = 0;
+  const rowCounts = Array(CONSECUTIVE_GRID_SIZE).fill(0);
+  const colCounts = Array(CONSECUTIVE_GRID_SIZE).fill(0);
+  for (let index = 0; index < initialGrid.length; index += 1) {
+    const raw = initialGrid[index];
+    if (raw === null || raw === undefined) continue;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value <= 0 || value > 200) return false;
+    if (value !== numbers[index]) return false;
+    fixedCount += 1;
+    rowCounts[Math.floor(index / CONSECUTIVE_GRID_SIZE)] += 1;
+    colCounts[index % CONSECUTIVE_GRID_SIZE] += 1;
+  }
+  if (fixedCount !== CONSECUTIVE_FIXED_COUNT) return false;
+  if (!rowCounts.every((count) => count >= 1 && count <= 3)) return false;
+  if (!colCounts.every((count) => count >= 1 && count <= 3)) return false;
+  return true;
+}
+
+function validateConsecutiveChallengeAnswer(puzzle, answer = {}) {
+  if (!isConsecutivePuzzleEncodingValid(puzzle)) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (grid.length !== CONSECUTIVE_CELL_COUNT || !grid.every(Number.isInteger)) return false;
+
+  const initialGrid = puzzle.initialGrid;
+  for (let index = 0; index < CONSECUTIVE_CELL_COUNT; index += 1) {
+    const fixed = initialGrid[index];
+    if (fixed !== null && fixed !== undefined && grid[index] !== Number(fixed)) return false;
+  }
+
+  if (!grid.every((value, index) => value === Number(puzzle.numbers[index]))) return false;
+  return consecutiveGridSolved(grid);
+}
 
 const EQUATION_HUNT_MAX_LINEAR_SOLUTION = 20;
 const EQUATION_HUNT_MAX_QUADRATIC_SOLUTION = 10;
@@ -4470,6 +4638,11 @@ const GAME_HANDLERS = Object.freeze({
     key: "equation_hunt",
     createPuzzle: () => generateEquationHuntPuzzle(),
     validateAnswer: (puzzle, answer) => validateEquationHuntChallengeAnswer(puzzle, answer),
+  }),
+  consecutive: Object.freeze({
+    key: "consecutive",
+    createPuzzle: () => generateConsecutivePuzzle(),
+    validateAnswer: (puzzle, answer) => validateConsecutiveChallengeAnswer(puzzle, answer),
   }),
 });
 
