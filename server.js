@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "shortest-path-v2-sibling-ops-20260823";
+const SERVER_BUILD_ID = "shortest-path-v1-20260823";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2064,6 +2064,21 @@ const GAME_DEFINITIONS = Object.freeze({
     botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
+  shortest_path: Object.freeze({
+    key: "shortest_path",
+    displayName: "EN KISA YOL",
+    // Beş şehirli rota oyunu ortak 2 dakikalık rekabet temposunu kullanır.
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Botun bitirme zamanı ortak Hedef Sayıyı Bul / Sonraki Sayı profiliyle aynıdır.
+    // Yalnızca bu oyuna özel %21 yanlış rota davranışı aşağıdaki ortak bot planına eklenir.
+    botFinishMinMs: 24 * 1000,
+    botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
   consecutive: Object.freeze({
     key: "consecutive",
     displayName: "ARDIŞIK",
@@ -2076,20 +2091,6 @@ const GAME_DEFINITIONS = Object.freeze({
     botCalibrationMinMs: 4 * 60 * 1000,
     botCalibrationMaxMs: 5 * 60 * 1000,
     botAverageVarianceMs: 7 * 1000,
-    infiniteDifficultyForStage: () => "Standard",
-  }),
-  shortest_path: Object.freeze({
-    key: "shortest_path",
-    displayName: "EN KISA YOL",
-    // Kullanıcının istediği gibi Hedef Sayıyı Bul ile birebir aynı iki dakikalık tempo.
-    roundDurationMs: 2 * 60 * 1000,
-    hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 24 * 1000,
-    botFinishMaxMs: 105 * 1000,
-    // İlk 5 bot oyunu 90-119 sn; 6. oyundan itibaren oyuncu ortalamasının ±4 sn çevresi.
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
 });
@@ -4272,39 +4273,38 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number
   return secureRandomInt(minimumFinishMs, maximumFinishMs + 1);
 }
 
-const BOT_WRONG_ANSWER_BPS = 2100; // Tüm oyunlardaki bot rakipler için tam %21.
-
 function createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile = {}) {
-  // Bu davranış oyuna özel değildir: bot kullanılan her oyunda bağımsız %21 olasılıkla
-  // bot kendi cevap anında yanlış cevap vermiş sayılır ve insan oyuncu maçı kazanır.
-  // Olay zamanı yine oyunun normal bot bitiriş profiline göre hesaplanır.
-  if (secureRandomInt(0, 10000) < BOT_WRONG_ANSWER_BPS) {
-    return {
-      finishMs: createTwoPlayerBotFinishMs(finishProfile, gameKey),
-      leaveMs: null,
-      wrongAnswer: true,
-    };
-  }
-
   const cannotFinishBps = difficulty === "Hard" ? 2530 : 1070;
   const roll = secureRandomInt(0, 10000);
   if (roll < 560) {
-    return { finishMs: null, leaveMs: secureRandomInt(0, 120) * 1000, wrongAnswer: false };
+    return { finishMs: null, leaveMs: secureRandomInt(0, 120) * 1000 };
   }
   if (roll < 560 + cannotFinishBps) {
-    return { finishMs: null, leaveMs: null, wrongAnswer: false };
+    return { finishMs: null, leaveMs: null };
   }
 
   return {
     finishMs: createTwoPlayerBotFinishMs(finishProfile, gameKey),
     leaveMs: null,
-    wrongAnswer: false,
   };
 }
 
 function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
   const config = gameDefinition(gameKey);
-  const plan = createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile);
+  const baseGameKey = normalizeBaseGameKey(gameKey);
+
+  // En Kısa Yol'a özel tek bot farkı: maç başında tam %21 olasılıkla bot,
+  // normal bitirme zamanında en kısa olmayan bir rota gönderir ve eli kaybeder.
+  // Kalan %79'da ayrılma / çözememe / kalibrasyon dahil ortak bot motoru aynen çalışır.
+  const wrongShortestPathRoute = baseGameKey === "shortest_path" && secureRandomInt(0, 10000) < 2100;
+  const plan = wrongShortestPathRoute
+    ? {
+        finishMs: createTwoPlayerBotFinishMs(finishProfile, gameKey),
+        leaveMs: null,
+        wrongRoute: true,
+      }
+    : createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile);
+
   if (plan.finishMs === null || plan.finishMs === undefined) return plan;
   const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 1) - 1_000);
   const gameMinMs = Math.max(BOT_MIN_FINISH_MS, Math.min(Number(config.botFinishMinMs || BOT_MIN_FINISH_MS), absoluteMaxMs));
@@ -4328,8 +4328,8 @@ function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
     return { resolvable: true, won: true, reason: "bot_left" };
   }
   if (finishMs !== null && elapsedMs >= finishMs) {
-    if (plan?.wrongAnswer === true) {
-      return { resolvable: true, won: true, reason: "bot_wrong_answer" };
+    if (plan?.wrongRoute === true) {
+      return { resolvable: true, won: true, reason: "bot_wrong_route" };
     }
     return { resolvable: true, won: false, reason: "bot_finished" };
   }
@@ -4614,224 +4614,6 @@ function validateEqualSumChallengeAnswer(puzzle, numberSlotsRaw) {
   return new Set(signatures).size === signatures.length;
 }
 
-const SHORTEST_PATH_ENCODING_VERSION = 2;
-const SHORTEST_PATH_BRANCH_EDGE_COUNT = 14;
-const SHORTEST_PATH_EDGE_COUNT = 22;
-const SHORTEST_PATH_COUNT = 8;
-
-// İlk üç dallanma katmanındaki işlem deseni. Her kardeş dal çifti farklı işlem taşır.
-// 4. işlem, 1-8 numaralı uçtan B'ye gider ve o rotada eksik kalan işlem türünü tamamlar.
-const SHORTEST_PATH_BRANCH_OPERATOR_PATTERN = Object.freeze([
-  0, 1,       // A -> 2 dal: + / -
-  2, 1,       // üst dal -> 2 dal: × / -
-  0, 2,       // alt dal -> 2 dal: + / ×
-  1, 0,       // 1. ara düğüm -> 2 dal: - / +
-  2, 0,       // 2. ara düğüm -> 2 dal: × / +
-  2, 1,       // 3. ara düğüm -> 2 dal: × / -
-  0, 1,       // 4. ara düğüm -> 2 dal: + / -
-]);
-
-const SHORTEST_PATH_SIBLING_EDGE_PAIRS = Object.freeze([
-  [0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11], [12, 13],
-]);
-
-function shortestPathApply(value, operatorCode, operand) {
-  if (!Number.isInteger(value) || !Number.isInteger(operand)) return null;
-  if (operatorCode === 0) return value + operand;
-  if (operatorCode === 1) return value - operand;
-  if (operatorCode === 2) return value * operand;
-  return null;
-}
-
-function shortestPathBranchEdgeIndices(pathIndex) {
-  if (!Number.isInteger(pathIndex) || pathIndex < 0 || pathIndex >= SHORTEST_PATH_COUNT) return null;
-  const first = (pathIndex >> 2) & 1;
-  const second = (pathIndex >> 1) & 1;
-  const third = pathIndex & 1;
-  return [
-    first,
-    2 + first * 2 + second,
-    6 + first * 4 + second * 2 + third,
-  ];
-}
-
-function shortestPathEdgeIndices(pathIndex) {
-  const branchIndices = shortestPathBranchEdgeIndices(pathIndex);
-  if (!branchIndices) return null;
-  return [...branchIndices, SHORTEST_PATH_BRANCH_EDGE_COUNT + pathIndex];
-}
-
-function decodeShortestPathEncoding(numbersRaw) {
-  const numbers = Array.isArray(numbersRaw) ? numbersRaw.map(Number) : [];
-  if (numbers.length !== 2 + SHORTEST_PATH_EDGE_COUNT * 2) return null;
-  if (numbers[0] !== SHORTEST_PATH_ENCODING_VERSION) return null;
-  const startValue = Number(numbers[1]);
-  if (!Number.isInteger(startValue) || startValue < 12 || startValue > 30) return null;
-
-  const edges = [];
-  for (let edgeIndex = 0; edgeIndex < SHORTEST_PATH_EDGE_COUNT; edgeIndex += 1) {
-    const operatorCode = Number(numbers[2 + edgeIndex * 2]);
-    const operand = Number(numbers[3 + edgeIndex * 2]);
-    if (!Number.isInteger(operatorCode) || operatorCode < 0 || operatorCode > 2) return null;
-    if (!Number.isInteger(operand) || operand < 1 || operand > 30) return null;
-    edges.push({ operatorCode, operand });
-  }
-  return { startValue, edges };
-}
-
-function shortestPathResultForPath(decoded, pathIndex) {
-  const edgeIndices = shortestPathEdgeIndices(pathIndex);
-  if (!decoded || !edgeIndices) return null;
-  let value = decoded.startValue;
-  for (const edgeIndex of edgeIndices) {
-    const edge = decoded.edges[edgeIndex];
-    value = shortestPathApply(value, edge.operatorCode, edge.operand);
-    if (!Number.isInteger(value)) return null;
-  }
-  return value;
-}
-
-function shortestPathResults(decoded) {
-  if (!decoded) return [];
-  return Array.from({ length: SHORTEST_PATH_COUNT }, (_, pathIndex) =>
-    shortestPathResultForPath(decoded, pathIndex)
-  );
-}
-
-function shortestPathSiblingOperatorsAreDistinct(decoded) {
-  if (!decoded || decoded.edges.length < SHORTEST_PATH_BRANCH_EDGE_COUNT) return false;
-  return SHORTEST_PATH_SIBLING_EDGE_PAIRS.every(([leftIndex, rightIndex]) =>
-    decoded.edges[leftIndex].operatorCode !== decoded.edges[rightIndex].operatorCode
-  );
-}
-
-function isShortestPathPuzzleShapeValid(puzzle) {
-  const decoded = decodeShortestPathEncoding(puzzle?.numbers);
-  if (!decoded) return false;
-  if (!shortestPathSiblingOperatorsAreDistinct(decoded)) return false;
-
-  const results = shortestPathResults(decoded);
-  if (results.length !== SHORTEST_PATH_COUNT || results.some((value) => !Number.isInteger(value) || value < 150 || value > 200)) {
-    return false;
-  }
-
-  for (let pathIndex = 0; pathIndex < SHORTEST_PATH_COUNT; pathIndex += 1) {
-    const edgeIndices = shortestPathEdgeIndices(pathIndex);
-    const operations = new Set(edgeIndices.map((edgeIndex) => decoded.edges[edgeIndex].operatorCode));
-    if (operations.size !== 3 || !operations.has(0) || !operations.has(1) || !operations.has(2)) return false;
-  }
-
-  const minimum = Math.min(...results);
-  if (results.filter((value) => value === minimum).length !== 1) return false;
-  return Number(puzzle?.target) === minimum;
-}
-
-function shortestPathFinalCandidates(value, usedOperatorCodes) {
-  if (!Number.isInteger(value) || value <= 0) return [];
-  const used = new Set(usedOperatorCodes);
-  const missing = [0, 1, 2].filter((operatorCode) => !used.has(operatorCode));
-  const allowedOperators = missing.length > 0 ? missing : [0, 1, 2];
-  const candidates = [];
-
-  for (const operatorCode of allowedOperators) {
-    const minOperand = operatorCode === 2 ? 2 : 1;
-    for (let operand = minOperand; operand <= 30; operand += 1) {
-      const result = shortestPathApply(value, operatorCode, operand);
-      if (Number.isInteger(result) && result >= 150 && result <= 200) {
-        candidates.push({ operatorCode, operand, result });
-      }
-    }
-  }
-  return candidates;
-}
-
-function generateShortestPathPuzzle() {
-  // 3 dallanma + uçtan B'ye 1 tamamlama işlemi vardır. Böylece:
-  // 1) her ayrım noktasındaki iki kardeş dalın işlemi farklıdır,
-  // 2) 8 rotanın her birinde +, -, × işlemlerinin tamamı bulunur,
-  // 3) bütün sonuçlar 150-200 aralığındadır ve minimum rota tektir.
-  for (let attempt = 0; attempt < 4_000; attempt += 1) {
-    const startValue = secureRandomInt(12, 31);
-    const branchEdges = SHORTEST_PATH_BRANCH_OPERATOR_PATTERN.map((operatorCode) => {
-      const operand = operatorCode === 0
-        ? secureRandomInt(1, 19)
-        : operatorCode === 1
-          ? secureRandomInt(1, 13)
-          : secureRandomInt(2, 8);
-      return { operatorCode, operand };
-    });
-
-    const finalCandidatesByPath = [];
-    let branchStateValid = true;
-    for (let pathIndex = 0; pathIndex < SHORTEST_PATH_COUNT; pathIndex += 1) {
-      const branchIndices = shortestPathBranchEdgeIndices(pathIndex);
-      let value = startValue;
-      const usedOperators = [];
-      for (const edgeIndex of branchIndices) {
-        const edge = branchEdges[edgeIndex];
-        value = shortestPathApply(value, edge.operatorCode, edge.operand);
-        usedOperators.push(edge.operatorCode);
-        if (!Number.isInteger(value) || value <= 0 || value > 500) {
-          branchStateValid = false;
-          break;
-        }
-      }
-      if (!branchStateValid) break;
-      const candidates = shortestPathFinalCandidates(value, usedOperators);
-      if (candidates.length === 0) {
-        branchStateValid = false;
-        break;
-      }
-      finalCandidatesByPath.push(candidates);
-    }
-    if (!branchStateValid || finalCandidatesByPath.length !== SHORTEST_PATH_COUNT) continue;
-
-    for (let finalAttempt = 0; finalAttempt < 30; finalAttempt += 1) {
-      const finalEdges = finalCandidatesByPath.map((candidates) =>
-        candidates[secureRandomInt(0, candidates.length)]
-      );
-      const edges = [...branchEdges, ...finalEdges];
-      const numbers = [SHORTEST_PATH_ENCODING_VERSION, startValue];
-      edges.forEach(({ operatorCode, operand }) => numbers.push(operatorCode, operand));
-
-      const decoded = decodeShortestPathEncoding(numbers);
-      const results = shortestPathResults(decoded);
-      if (results.length !== SHORTEST_PATH_COUNT) continue;
-      const minimum = Math.min(...results);
-      if (results.filter((value) => value === minimum).length !== 1) continue;
-
-      const puzzle = {
-        difficulty: "Standard",
-        target: minimum,
-        numbers,
-        gameKey: "shortest_path",
-        initialGrid: [],
-      };
-      if (isShortestPathPuzzleShapeValid(puzzle)) return puzzle;
-    }
-  }
-
-  // Önceden doğrulanmış v2 örneği. Her kardeş dal farklı işlem taşır; her tam rota +,-,× içerir.
-  const fallbackNumbers = [
-    2, 29,
-    0, 11, 1, 8,
-    2, 5, 1, 5, 0, 15, 2, 6,
-    1, 2, 0, 8, 2, 6, 0, 17, 2, 5, 1, 3, 0, 17, 1, 5,
-    1, 27, 1, 30, 1, 19, 2, 3, 0, 16, 2, 5, 0, 21, 0, 29,
-  ];
-  return { difficulty: "Standard", target: 150, numbers: fallbackNumbers, gameKey: "shortest_path", initialGrid: [] };
-}
-
-function validateShortestPathChallengeAnswer(puzzle, answer = {}) {
-  if (!isShortestPathPuzzleShapeValid(puzzle)) return false;
-  const pathIndex = Number(answer?.pathIndex);
-  if (!Number.isInteger(pathIndex) || pathIndex < 0 || pathIndex >= SHORTEST_PATH_COUNT) return false;
-  const decoded = decodeShortestPathEncoding(puzzle.numbers);
-  const results = shortestPathResults(decoded);
-  const minimum = Math.min(...results);
-  return results[pathIndex] === minimum && results.filter((value) => value === minimum).length === 1;
-}
-
 function normalizeGameAnswer(numberSlotsRaw, operatorsRaw, answerRaw) {
   const answer = answerRaw && typeof answerRaw === "object" && !Array.isArray(answerRaw)
     ? { ...answerRaw }
@@ -4855,6 +4637,132 @@ function validateTargetNumberChallengeAnswer(puzzle, answer = {}) {
   const orderedNumbers = numberSlots.map((index) => numbers[index]);
   const result = evaluateExpression(orderedNumbers, operators);
   return result !== null && Math.abs(result - Number(puzzle.target)) < 0.0001;
+}
+
+const SHORTEST_PATH_EDGE_PAIRS = Object.freeze([
+  [0, 1], [0, 2], [0, 3], [0, 4],
+  [1, 2], [1, 3], [1, 4],
+  [2, 3], [2, 4],
+  [3, 4],
+]);
+
+const SHORTEST_PATH_ROUTE_ORDERS = Object.freeze((() => {
+  const values = [1, 2, 3, 4];
+  const routes = [];
+  for (const a of values) for (const b of values) for (const c of values) for (const d of values) {
+    const route = [a, b, c, d];
+    if (new Set(route).size === 4) routes.push(Object.freeze(route));
+  }
+  return routes;
+})());
+
+function shortestPathEdgeIndex(aValue, bValue) {
+  const a = Math.min(Number(aValue), Number(bValue));
+  const b = Math.max(Number(aValue), Number(bValue));
+  return SHORTEST_PATH_EDGE_PAIRS.findIndex(([left, right]) => left === a && right === b);
+}
+
+function shortestPathDistance(numbers, a, b) {
+  const index = shortestPathEdgeIndex(a, b);
+  if (index < 0 || index >= numbers.length) return null;
+  const value = Number(numbers[index]);
+  return Number.isInteger(value) ? value : null;
+}
+
+function shortestPathRouteTotal(numbersRaw, routeOrderRaw) {
+  const numbers = Array.isArray(numbersRaw) ? numbersRaw.map(Number) : [];
+  const routeOrder = Array.isArray(routeOrderRaw) ? routeOrderRaw.map(Number) : [];
+  if (numbers.length !== 10 || routeOrder.length !== 4 || new Set(routeOrder).size !== 4) return null;
+  if (!routeOrder.every((value) => Number.isInteger(value) && value >= 1 && value <= 4)) return null;
+  const fullRoute = [0, ...routeOrder, 0];
+  let total = 0;
+  for (let i = 0; i < fullRoute.length - 1; i += 1) {
+    const distance = shortestPathDistance(numbers, fullRoute[i], fullRoute[i + 1]);
+    if (distance === null) return null;
+    total += distance;
+  }
+  return total;
+}
+
+function shortestPathWinningRoutes(numbers) {
+  const totals = SHORTEST_PATH_ROUTE_ORDERS.map((route) => ({ route, total: shortestPathRouteTotal(numbers, route) }));
+  const minimum = Math.min(...totals.map((item) => item.total ?? Number.MAX_SAFE_INTEGER));
+  return {
+    minimum,
+    routes: totals.filter((item) => item.total === minimum).map((item) => item.route),
+  };
+}
+
+function isShortestPathPuzzleEncodingValid(puzzle) {
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (numbers.length !== 10) return false;
+  if (!numbers.every((value) => Number.isInteger(value) && value >= 5 && value <= 25)) return false;
+  if (new Set(numbers).size !== 10) return false;
+  const winning = shortestPathWinningRoutes(numbers);
+  if (!Number.isInteger(winning.minimum) || Number(puzzle?.target) !== winning.minimum) return false;
+  // Ters yönde dolaşmak aynı çevrimi verir; bu yüzden tek bir geometrik en kısa rota
+  // tam olarak iki yönlü permütasyon olarak görünmelidir.
+  if (winning.routes.length !== 2) return false;
+  const first = winning.routes[0];
+  const second = winning.routes[1];
+  return first.every((value, index) => value === second[second.length - 1 - index]);
+}
+
+function generateShortestPathPuzzle() {
+  const candidates = Array.from({ length: 21 }, (_, index) => index + 5);
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const shuffled = [...candidates];
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = secureRandomInt(0, i + 1);
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const numbers = shuffled.slice(0, 10);
+    const winning = shortestPathWinningRoutes(numbers);
+    if (winning.routes.length !== 2) continue;
+    const first = winning.routes[0];
+    const second = winning.routes[1];
+    const reversePair = first.every((value, index) => value === second[second.length - 1 - index]);
+    if (!reversePair) continue;
+    return {
+      difficulty: "Standard",
+      target: winning.minimum,
+      numbers,
+      gameKey: "shortest_path",
+      initialGrid: [],
+    };
+  }
+  // Kriptografik rastgele üretimde bu kola pratikte düşülmez. Yine de servis hiçbir zaman
+  // geçersiz bulmaca döndürmesin diye önceden doğrulanmış deterministik bir dağılım tutulur.
+  const fallbackNumbers = [6, 21, 17, 12, 9, 25, 14, 7, 19, 11];
+  const winning = shortestPathWinningRoutes(fallbackNumbers);
+  if (winning.routes.length !== 2) throw new Error("En Kısa Yol bulmacası üretilemedi.");
+  return {
+    difficulty: "Standard",
+    target: winning.minimum,
+    numbers: fallbackNumbers,
+    gameKey: "shortest_path",
+    initialGrid: [],
+  };
+}
+
+function normalizeShortestPathRoute(answer = {}) {
+  if (!Array.isArray(answer.route)) return null;
+  const raw = answer.route.map(Number);
+  const route = raw.length === 6 && raw[0] === 0 && raw[5] === 0 ? raw.slice(1, 5) : raw;
+  if (route.length !== 4 || new Set(route).size !== 4) return null;
+  if (!route.every((value) => Number.isInteger(value) && value >= 1 && value <= 4)) return null;
+  return route;
+}
+
+function validateShortestPathChallengeAnswer(puzzle, answer = {}) {
+  if (!isShortestPathPuzzleEncodingValid(puzzle)) return false;
+  return normalizeShortestPathRoute(answer) !== null;
+}
+
+function shortestPathAnswerIsWinning(puzzle, answer = {}) {
+  const route = normalizeShortestPathRoute(answer);
+  if (route === null || !isShortestPathPuzzleEncodingValid(puzzle)) return false;
+  return shortestPathRouteTotal(puzzle.numbers, route) === Number(puzzle.target);
 }
 
 const GAME_HANDLERS = Object.freeze({
@@ -4888,15 +4796,18 @@ const GAME_HANDLERS = Object.freeze({
     createPuzzle: () => generateEquationHuntPuzzle(),
     validateAnswer: (puzzle, answer) => validateEquationHuntChallengeAnswer(puzzle, answer),
   }),
+  shortest_path: Object.freeze({
+    key: "shortest_path",
+    createPuzzle: () => generateShortestPathPuzzle(),
+    // Yanlış rota da biçimsel olarak geçerli bir "gönderim"dir; kazanıp kazanmadığı
+    // challengeAnswerIsWinning ile ayrıca hesaplanır ve kayıp olarak işlenir.
+    validateAnswer: (puzzle, answer) => validateShortestPathChallengeAnswer(puzzle, answer),
+    isWinningAnswer: (puzzle, answer) => shortestPathAnswerIsWinning(puzzle, answer),
+  }),
   consecutive: Object.freeze({
     key: "consecutive",
     createPuzzle: () => generateConsecutivePuzzle(),
     validateAnswer: (puzzle, answer) => validateConsecutiveChallengeAnswer(puzzle, answer),
-  }),
-  shortest_path: Object.freeze({
-    key: "shortest_path",
-    createPuzzle: () => generateShortestPathPuzzle(),
-    validateAnswer: (puzzle, answer) => validateShortestPathChallengeAnswer(puzzle, answer),
   }),
 });
 
@@ -4910,6 +4821,15 @@ function gameHandler(value) {
 function validateChallengeAnswer(puzzle, numberSlotsRaw, operatorsRaw, answerRaw) {
   const answer = normalizeGameAnswer(numberSlotsRaw, operatorsRaw, answerRaw);
   return gameHandler(puzzle?.gameKey).validateAnswer(puzzle, answer);
+}
+
+function challengeAnswerIsWinning(puzzle, numberSlotsRaw, operatorsRaw, answerRaw) {
+  const answer = normalizeGameAnswer(numberSlotsRaw, operatorsRaw, answerRaw);
+  const handler = gameHandler(puzzle?.gameKey);
+  if (!handler.validateAnswer(puzzle, answer)) return false;
+  return typeof handler.isWinningAnswer === "function"
+    ? handler.isWinningAnswer(puzzle, answer) === true
+    : true;
 }
 
 async function ensureAuthenticatedPlayer(client, playerId) {
@@ -5464,7 +5384,10 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
       playerId: realWinner.playerId,
       generalDelta: reward,
       xpDelta: winnerXp,
-      finishSampleMs: safeTwoPlayerFinishSampleMs(realWinner.totalElapsedMs, room.roundCount, room.gameKey),
+      finishSampleMs: normalizeBaseGameKey(room.gameKey) === "shortest_path" &&
+        realWinner.wonRoundBecauseOpponentWrongAnswer === true
+        ? null
+        : safeTwoPlayerFinishSampleMs(realWinner.totalElapsedMs, room.roundCount, room.gameKey),
     });
   }
   if (realLoser) {
@@ -6318,105 +6241,6 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
   }
 });
 
-async function settleShortestPathWrongChallengeInTransaction(client, challenge, playerId, gameKey, challengeId, elapsedServerMs) {
-  if (challenge.mode === "hundred") {
-    const hundredResult = await forfeitHundredRunInTransaction(client, playerId, gameKey);
-    return {
-      ok: true,
-      gameKey,
-      ...hundredResult,
-      runScore: Number(hundredResult.runScore || 0),
-      won: false,
-      outcomeReason: "wrong_path",
-      elapsedServerMs,
-    };
-  }
-
-  if (challenge.mode === "tournament_bot") {
-    const tournamentResult = await applyTournamentOutcomeInTransaction(
-      client, playerId, false, Number(challenge.stage), gameKey
-    );
-    await recordTaskEventInTransaction(client, {
-      playerId,
-      sourceKey: `challenge:${challengeId}`,
-      eventType: "game",
-      gameKey,
-      multiplayer: true,
-      won: false,
-    });
-    return {
-      ok: true,
-      gameKey,
-      ...tournamentResult,
-      runScore: Number(tournamentResult.runScore || 0),
-      won: false,
-      outcomeReason: "wrong_path",
-      elapsedServerMs,
-    };
-  }
-
-  if (challenge.mode === "two_player_bot") {
-    const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
-    // Yanlış cevap, oyuncunun doğru çözüm süresi olmadığı için bitiriş ortalamasına eklenmez.
-    const state = await applyTwoPlayerBotRewardsInTransaction(client, playerId, rewards, { gameKey });
-    await recordTaskEventInTransaction(client, {
-      playerId,
-      sourceKey: `challenge:${challengeId}`,
-      eventType: "game",
-      gameKey,
-      multiplayer: true,
-      won: false,
-    });
-    return {
-      ok: true,
-      gameKey,
-      ...state,
-      generalDelta: Number(rewards.generalDelta || 0),
-      infiniteDelta: 0,
-      xpDelta: 0,
-      runScore: Number(state.runScore || 0),
-      won: false,
-      outcomeReason: "wrong_path",
-      elapsedServerMs,
-    };
-  }
-
-  if (challenge.mode === "infinite") {
-    await ensurePlayerGameProgress(client, playerId, gameKey);
-    await client.query(
-      `UPDATE player_game_progress
-       SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
-       WHERE player_id = $1 AND game_key = $2`,
-      [playerId, gameKey]
-    );
-    const state = await readAuthoritativePlayerState(client, playerId, gameKey);
-    await recordTaskEventInTransaction(client, {
-      playerId,
-      sourceKey: `challenge:${challengeId}`,
-      eventType: "game",
-      gameKey,
-      multiplayer: false,
-      won: false,
-    });
-    return {
-      ok: true,
-      gameKey,
-      ...state,
-      generalDelta: 0,
-      infiniteDelta: 0,
-      xpDelta: 0,
-      runScore: 0,
-      won: false,
-      outcomeReason: "wrong_path",
-      elapsedServerMs,
-    };
-  }
-
-  const error = new Error("Bu oyun modu yanlış yol sonucu için desteklenmiyor.");
-  error.statusCode = 409;
-  throw error;
-}
-
 app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const challengeId = safeText(req.body.challengeId, "", 128);
@@ -6461,59 +6285,46 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       error.publicCode = "HUNDRED_STAGE_EXPIRED";
       throw error;
     }
-    const answerValid = validateChallengeAnswer(
-      challenge.puzzle,
-      req.body.numberSlots,
-      req.body.operators,
-      req.body.answer
-    );
-    if (!answerValid) {
-      const submittedPathIndex = Number(req.body?.answer?.pathIndex);
-      const isWellFormedShortestPathSubmission =
-        gameKey === "shortest_path" &&
-        isShortestPathPuzzleShapeValid(challenge.puzzle) &&
-        Number.isInteger(submittedPathIndex) &&
-        submittedPathIndex >= 0 && submittedPathIndex < SHORTEST_PATH_COUNT;
-
-      // En Kısa Yol'un temel kuralı: geçerli biçimde gönderilmiş ama minimum olmayan yol
-      // doğrulama hatası değil, kesin oyun mağlubiyetidir.
-      if (isWellFormedShortestPathSubmission) {
-        const response = await settleShortestPathWrongChallengeInTransaction(
-          client, challenge, req.auth.sub, gameKey, challengeId, elapsedServerMs
-        );
-        await client.query(
-          `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
-          [challengeId, JSON.stringify(compactChallengeResult(response))]
-        );
-        await client.query("COMMIT");
-        res.json(response);
-        return;
-      }
-
+    if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer)) {
       const error = new Error("Oyun sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
     }
+    const answerWon = challengeAnswerIsWinning(
+      challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer
+    );
 
     let won = null;
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.stage);
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
-      const outcome = botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true);
+      const outcome = answerWon
+        ? botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true)
+        : { resolvable: true, won: false, reason: "wrong_route" };
       won = outcome.won;
       outcomeReason = outcome.reason;
       rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
     }
 
     if (challenge.mode === "hundred") {
-      const hundredResult = await completeHundredStageInTransaction(client, req.auth.sub, Number(challenge.stage), gameKey);
-      await recordTaskEventInTransaction(client, {
-        playerId: req.auth.sub,
-        sourceKey: `challenge:${challengeId}`,
-        eventType: "game",
-        gameKey,
-        multiplayer: true,
-        won: true,
-      });
-      const response = { ok: true, gameKey, ...hundredResult, runScore: hundredResult.runScore || 0, elapsedServerMs };
+      const hundredResult = answerWon
+        ? await completeHundredStageInTransaction(client, req.auth.sub, Number(challenge.stage), gameKey)
+        : await forfeitHundredRunInTransaction(client, req.auth.sub, gameKey);
+      if (answerWon) {
+        await recordTaskEventInTransaction(client, {
+          playerId: req.auth.sub,
+          sourceKey: `challenge:${challengeId}`,
+          eventType: "game",
+          gameKey,
+          multiplayer: true,
+          won: true,
+        });
+      }
+      const response = {
+        ok: true, gameKey, ...hundredResult,
+        runScore: hundredResult.runScore || 0,
+        won: answerWon ? hundredResult.won : false,
+        outcomeReason: answerWon ? null : "wrong_route",
+        elapsedServerMs,
+      };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
         [challengeId, JSON.stringify(compactChallengeResult(response))]
@@ -6551,6 +6362,36 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
 
     let infiniteRunScore = 0;
     let state;
+    if (challenge.mode === "infinite" && !answerWon) {
+      await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
+      await client.query(
+        `UPDATE player_game_progress
+         SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
+         WHERE player_id = $1 AND game_key = $2`,
+        [req.auth.sub, gameKey]
+      );
+      state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
+      await recordTaskEventInTransaction(client, {
+        playerId: req.auth.sub,
+        sourceKey: `challenge:${challengeId}`,
+        eventType: "game",
+        gameKey,
+        multiplayer: false,
+        won: false,
+      });
+      const response = {
+        ok: true, gameKey, ...state,
+        generalDelta: 0, infiniteDelta: 0, xpDelta: 0,
+        runScore: 0, won: false, outcomeReason: "wrong_route", elapsedServerMs,
+      };
+      await client.query(
+        `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
+        [challengeId, JSON.stringify(compactChallengeResult(response))]
+      );
+      await client.query("COMMIT");
+      res.json(response);
+      return;
+    }
     if (challenge.mode === "infinite") {
       await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
       const progressBefore = await client.query(
@@ -6598,7 +6439,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         client,
         req.auth.sub,
         rewards,
-        { finishElapsedMs: elapsedServerMs, gameKey }
+        { finishElapsedMs: answerWon ? elapsedServerMs : null, gameKey }
       );
       await recordTaskEventInTransaction(client, {
         playerId: req.auth.sub,
@@ -7939,14 +7780,11 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
       ? Math.max(1, roundLimitMs - 1)
       : Math.min(botPlan.finishMs, Math.max(1, roundLimitMs - 1));
     room.botFinishHandle = setTimeout(() => {
-      if (botPlan.wrongAnswer === true) {
-        const humanParticipant = roomParticipants(room).find((participant) => !participant.isBot);
-        if (humanParticipant) {
-          finishRealtimeMatch(room, humanParticipant, "bot_wrong_answer");
-          return;
-        }
+      if (botPlan.wrongRoute === true) {
+        registerRealtimeRoundLoss(room, botParticipant, botElapsedMs, "bot_wrong_route");
+      } else {
+        registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
       }
-      registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
     }, safePrepareMs + botElapsedMs);
     if (typeof room.botFinishHandle.unref === "function") room.botFinishHandle.unref();
   }
@@ -7983,6 +7821,36 @@ function registerRealtimeRoundFinish(room, participant, elapsedMs) {
     unfinishedOpponent.roundElapsedMs = gameDefinition(room.gameKey).roundDurationMs;
     unfinishedOpponent.finishedRoundIndex = room.roundIndex;
   }
+  resolveRealtimeRound(room);
+}
+
+function registerRealtimeRoundLoss(room, loser, elapsedMs, reason = "wrong_answer") {
+  if (!room || !loser || room.resolved) return;
+  if (loser.finishedRoundIndex === room.roundIndex) return;
+
+  const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
+  const safeElapsedMs = Math.max(1, Math.min(Number(elapsedMs || 1), roundLimitMs));
+  const winner = getOpponentParticipant(room, loser.playerId);
+  if (!winner) return;
+
+  // Yanlış cevap/rota gönderen oyuncu eli o anda kaybeder. Beraberlik bozucu toplam süre
+  // deterministik kalsın diye kaybedene tur limiti, kazanana olay anındaki gerçek süre yazılır.
+  loser.finishedAt = Date.now();
+  loser.elapsedMs = roundLimitMs;
+  loser.roundElapsedMs = roundLimitMs;
+  loser.finishedRoundIndex = room.roundIndex;
+  clearParticipantAwayState(room, loser.playerId);
+
+  winner.wonRoundBecauseOpponentWrongAnswer = true;
+  if (winner.finishedRoundIndex !== room.roundIndex) {
+    winner.finishedAt = Date.now();
+    winner.elapsedMs = safeElapsedMs;
+    winner.roundElapsedMs = safeElapsedMs;
+    winner.finishedRoundIndex = room.roundIndex;
+    clearParticipantAwayState(room, winner.playerId);
+  }
+
+  realtimeLog("realtime round loss:", room.roomId, loser.playerId, reason);
   resolveRealtimeRound(room);
 }
 
@@ -9781,28 +9649,17 @@ io.on("connection", (socket) => {
         socket.emit("match_error", { code: "MATCH_NOT_STARTED", message: "Hazırlık geri sayımı henüz tamamlanmadı." });
         return;
       }
-      const answerValid = validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators, payload.answer);
-      if (!answerValid) {
-        const gameKey = normalizeBaseGameKey(room.gameKey || room.puzzle?.gameKey);
-        const submittedPathIndex = Number(payload?.answer?.pathIndex);
-        const isWellFormedShortestPathSubmission =
-          gameKey === "shortest_path" &&
-          isShortestPathPuzzleShapeValid(room.puzzle) &&
-          Number.isInteger(submittedPathIndex) &&
-          submittedPathIndex >= 0 && submittedPathIndex < SHORTEST_PATH_COUNT;
-
-        if (isWellFormedShortestPathSubmission) {
-          const opponent = getOpponentParticipant(room, participant.playerId);
-          if (opponent) finishRealtimeMatch(room, opponent, "wrong_path");
-          return;
-        }
-
-        socket.emit("match_error", { code: "INVALID_SOLUTION", message: "Gönderilen işlem sunucuda doğrulanamadı." });
+      if (!validateChallengeAnswer(room.puzzle, payload.numberSlots, payload.operators, payload.answer)) {
+        socket.emit("match_error", { code: "INVALID_SOLUTION", message: "Gönderilen cevap sunucuda doğrulanamadı." });
         return;
       }
 
       const elapsedMs = Math.max(1, Date.now() - Number(room.startsAtMillis || room.createdAt));
-      registerRealtimeRoundFinish(room, participant, elapsedMs);
+      if (challengeAnswerIsWinning(room.puzzle, payload.numberSlots, payload.operators, payload.answer)) {
+        registerRealtimeRoundFinish(room, participant, elapsedMs);
+      } else {
+        registerRealtimeRoundLoss(room, participant, elapsedMs, "wrong_route");
+      }
     }
   );
 
