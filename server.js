@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "shortest-path-v1-20260823";
+const SERVER_BUILD_ID = "shortest-path-v2-sibling-ops-20260823";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -4614,9 +4614,26 @@ function validateEqualSumChallengeAnswer(puzzle, numberSlotsRaw) {
   return new Set(signatures).size === signatures.length;
 }
 
-const SHORTEST_PATH_ENCODING_VERSION = 1;
-const SHORTEST_PATH_EDGE_COUNT = 14;
+const SHORTEST_PATH_ENCODING_VERSION = 2;
+const SHORTEST_PATH_BRANCH_EDGE_COUNT = 14;
+const SHORTEST_PATH_EDGE_COUNT = 22;
 const SHORTEST_PATH_COUNT = 8;
+
+// İlk üç dallanma katmanındaki işlem deseni. Her kardeş dal çifti farklı işlem taşır.
+// 4. işlem, 1-8 numaralı uçtan B'ye gider ve o rotada eksik kalan işlem türünü tamamlar.
+const SHORTEST_PATH_BRANCH_OPERATOR_PATTERN = Object.freeze([
+  0, 1,       // A -> 2 dal: + / -
+  2, 1,       // üst dal -> 2 dal: × / -
+  0, 2,       // alt dal -> 2 dal: + / ×
+  1, 0,       // 1. ara düğüm -> 2 dal: - / +
+  2, 0,       // 2. ara düğüm -> 2 dal: × / +
+  2, 1,       // 3. ara düğüm -> 2 dal: × / -
+  0, 1,       // 4. ara düğüm -> 2 dal: + / -
+]);
+
+const SHORTEST_PATH_SIBLING_EDGE_PAIRS = Object.freeze([
+  [0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11], [12, 13],
+]);
 
 function shortestPathApply(value, operatorCode, operand) {
   if (!Number.isInteger(value) || !Number.isInteger(operand)) return null;
@@ -4626,7 +4643,7 @@ function shortestPathApply(value, operatorCode, operand) {
   return null;
 }
 
-function shortestPathEdgeIndices(pathIndex) {
+function shortestPathBranchEdgeIndices(pathIndex) {
   if (!Number.isInteger(pathIndex) || pathIndex < 0 || pathIndex >= SHORTEST_PATH_COUNT) return null;
   const first = (pathIndex >> 2) & 1;
   const second = (pathIndex >> 1) & 1;
@@ -4636,6 +4653,12 @@ function shortestPathEdgeIndices(pathIndex) {
     2 + first * 2 + second,
     6 + first * 4 + second * 2 + third,
   ];
+}
+
+function shortestPathEdgeIndices(pathIndex) {
+  const branchIndices = shortestPathBranchEdgeIndices(pathIndex);
+  if (!branchIndices) return null;
+  return [...branchIndices, SHORTEST_PATH_BRANCH_EDGE_COUNT + pathIndex];
 }
 
 function decodeShortestPathEncoding(numbersRaw) {
@@ -4675,9 +4698,18 @@ function shortestPathResults(decoded) {
   );
 }
 
+function shortestPathSiblingOperatorsAreDistinct(decoded) {
+  if (!decoded || decoded.edges.length < SHORTEST_PATH_BRANCH_EDGE_COUNT) return false;
+  return SHORTEST_PATH_SIBLING_EDGE_PAIRS.every(([leftIndex, rightIndex]) =>
+    decoded.edges[leftIndex].operatorCode !== decoded.edges[rightIndex].operatorCode
+  );
+}
+
 function isShortestPathPuzzleShapeValid(puzzle) {
   const decoded = decodeShortestPathEncoding(puzzle?.numbers);
   if (!decoded) return false;
+  if (!shortestPathSiblingOperatorsAreDistinct(decoded)) return false;
+
   const results = shortestPathResults(decoded);
   if (results.length !== SHORTEST_PATH_COUNT || results.some((value) => !Number.isInteger(value) || value < 150 || value > 200)) {
     return false;
@@ -4694,149 +4726,100 @@ function isShortestPathPuzzleShapeValid(puzzle) {
   return Number(puzzle?.target) === minimum;
 }
 
-function randomArrayItem(values) {
-  if (!Array.isArray(values) || values.length === 0) return null;
-  return values[secureRandomInt(0, values.length)];
-}
-
-function chooseTwoDistinctShortestPathValues(values) {
-  const unique = [...new Set(values)];
-  if (unique.length < 2) return null;
-  const firstIndex = secureRandomInt(0, unique.length);
-  let secondIndex = secureRandomInt(0, unique.length - 1);
-  if (secondIndex >= firstIndex) secondIndex += 1;
-  return [unique[firstIndex], unique[secondIndex]];
-}
-
-function shortestPathMulThenSubtractBranch(value) {
+function shortestPathFinalCandidates(value, usedOperatorCodes) {
+  if (!Number.isInteger(value) || value <= 0) return [];
+  const used = new Set(usedOperatorCodes);
+  const missing = [0, 1, 2].filter((operatorCode) => !used.has(operatorCode));
+  const allowedOperators = missing.length > 0 ? missing : [0, 1, 2];
   const candidates = [];
-  for (let multiplier = 2; multiplier <= 18; multiplier += 1) {
-    const afterSecond = value * multiplier;
-    const leafOperands = [];
-    for (let subtract = 1; subtract <= 30; subtract += 1) {
-      const result = afterSecond - subtract;
-      if (result >= 150 && result <= 200) leafOperands.push(subtract);
-    }
-    if (leafOperands.length >= 2) candidates.push({ secondOperand: multiplier, leafOperands });
-  }
-  const chosen = randomArrayItem(candidates);
-  if (!chosen) return null;
-  const leaves = chooseTwoDistinctShortestPathValues(chosen.leafOperands);
-  return leaves ? { secondOperand: chosen.secondOperand, leaves } : null;
-}
 
-function shortestPathSubtractThenMultiplyBranch(value) {
-  const candidates = [];
-  for (let subtract = 1; subtract <= 18; subtract += 1) {
-    const afterSecond = value - subtract;
-    if (afterSecond <= 0) continue;
-    const leafOperands = [];
-    for (let multiplier = 2; multiplier <= 18; multiplier += 1) {
-      const result = afterSecond * multiplier;
-      if (result >= 150 && result <= 200) leafOperands.push(multiplier);
+  for (const operatorCode of allowedOperators) {
+    const minOperand = operatorCode === 2 ? 2 : 1;
+    for (let operand = minOperand; operand <= 30; operand += 1) {
+      const result = shortestPathApply(value, operatorCode, operand);
+      if (Number.isInteger(result) && result >= 150 && result <= 200) {
+        candidates.push({ operatorCode, operand, result });
+      }
     }
-    if (leafOperands.length >= 2) candidates.push({ secondOperand: subtract, leafOperands });
   }
-  const chosen = randomArrayItem(candidates);
-  if (!chosen) return null;
-  const leaves = chooseTwoDistinctShortestPathValues(chosen.leafOperands);
-  return leaves ? { secondOperand: chosen.secondOperand, leaves } : null;
-}
-
-function shortestPathAddThenMultiplyBranch(value) {
-  const candidates = [];
-  for (let add = 1; add <= 18; add += 1) {
-    const afterSecond = value + add;
-    const leafOperands = [];
-    for (let multiplier = 2; multiplier <= 18; multiplier += 1) {
-      const result = afterSecond * multiplier;
-      if (result >= 150 && result <= 200) leafOperands.push(multiplier);
-    }
-    if (leafOperands.length >= 2) candidates.push({ secondOperand: add, leafOperands });
-  }
-  const chosen = randomArrayItem(candidates);
-  if (!chosen) return null;
-  const leaves = chooseTwoDistinctShortestPathValues(chosen.leafOperands);
-  return leaves ? { secondOperand: chosen.secondOperand, leaves } : null;
-}
-
-function shortestPathMulThenAddBranch(value) {
-  const candidates = [];
-  for (let multiplier = 2; multiplier <= 18; multiplier += 1) {
-    const afterSecond = value * multiplier;
-    const leafOperands = [];
-    for (let add = 1; add <= 30; add += 1) {
-      const result = afterSecond + add;
-      if (result >= 150 && result <= 200) leafOperands.push(add);
-    }
-    if (leafOperands.length >= 2) candidates.push({ secondOperand: multiplier, leafOperands });
-  }
-  const chosen = randomArrayItem(candidates);
-  if (!chosen) return null;
-  const leaves = chooseTwoDistinctShortestPathValues(chosen.leafOperands);
-  return leaves ? { secondOperand: chosen.secondOperand, leaves } : null;
+  return candidates;
 }
 
 function generateShortestPathPuzzle() {
-  // Sabit işlem deseni her 8 yolun da +, -, × işlemlerini tam bir kez kullanmasını garanti eder;
-  // operandlar kriptografik RNG ile seçilir. Sonuçlar 150-200 aralığına ve tekil minimuma zorlanır.
-  for (let attempt = 0; attempt < 2_000; attempt += 1) {
+  // 3 dallanma + uçtan B'ye 1 tamamlama işlemi vardır. Böylece:
+  // 1) her ayrım noktasındaki iki kardeş dalın işlemi farklıdır,
+  // 2) 8 rotanın her birinde +, -, × işlemlerinin tamamı bulunur,
+  // 3) bütün sonuçlar 150-200 aralığındadır ve minimum rota tektir.
+  for (let attempt = 0; attempt < 4_000; attempt += 1) {
     const startValue = secureRandomInt(12, 31);
-    const rootPlus = secureRandomInt(1, 13);
-    const maxRootMinus = Math.max(2, Math.min(11, startValue - 4));
-    const rootMinus = secureRandomInt(1, maxRootMinus);
-    const leftValue = startValue + rootPlus;
-    const rightValue = startValue - rootMinus;
+    const branchEdges = SHORTEST_PATH_BRANCH_OPERATOR_PATTERN.map((operatorCode) => {
+      const operand = operatorCode === 0
+        ? secureRandomInt(1, 19)
+        : operatorCode === 1
+          ? secureRandomInt(1, 13)
+          : secureRandomInt(2, 8);
+      return { operatorCode, operand };
+    });
 
-    const branch0 = shortestPathMulThenSubtractBranch(leftValue);   // +, ×, -
-    const branch1 = shortestPathSubtractThenMultiplyBranch(leftValue); // +, -, ×
-    const branch2 = shortestPathAddThenMultiplyBranch(rightValue);     // -, +, ×
-    const branch3 = shortestPathMulThenAddBranch(rightValue);           // -, ×, +
-    if (!branch0 || !branch1 || !branch2 || !branch3) continue;
+    const finalCandidatesByPath = [];
+    let branchStateValid = true;
+    for (let pathIndex = 0; pathIndex < SHORTEST_PATH_COUNT; pathIndex += 1) {
+      const branchIndices = shortestPathBranchEdgeIndices(pathIndex);
+      let value = startValue;
+      const usedOperators = [];
+      for (const edgeIndex of branchIndices) {
+        const edge = branchEdges[edgeIndex];
+        value = shortestPathApply(value, edge.operatorCode, edge.operand);
+        usedOperators.push(edge.operatorCode);
+        if (!Number.isInteger(value) || value <= 0 || value > 500) {
+          branchStateValid = false;
+          break;
+        }
+      }
+      if (!branchStateValid) break;
+      const candidates = shortestPathFinalCandidates(value, usedOperators);
+      if (candidates.length === 0) {
+        branchStateValid = false;
+        break;
+      }
+      finalCandidatesByPath.push(candidates);
+    }
+    if (!branchStateValid || finalCandidatesByPath.length !== SHORTEST_PATH_COUNT) continue;
 
-    const edges = [
-      [0, rootPlus],
-      [1, rootMinus],
-      [2, branch0.secondOperand],
-      [1, branch1.secondOperand],
-      [0, branch2.secondOperand],
-      [2, branch3.secondOperand],
-      [1, branch0.leaves[0]],
-      [1, branch0.leaves[1]],
-      [2, branch1.leaves[0]],
-      [2, branch1.leaves[1]],
-      [2, branch2.leaves[0]],
-      [2, branch2.leaves[1]],
-      [0, branch3.leaves[0]],
-      [0, branch3.leaves[1]],
-    ];
-    const numbers = [SHORTEST_PATH_ENCODING_VERSION, startValue];
-    edges.forEach(([operatorCode, operand]) => numbers.push(operatorCode, operand));
-    const decoded = decodeShortestPathEncoding(numbers);
-    const results = shortestPathResults(decoded);
-    if (results.length !== SHORTEST_PATH_COUNT) continue;
-    const minimum = Math.min(...results);
-    if (results.filter((value) => value === minimum).length !== 1) continue;
+    for (let finalAttempt = 0; finalAttempt < 30; finalAttempt += 1) {
+      const finalEdges = finalCandidatesByPath.map((candidates) =>
+        candidates[secureRandomInt(0, candidates.length)]
+      );
+      const edges = [...branchEdges, ...finalEdges];
+      const numbers = [SHORTEST_PATH_ENCODING_VERSION, startValue];
+      edges.forEach(({ operatorCode, operand }) => numbers.push(operatorCode, operand));
 
-    const puzzle = {
-      difficulty: "Standard",
-      target: minimum,
-      numbers,
-      gameKey: "shortest_path",
-      initialGrid: [],
-    };
-    if (isShortestPathPuzzleShapeValid(puzzle)) return puzzle;
+      const decoded = decodeShortestPathEncoding(numbers);
+      const results = shortestPathResults(decoded);
+      if (results.length !== SHORTEST_PATH_COUNT) continue;
+      const minimum = Math.min(...results);
+      if (results.filter((value) => value === minimum).length !== 1) continue;
+
+      const puzzle = {
+        difficulty: "Standard",
+        target: minimum,
+        numbers,
+        gameKey: "shortest_path",
+        initialGrid: [],
+      };
+      if (isShortestPathPuzzleShapeValid(puzzle)) return puzzle;
+    }
   }
 
-  // Teorik olarak yukarıdaki üretim çok geniş bir çözüm uzayına sahiptir. Yine de RNG/gelecek
-  // değişiklikleri nedeniyle üretim bulunamazsa istemciyle aynı, önceden doğrulanmış güvenli örnek kullanılır.
+  // Önceden doğrulanmış v2 örneği. Her kardeş dal farklı işlem taşır; her tam rota +,-,× içerir.
   const fallbackNumbers = [
-    1, 20,
-    0, 5, 1, 5,
-    2, 7, 1, 3, 0, 5, 2, 10,
-    1, 10, 1, 15, 2, 8, 2, 7, 2, 9, 2, 8, 0, 8, 0, 12,
+    2, 29,
+    0, 11, 1, 8,
+    2, 5, 1, 5, 0, 15, 2, 6,
+    1, 2, 0, 8, 2, 6, 0, 17, 2, 5, 1, 3, 0, 17, 1, 5,
+    1, 27, 1, 30, 1, 19, 2, 3, 0, 16, 2, 5, 0, 21, 0, 29,
   ];
-  return { difficulty: "Standard", target: 154, numbers: fallbackNumbers, gameKey: "shortest_path", initialGrid: [] };
+  return { difficulty: "Standard", target: 150, numbers: fallbackNumbers, gameKey: "shortest_path", initialGrid: [] };
 }
 
 function validateShortestPathChallengeAnswer(puzzle, answer = {}) {
