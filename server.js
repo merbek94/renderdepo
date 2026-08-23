@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "consecutive-grid-v1-20260822";
+const SERVER_BUILD_ID = "shortest-path-v1-20260823";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2078,6 +2078,19 @@ const GAME_DEFINITIONS = Object.freeze({
     botAverageVarianceMs: 7 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
+  shortest_path: Object.freeze({
+    key: "shortest_path",
+    displayName: "EN KISA YOL",
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Hedef Sayıyı Bul ile birebir aynı bot profili: ilk 5 oyun 90-119 sn, devamında oyuncu ortalaması ±4 sn.
+    botFinishMinMs: 24 * 1000,
+    botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
 });
 
 function unsupportedGameError(value) {
@@ -2860,6 +2873,168 @@ function validateEquationHuntChallengeAnswer(puzzle, answer = {}) {
   if (!Number.isInteger(firstValue) || !Number.isInteger(secondValue)) return false;
   return firstValue === Number(puzzle.target) &&
     secondValue === Number(puzzle.numbers[2]);
+}
+
+
+const SHORTEST_PATH_MULTIPLY_OFFSET = 100;
+
+function encodeShortestPathOperation(operation) {
+  return operation.kind === "multiply"
+    ? SHORTEST_PATH_MULTIPLY_OFFSET + operation.operand
+    : operation.operand;
+}
+
+function decodeShortestPathOperation(encodedValue) {
+  const encoded = Number(encodedValue);
+  if (Number.isInteger(encoded) && encoded >= 1 && encoded <= 40) {
+    return { kind: "add", operand: encoded };
+  }
+  if (Number.isInteger(encoded) && encoded >= 102 && encoded <= 103) {
+    return { kind: "multiply", operand: encoded - SHORTEST_PATH_MULTIPLY_OFFSET };
+  }
+  return null;
+}
+
+function applyShortestPathOperation(value, operation) {
+  return operation.kind === "multiply" ? value * operation.operand : value + operation.operand;
+}
+
+function shortestPathResultForChoices(puzzle, choices) {
+  if (!Array.isArray(choices) || choices.length !== 3 || choices.some((choice) => !Number.isInteger(Number(choice)) || Number(choice) < 0 || Number(choice) > 2)) {
+    return null;
+  }
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (numbers.length !== 14) return null;
+  let value = Number(numbers[0]);
+  if (!Number.isInteger(value)) return null;
+  for (let stage = 0; stage < 3; stage += 1) {
+    const option = Number(choices[stage]);
+    const operation = decodeShortestPathOperation(numbers[5 + stage * 3 + option]);
+    if (!operation) return null;
+    value = applyShortestPathOperation(value, operation);
+    if (!Number.isSafeInteger(value)) return null;
+  }
+  return value;
+}
+
+function shortestPathAllResults(puzzle) {
+  const results = [];
+  for (let a = 0; a < 3; a += 1) {
+    for (let b = 0; b < 3; b += 1) {
+      for (let c = 0; c < 3; c += 1) {
+        const value = shortestPathResultForChoices(puzzle, [a, b, c]);
+        if (!Number.isInteger(value)) return [];
+        results.push(value);
+      }
+    }
+  }
+  return results;
+}
+
+function isShortestPathPuzzleEncodingValid(puzzle) {
+  const target = Number(puzzle?.target);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (!Number.isInteger(target) || target < 60 || target > 100 || numbers.length !== 14) return false;
+  if (!Number.isInteger(numbers[0]) || numbers[0] < 4 || numbers[0] > 20) return false;
+  const nodeIds = numbers.slice(1, 5);
+  if (nodeIds.some((id) => !Number.isInteger(id) || id < 0 || id > 8) || new Set(nodeIds).size !== 4) return false;
+
+  let hasAdd = false;
+  let hasMultiply = false;
+  for (let stage = 0; stage < 3; stage += 1) {
+    const labels = [];
+    for (let option = 0; option < 3; option += 1) {
+      const operation = decodeShortestPathOperation(numbers[5 + stage * 3 + option]);
+      if (!operation) return false;
+      labels.push(`${operation.kind}:${operation.operand}`);
+      if (operation.kind === "add") hasAdd = true;
+      if (operation.kind === "multiply") hasMultiply = true;
+    }
+    if (new Set(labels).size !== 3) return false;
+  }
+  if (!hasAdd || !hasMultiply) return false;
+
+  const results = shortestPathAllResults(puzzle);
+  if (results.length !== 27 || results.some((value) => value < 60 || value > 100)) return false;
+  const minimum = Math.min(...results);
+  return minimum === target && results.filter((value) => value === minimum).length === 1;
+}
+
+function randomShortestPathMinima(startValue) {
+  const desiredMinimum = secureRandomInt(60, 77);
+  const requiredTotal = desiredMinimum - startValue;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const first = secureRandomInt(10, 25);
+    const second = secureRandomInt(10, 25);
+    const third = requiredTotal - first - second;
+    if (third >= 10 && third <= 24) return [first, second, third];
+  }
+  return null;
+}
+
+function generateShortestPathPuzzle() {
+  for (let outer = 0; outer < 1000; outer += 1) {
+    const startValue = secureRandomInt(4, 21);
+    const minima = randomShortestPathMinima(startValue);
+    if (!minima) continue;
+
+    const baseline = minima.map((minimum) => {
+      const deltas = shuffled([1, 2, 3, 4, 5, 6]).slice(0, 2);
+      return shuffled([minimum, minimum + deltas[0], minimum + deltas[1]])
+        .map((operand) => ({ kind: "add", operand }));
+    });
+
+    // En az bir, en fazla üç çizgiyi ×2/×3'e dönüştür. Her aday 27 rotanın tamamıyla doğrulanır.
+    for (let variant = 0; variant < 60; variant += 1) {
+      const stages = baseline.map((stage) => stage.map((operation) => ({ ...operation })));
+      const positions = shuffled(Array.from({ length: 9 }, (_, index) => [Math.floor(index / 3), index % 3]));
+      const replacementCount = secureRandomInt(1, 4);
+      for (let index = 0; index < replacementCount; index += 1) {
+        const [stage, option] = positions[index];
+        stages[stage][option] = { kind: "multiply", operand: secureRandomInt(2, 4) };
+      }
+      if (stages.some((stage) => new Set(stage.map((op) => `${op.kind}:${op.operand}`)).size !== 3)) continue;
+
+      const nodeIds = shuffled([0, 1, 2, 3, 4, 5, 6, 7, 8]).slice(0, 4);
+      const numbers = [
+        startValue,
+        ...nodeIds,
+        ...stages.flat().map(encodeShortestPathOperation),
+      ];
+      const candidate = {
+        difficulty: "Standard",
+        target: 60,
+        numbers,
+        gameKey: "shortest_path",
+        initialGrid: [],
+      };
+      const results = shortestPathAllResults(candidate);
+      if (results.length !== 27 || results.some((value) => value < 60 || value > 100)) continue;
+      const minimum = Math.min(...results);
+      if (results.filter((value) => value === minimum).length !== 1) continue;
+      candidate.target = minimum;
+      if (isShortestPathPuzzleEncodingValid(candidate)) return candidate;
+    }
+  }
+
+  // Deterministik ve tamamen geçerli güvenli fallback. 27 sonucun tamamı 60..86 aralığındadır.
+  return {
+    difficulty: "Standard",
+    target: 60,
+    numbers: [8, 0, 2, 4, 6, 27, 23, 21, 25, 19, 102, 16, 12, 15],
+    gameKey: "shortest_path",
+    initialGrid: [],
+  };
+}
+
+function validateShortestPathChallengeAnswer(puzzle, answer = {}) {
+  if (!isShortestPathPuzzleEncodingValid(puzzle)) return false;
+  const choices = Array.isArray(answer?.choices) ? answer.choices.map(Number) : [];
+  if (choices.length !== 3 || choices.some((choice) => !Number.isInteger(choice) || choice < 0 || choice > 2)) return false;
+  const actualResult = shortestPathResultForChoices(puzzle, choices);
+  if (!Number.isInteger(actualResult) || actualResult !== Number(puzzle.target)) return false;
+  const claimedResult = Number(answer?.result);
+  return Number.isInteger(claimedResult) && claimedResult === actualResult;
 }
 
 function generatePuzzleForGame(gameKey, difficultyValue) {
@@ -4643,6 +4818,11 @@ const GAME_HANDLERS = Object.freeze({
     key: "consecutive",
     createPuzzle: () => generateConsecutivePuzzle(),
     validateAnswer: (puzzle, answer) => validateConsecutiveChallengeAnswer(puzzle, answer),
+  }),
+  shortest_path: Object.freeze({
+    key: "shortest_path",
+    createPuzzle: () => generateShortestPathPuzzle(),
+    validateAnswer: (puzzle, answer) => validateShortestPathChallengeAnswer(puzzle, answer),
   }),
 });
 
