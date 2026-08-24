@@ -4720,12 +4720,12 @@ function isDigitAttackPuzzleEncodingValid(puzzle) {
   let previousTarget = null;
   for (let index = 0; index < waves.length; index += 1) {
     const wave = waves[index];
-    // Yalnız ilk alt sayı 1-10 arasındadır. Sonraki her dalganın alt sayısı,
-    // bir önceki dalganın hedefidir: 3 -> hedef 10 ise sonraki alt sayı 10 olur.
-    if (!Number.isInteger(wave.base) || wave.base < 1 || wave.base >= 100) return false;
+    // İlk alt sayı 4-10 arasındadır. Sonraki her dalganın alt sayısı bir önceki
+    // hedefe eşittir ve zincirin hiçbir aşamasında 4'ün altına düşmez.
+    if (!Number.isInteger(wave.base) || wave.base < 4 || wave.base >= 100) return false;
     if (index === 0 && wave.base > 10) return false;
     if (index > 0 && wave.base !== previousTarget) return false;
-    if (!Number.isInteger(wave.target) || wave.target < 1 || wave.target >= 100) return false;
+    if (!Number.isInteger(wave.target) || wave.target < 4 || wave.target >= 100) return false;
     if (wave.target === wave.base) return false;
     if (!Number.isInteger(wave.operation) || wave.operation < 0 || wave.operation > 3) return false;
     if (!Array.isArray(wave.operands) || wave.operands.length !== 3) return false;
@@ -4734,6 +4734,10 @@ function isDigitAttackPuzzleEncodingValid(puzzle) {
     const correctLane = digitAttackCorrectLane(wave);
     if (correctLane < 0) return false;
     const correctOperand = wave.operands[correctLane];
+    const correctOperandAllowed = wave.operation === 0 || wave.operation === 1
+      ? correctOperand >= 9 && correctOperand <= 25
+      : correctOperand >= 2 && correctOperand <= 5;
+    if (!correctOperandAllowed) return false;
     if (wave.operands.some((operand, lane) => lane !== correctLane &&
         (Math.abs(operand - correctOperand) < 1 || Math.abs(operand - correctOperand) > 2))) return false;
     previousTarget = wave.target;
@@ -4757,13 +4761,14 @@ function digitAttackNearbyOperands(base, operation, correctOperand, target) {
 }
 
 function digitAttackCanUseOperation(base, operation) {
-  if (!Number.isInteger(base) || base < 1 || base >= 100) return false;
-  if (operation === 0) return base <= 98; // + en az 1 ekleyip yine <100 kalabilmeli.
-  if (operation === 1) return base >= 2;  // sonuç pozitif ve hedeften farklı olmalı.
-  if (operation === 2) return base <= 49; // × en az 2 ile çarpılır ve sonuç <100 kalır.
+  if (!Number.isInteger(base) || base < 4 || base >= 100) return false;
+  if (operation === 0) return base <= 90; // Doğru toplama operandı +9..+25 ve hedef <100.
+  if (operation === 1) return base >= 13; // Doğru çıkarma operandı -9..-25 ve hedef >=4.
+  if (operation === 2) return base <= 49; // Doğru çarpan ×2..×5 ve hedef <100.
   if (operation === 3) {
-    for (let divisor = 2; divisor <= Math.min(40, base); divisor += 1) {
-      if (base % divisor === 0) return true;
+    // Doğru bölen ÷2..÷5; bölüm de sonraki alt sayı olacağı için en az 4 olmalı.
+    for (let divisor = 2; divisor <= 5; divisor += 1) {
+      if (base % divisor === 0 && base / divisor >= 4) return true;
     }
     return false;
   }
@@ -4773,22 +4778,28 @@ function digitAttackCanUseOperation(base, operation) {
 function generateDigitAttackWaveFromBase(base, operation, nextOperation = null) {
   let candidates = [];
   if (operation === 0) {
-    const maxOperand = Math.min(40, 99 - base);
-    candidates = Array.from({ length: Math.max(0, maxOperand) }, (_, index) => index + 1);
+    const maxOperand = Math.min(25, 99 - base);
+    candidates = maxOperand >= 9
+      ? Array.from({ length: maxOperand - 8 }, (_, index) => index + 9)
+      : [];
   } else if (operation === 1) {
-    const maxOperand = Math.min(40, base - 1);
-    candidates = Array.from({ length: Math.max(0, maxOperand) }, (_, index) => index + 1);
+    const maxOperand = Math.min(25, base - 4);
+    candidates = maxOperand >= 9
+      ? Array.from({ length: maxOperand - 8 }, (_, index) => index + 9)
+      : [];
   } else if (operation === 2) {
-    const maxOperand = Math.min(40, Math.floor(99 / base));
-    candidates = Array.from({ length: Math.max(0, maxOperand - 1) }, (_, index) => index + 2);
+    const maxOperand = Math.min(5, Math.floor(99 / base));
+    candidates = maxOperand >= 2
+      ? Array.from({ length: maxOperand - 1 }, (_, index) => index + 2)
+      : [];
   } else if (operation === 3) {
-    candidates = Array.from({ length: Math.min(40, base) - 1 }, (_, index) => index + 2)
-      .filter((operand) => base % operand === 0);
+    candidates = [2, 3, 4, 5]
+      .filter((operand) => base % operand === 0 && base / operand >= 4);
   }
 
   for (const correctOperand of shuffled(candidates)) {
     const target = digitAttackApply(base, operation, correctOperand);
-    if (!Number.isInteger(target) || target < 1 || target >= 100 || target === base) continue;
+    if (!Number.isInteger(target) || target < 4 || target >= 100 || target === base) continue;
     if (nextOperation !== null && !digitAttackCanUseOperation(target, nextOperation)) continue;
     const operands = digitAttackNearbyOperands(base, operation, correctOperand, target);
     if (!operands) continue;
@@ -4802,9 +4813,9 @@ function generateDigitAttackWaveFromBase(base, operation, nextOperation = null) 
 function generateDigitAttackPuzzle() {
   // Dört işlemin her biri tam 7 kez bulunur. İşlem sırası rastgele kalır; fakat
   // hedef bir sonraki dalganın alt sayısı olduğundan zincirin tamamı birlikte üretilir.
-  for (let puzzleAttempt = 0; puzzleAttempt < 500; puzzleAttempt += 1) {
+  for (let puzzleAttempt = 0; puzzleAttempt < 2500; puzzleAttempt += 1) {
     const operations = shuffled(Array.from({ length: 7 }, () => [0, 1, 2, 3]).flat());
-    let base = secureRandomInt(1, 11);
+    let base = secureRandomInt(4, 11);
     const waves = [];
     let failed = false;
 
