@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "digit-attack-v1-20260824";
+const SERVER_BUILD_ID = "digit-attack-chain-v3-20260824";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -4718,9 +4718,15 @@ function isDigitAttackPuzzleEncodingValid(puzzle) {
   if (!waves) return false;
   const operationCounts = [0, 0, 0, 0];
   let previousTarget = null;
-  for (const wave of waves) {
-    if (!Number.isInteger(wave.base) || wave.base < 1 || wave.base > 10) return false;
+  for (let index = 0; index < waves.length; index += 1) {
+    const wave = waves[index];
+    // Yalnız ilk alt sayı 1-10 arasındadır. Sonraki her dalganın alt sayısı,
+    // bir önceki dalganın hedefidir: 3 -> hedef 10 ise sonraki alt sayı 10 olur.
+    if (!Number.isInteger(wave.base) || wave.base < 1 || wave.base >= 100) return false;
+    if (index === 0 && wave.base > 10) return false;
+    if (index > 0 && wave.base !== previousTarget) return false;
     if (!Number.isInteger(wave.target) || wave.target < 1 || wave.target >= 100) return false;
+    if (wave.target === wave.base) return false;
     if (!Number.isInteger(wave.operation) || wave.operation < 0 || wave.operation > 3) return false;
     if (!Array.isArray(wave.operands) || wave.operands.length !== 3) return false;
     if (!wave.operands.every((value) => Number.isInteger(value) && value >= 1 && value <= 40)) return false;
@@ -4730,7 +4736,6 @@ function isDigitAttackPuzzleEncodingValid(puzzle) {
     const correctOperand = wave.operands[correctLane];
     if (wave.operands.some((operand, lane) => lane !== correctLane &&
         (Math.abs(operand - correctOperand) < 1 || Math.abs(operand - correctOperand) > 2))) return false;
-    if (previousTarget !== null && wave.target === previousTarget) return false;
     previousTarget = wave.target;
     operationCounts[wave.operation] += 1;
   }
@@ -4751,54 +4756,86 @@ function digitAttackNearbyOperands(base, operation, correctOperand, target) {
   return result.length === 3 ? shuffled(result) : null;
 }
 
-function generateDigitAttackWave(operation, previousTarget = null) {
-  const divisionPairs = [[4, 2], [6, 2], [6, 3], [8, 2], [8, 4], [9, 3], [10, 2], [10, 5]];
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    let base;
-    let correctOperand;
-    if (operation === 0) {
-      base = secureRandomInt(1, 11);
-      correctOperand = secureRandomInt(6, 31);
-    } else if (operation === 1) {
-      base = secureRandomInt(3, 11);
-      correctOperand = secureRandomInt(1, base);
-    } else if (operation === 2) {
-      base = secureRandomInt(2, 11);
-      const maxOperand = Math.max(2, Math.min(9, Math.floor(99 / base)));
-      correctOperand = secureRandomInt(2, maxOperand + 1);
-    } else {
-      [base, correctOperand] = divisionPairs[secureRandomInt(0, divisionPairs.length)];
+function digitAttackCanUseOperation(base, operation) {
+  if (!Number.isInteger(base) || base < 1 || base >= 100) return false;
+  if (operation === 0) return base <= 98; // + en az 1 ekleyip yine <100 kalabilmeli.
+  if (operation === 1) return base >= 2;  // sonuç pozitif ve hedeften farklı olmalı.
+  if (operation === 2) return base <= 49; // × en az 2 ile çarpılır ve sonuç <100 kalır.
+  if (operation === 3) {
+    for (let divisor = 2; divisor <= Math.min(40, base); divisor += 1) {
+      if (base % divisor === 0) return true;
     }
+    return false;
+  }
+  return false;
+}
+
+function generateDigitAttackWaveFromBase(base, operation, nextOperation = null) {
+  let candidates = [];
+  if (operation === 0) {
+    const maxOperand = Math.min(40, 99 - base);
+    candidates = Array.from({ length: Math.max(0, maxOperand) }, (_, index) => index + 1);
+  } else if (operation === 1) {
+    const maxOperand = Math.min(40, base - 1);
+    candidates = Array.from({ length: Math.max(0, maxOperand) }, (_, index) => index + 1);
+  } else if (operation === 2) {
+    const maxOperand = Math.min(40, Math.floor(99 / base));
+    candidates = Array.from({ length: Math.max(0, maxOperand - 1) }, (_, index) => index + 2);
+  } else if (operation === 3) {
+    candidates = Array.from({ length: Math.min(40, base) - 1 }, (_, index) => index + 2)
+      .filter((operand) => base % operand === 0);
+  }
+
+  for (const correctOperand of shuffled(candidates)) {
     const target = digitAttackApply(base, operation, correctOperand);
-    if (!Number.isInteger(target) || target < 1 || target >= 100 || target === previousTarget) continue;
+    if (!Number.isInteger(target) || target < 1 || target >= 100 || target === base) continue;
+    if (nextOperation !== null && !digitAttackCanUseOperation(target, nextOperation)) continue;
     const operands = digitAttackNearbyOperands(base, operation, correctOperand, target);
     if (!operands) continue;
     const wave = { base, target, operation, operands };
     if (digitAttackCorrectLane(wave) < 0) continue;
     return wave;
   }
-  throw new Error("Rakam Saldırısı dalgası üretilemedi.");
+  return null;
 }
 
 function generateDigitAttackPuzzle() {
-  // Dört işlemin her biri tam 7 kez bulunur; yalnız dalga sırası rastgele karıştırılır.
-  const operations = shuffled(Array.from({ length: 7 }, () => [0, 1, 2, 3]).flat());
-  const numbers = [];
-  let previousTarget = null;
-  for (const operation of operations) {
-    const wave = generateDigitAttackWave(operation, previousTarget);
-    numbers.push(wave.base, wave.target, wave.operation, ...wave.operands);
-    previousTarget = wave.target;
+  // Dört işlemin her biri tam 7 kez bulunur. İşlem sırası rastgele kalır; fakat
+  // hedef bir sonraki dalganın alt sayısı olduğundan zincirin tamamı birlikte üretilir.
+  for (let puzzleAttempt = 0; puzzleAttempt < 500; puzzleAttempt += 1) {
+    const operations = shuffled(Array.from({ length: 7 }, () => [0, 1, 2, 3]).flat());
+    let base = secureRandomInt(1, 11);
+    const waves = [];
+    let failed = false;
+
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = operations[index];
+      const nextOperation = index + 1 < operations.length ? operations[index + 1] : null;
+      if (!digitAttackCanUseOperation(base, operation)) {
+        failed = true;
+        break;
+      }
+      const wave = generateDigitAttackWaveFromBase(base, operation, nextOperation);
+      if (!wave) {
+        failed = true;
+        break;
+      }
+      waves.push(wave);
+      base = wave.target;
+    }
+
+    if (failed || waves.length !== DIGIT_ATTACK_WAVE_COUNT) continue;
+    const numbers = waves.flatMap((wave) => [wave.base, wave.target, wave.operation, ...wave.operands]);
+    const puzzle = {
+      difficulty: "Standard",
+      target: DIGIT_ATTACK_REQUIRED_HITS,
+      numbers,
+      gameKey: "digit_attack",
+      initialGrid: [],
+    };
+    if (isDigitAttackPuzzleEncodingValid(puzzle)) return puzzle;
   }
-  const puzzle = {
-    difficulty: "Standard",
-    target: DIGIT_ATTACK_REQUIRED_HITS,
-    numbers,
-    gameKey: "digit_attack",
-    initialGrid: [],
-  };
-  if (!isDigitAttackPuzzleEncodingValid(puzzle)) throw new Error("Rakam Saldırısı bulmacası doğrulanamadı.");
-  return puzzle;
+  throw new Error("Rakam Saldırısı zincir bulmacası üretilemedi.");
 }
 
 function normalizeDigitAttackChoices(answer = {}) {
