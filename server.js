@@ -4725,7 +4725,11 @@ function isDigitAttackPuzzleEncodingValid(puzzle) {
     if (!Array.isArray(wave.operands) || wave.operands.length !== 3) return false;
     if (!wave.operands.every((value) => Number.isInteger(value) && value >= 1 && value <= 40)) return false;
     if (new Set(wave.operands).size !== 3) return false;
-    if (digitAttackCorrectLane(wave) < 0) return false;
+    const correctLane = digitAttackCorrectLane(wave);
+    if (correctLane < 0) return false;
+    const correctOperand = wave.operands[correctLane];
+    if (wave.operands.some((operand, lane) => lane !== correctLane &&
+        (Math.abs(operand - correctOperand) < 1 || Math.abs(operand - correctOperand) > 2))) return false;
     if (previousTarget !== null && wave.target === previousTarget) return false;
     previousTarget = wave.target;
     operationCounts[wave.operation] += 1;
@@ -4734,7 +4738,8 @@ function isDigitAttackPuzzleEncodingValid(puzzle) {
 }
 
 function digitAttackNearbyOperands(base, operation, correctOperand, target) {
-  const deltas = shuffled([-1, 1, -2, 2, -3, 3, -4, 4, -5, 5]);
+  // Yanlış iki taş doğru operandın en fazla 2 eksiği/fazlasıdır.
+  const deltas = shuffled([-1, 1, -2, 2]);
   const result = [correctOperand];
   for (const delta of deltas) {
     const candidate = correctOperand + delta;
