@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "shortest-path-v1-20260823";
+const SERVER_BUILD_ID = "digit-attack-v1-20260824";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2074,6 +2074,18 @@ const GAME_DEFINITIONS = Object.freeze({
     // Yalnızca bu oyuna özel %21 yanlış rota davranışı aşağıdaki ortak bot planına eklenir.
     botFinishMinMs: 24 * 1000,
     botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  digit_attack: Object.freeze({
+    key: "digit_attack",
+    displayName: "RAKAM SALDIRISI",
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 2 * 60 * 1000,
+    botFinishMinMs: 80 * 1000,
+    botFinishMaxMs: 119 * 1000,
     botCalibrationMinMs: 90 * 1000,
     botCalibrationMaxMs: 119 * 1000,
     botAverageVarianceMs: 4 * 1000,
@@ -4293,20 +4305,37 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
   const config = gameDefinition(gameKey);
   const baseGameKey = normalizeBaseGameKey(gameKey);
 
-  // En Kısa Yol'a özel tek bot farkı: maç başında tam %21 olasılıkla bot,
-  // normal bitirme zamanında en kısa olmayan bir rota gönderir ve eli kaybeder.
+  // Oyun-bazlı %21 özel yenilgi davranışları diğer bot kurallarından tamamen izoledir.
   // Kalan %79'da ayrılma / çözememe / kalibrasyon dahil ortak bot motoru aynen çalışır.
   const wrongShortestPathRoute = baseGameKey === "shortest_path" && secureRandomInt(0, 10000) < 2100;
+  const digitAttackForcedLoss = baseGameKey === "digit_attack" && secureRandomInt(0, 10000) < 2100;
+  const digitAttackLossMaxMs = Math.max(28_000, Math.min(70_000, Number(config.roundDurationMs || 120_000) - 1_000));
   const plan = wrongShortestPathRoute
     ? {
         finishMs: createTwoPlayerBotFinishMs(finishProfile, gameKey),
         leaveMs: null,
         wrongRoute: true,
       }
-    : createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile);
+    : digitAttackForcedLoss
+      ? {
+          // Rakam Saldırısı özel yenilgisi hiçbir zaman 28. saniyeden önce gerçekleşmez.
+          finishMs: secureRandomInt(28_000, digitAttackLossMaxMs + 1),
+          leaveMs: null,
+          forcedLoss: true,
+          forcedLossReason: "bot_three_mistakes",
+        }
+      : createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile);
 
   if (plan.finishMs === null || plan.finishMs === undefined) return plan;
   const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 1) - 1_000);
+  if (plan.forcedLoss === true) {
+    // Özel Rakam Saldırısı yenilgisi normal bitirme alt sınırına sıkıştırılmaz;
+    // yalnız 28. saniye ve tur sonu güvenlik sınırları uygulanır.
+    return {
+      ...plan,
+      finishMs: Math.max(28_000, Math.min(Number(plan.finishMs), absoluteMaxMs)),
+    };
+  }
   const gameMinMs = Math.max(BOT_MIN_FINISH_MS, Math.min(Number(config.botFinishMinMs || BOT_MIN_FINISH_MS), absoluteMaxMs));
   const gameMaxMs = Math.max(gameMinMs, Math.min(Number(config.botFinishMaxMs || absoluteMaxMs), absoluteMaxMs));
   return {
@@ -4330,6 +4359,9 @@ function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
   if (finishMs !== null && elapsedMs >= finishMs) {
     if (plan?.wrongRoute === true) {
       return { resolvable: true, won: true, reason: "bot_wrong_route" };
+    }
+    if (plan?.forcedLoss === true) {
+      return { resolvable: true, won: true, reason: safeText(plan.forcedLossReason, "bot_failed", 48) };
     }
     return { resolvable: true, won: false, reason: "bot_finished" };
   }
@@ -4639,6 +4671,174 @@ function validateTargetNumberChallengeAnswer(puzzle, answer = {}) {
   return result !== null && Math.abs(result - Number(puzzle.target)) < 0.0001;
 }
 
+
+const DIGIT_ATTACK_REQUIRED_HITS = 20;
+const DIGIT_ATTACK_MAX_MISTAKES = 3;
+const DIGIT_ATTACK_WAVE_COUNT = 28;
+const DIGIT_ATTACK_WAVE_STRIDE = 6;
+
+function digitAttackApply(baseValue, operationValue, operandValue) {
+  const base = Number(baseValue);
+  const operation = Number(operationValue);
+  const operand = Number(operandValue);
+  if (!Number.isInteger(base) || !Number.isInteger(operation) || !Number.isInteger(operand)) return null;
+  if (operation === 0) return base + operand;
+  if (operation === 1) return base - operand;
+  if (operation === 2) return base * operand;
+  if (operation === 3) return operand !== 0 && base % operand === 0 ? base / operand : null;
+  return null;
+}
+
+function digitAttackDecodeWaves(numbersRaw) {
+  const numbers = Array.isArray(numbersRaw) ? numbersRaw.map(Number) : [];
+  if (numbers.length !== DIGIT_ATTACK_WAVE_COUNT * DIGIT_ATTACK_WAVE_STRIDE) return null;
+  const waves = [];
+  for (let offset = 0; offset < numbers.length; offset += DIGIT_ATTACK_WAVE_STRIDE) {
+    waves.push({
+      base: numbers[offset],
+      target: numbers[offset + 1],
+      operation: numbers[offset + 2],
+      operands: numbers.slice(offset + 3, offset + 6),
+    });
+  }
+  return waves;
+}
+
+function digitAttackCorrectLane(wave) {
+  if (!wave || !Array.isArray(wave.operands)) return -1;
+  const matches = wave.operands
+    .map((operand, lane) => digitAttackApply(wave.base, wave.operation, operand) === wave.target ? lane : -1)
+    .filter((lane) => lane >= 0);
+  return matches.length === 1 ? matches[0] : -1;
+}
+
+function isDigitAttackPuzzleEncodingValid(puzzle) {
+  if (Number(puzzle?.target) !== DIGIT_ATTACK_REQUIRED_HITS) return false;
+  const waves = digitAttackDecodeWaves(puzzle?.numbers);
+  if (!waves) return false;
+  const operationCounts = [0, 0, 0, 0];
+  let previousTarget = null;
+  for (const wave of waves) {
+    if (!Number.isInteger(wave.base) || wave.base < 1 || wave.base > 10) return false;
+    if (!Number.isInteger(wave.target) || wave.target < 1 || wave.target >= 100) return false;
+    if (!Number.isInteger(wave.operation) || wave.operation < 0 || wave.operation > 3) return false;
+    if (!Array.isArray(wave.operands) || wave.operands.length !== 3) return false;
+    if (!wave.operands.every((value) => Number.isInteger(value) && value >= 1 && value <= 40)) return false;
+    if (new Set(wave.operands).size !== 3) return false;
+    if (digitAttackCorrectLane(wave) < 0) return false;
+    if (previousTarget !== null && wave.target === previousTarget) return false;
+    previousTarget = wave.target;
+    operationCounts[wave.operation] += 1;
+  }
+  return operationCounts.every((count) => count === DIGIT_ATTACK_WAVE_COUNT / 4);
+}
+
+function digitAttackNearbyOperands(base, operation, correctOperand, target) {
+  const deltas = shuffled([-1, 1, -2, 2, -3, 3, -4, 4, -5, 5]);
+  const result = [correctOperand];
+  for (const delta of deltas) {
+    const candidate = correctOperand + delta;
+    if (candidate < 1 || candidate > 40 || result.includes(candidate)) continue;
+    if (digitAttackApply(base, operation, candidate) === target) continue;
+    result.push(candidate);
+    if (result.length === 3) break;
+  }
+  return result.length === 3 ? shuffled(result) : null;
+}
+
+function generateDigitAttackWave(operation, previousTarget = null) {
+  const divisionPairs = [[4, 2], [6, 2], [6, 3], [8, 2], [8, 4], [9, 3], [10, 2], [10, 5]];
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    let base;
+    let correctOperand;
+    if (operation === 0) {
+      base = secureRandomInt(1, 11);
+      correctOperand = secureRandomInt(6, 31);
+    } else if (operation === 1) {
+      base = secureRandomInt(3, 11);
+      correctOperand = secureRandomInt(1, base);
+    } else if (operation === 2) {
+      base = secureRandomInt(2, 11);
+      const maxOperand = Math.max(2, Math.min(9, Math.floor(99 / base)));
+      correctOperand = secureRandomInt(2, maxOperand + 1);
+    } else {
+      [base, correctOperand] = divisionPairs[secureRandomInt(0, divisionPairs.length)];
+    }
+    const target = digitAttackApply(base, operation, correctOperand);
+    if (!Number.isInteger(target) || target < 1 || target >= 100 || target === previousTarget) continue;
+    const operands = digitAttackNearbyOperands(base, operation, correctOperand, target);
+    if (!operands) continue;
+    const wave = { base, target, operation, operands };
+    if (digitAttackCorrectLane(wave) < 0) continue;
+    return wave;
+  }
+  throw new Error("Rakam Saldırısı dalgası üretilemedi.");
+}
+
+function generateDigitAttackPuzzle() {
+  // Dört işlemin her biri tam 7 kez bulunur; yalnız dalga sırası rastgele karıştırılır.
+  const operations = shuffled(Array.from({ length: 7 }, () => [0, 1, 2, 3]).flat());
+  const numbers = [];
+  let previousTarget = null;
+  for (const operation of operations) {
+    const wave = generateDigitAttackWave(operation, previousTarget);
+    numbers.push(wave.base, wave.target, wave.operation, ...wave.operands);
+    previousTarget = wave.target;
+  }
+  const puzzle = {
+    difficulty: "Standard",
+    target: DIGIT_ATTACK_REQUIRED_HITS,
+    numbers,
+    gameKey: "digit_attack",
+    initialGrid: [],
+  };
+  if (!isDigitAttackPuzzleEncodingValid(puzzle)) throw new Error("Rakam Saldırısı bulmacası doğrulanamadı.");
+  return puzzle;
+}
+
+function normalizeDigitAttackChoices(answer = {}) {
+  if (!Array.isArray(answer.choices)) return null;
+  const choices = answer.choices.map(Number);
+  if (choices.length < 1 || choices.length > DIGIT_ATTACK_WAVE_COUNT) return null;
+  if (!choices.every((lane) => Number.isInteger(lane) && lane >= 0 && lane <= 2)) return null;
+  return choices;
+}
+
+function digitAttackEvaluateAnswer(puzzle, answer = {}) {
+  if (!isDigitAttackPuzzleEncodingValid(puzzle)) return null;
+  const choices = normalizeDigitAttackChoices(answer);
+  if (!choices) return null;
+  const waves = digitAttackDecodeWaves(puzzle.numbers);
+  let correct = 0;
+  let mistakes = 0;
+  for (let index = 0; index < choices.length; index += 1) {
+    const correctLane = digitAttackCorrectLane(waves[index]);
+    if (choices[index] === correctLane) correct += 1;
+    else mistakes += 1;
+    const won = correct >= DIGIT_ATTACK_REQUIRED_HITS;
+    const lost = mistakes >= DIGIT_ATTACK_MAX_MISTAKES;
+    if (won || lost) {
+      if (index !== choices.length - 1) return null;
+      return { terminal: true, won, correct, mistakes };
+    }
+  }
+  return { terminal: false, won: false, correct, mistakes };
+}
+
+function validateDigitAttackChallengeAnswer(puzzle, answer = {}) {
+  const result = digitAttackEvaluateAnswer(puzzle, answer);
+  if (!result || !result.terminal) return false;
+  if (Number(answer.correctCount) !== result.correct) return false;
+  if (Number(answer.mistakes) !== result.mistakes) return false;
+  const expectedOutcome = result.won ? "completed" : "three_mistakes";
+  return safeText(answer.outcome, "", 32) === expectedOutcome;
+}
+
+function digitAttackAnswerIsWinning(puzzle, answer = {}) {
+  const result = digitAttackEvaluateAnswer(puzzle, answer);
+  return result?.terminal === true && result.won === true;
+}
+
 const SHORTEST_PATH_EDGE_PAIRS = Object.freeze([
   [0, 1], [0, 2], [0, 3], [0, 4],
   [1, 2], [1, 3], [1, 4],
@@ -4795,6 +4995,13 @@ const GAME_HANDLERS = Object.freeze({
     key: "equation_hunt",
     createPuzzle: () => generateEquationHuntPuzzle(),
     validateAnswer: (puzzle, answer) => validateEquationHuntChallengeAnswer(puzzle, answer),
+  }),
+  digit_attack: Object.freeze({
+    key: "digit_attack",
+    createPuzzle: () => generateDigitAttackPuzzle(),
+    // 20 doğru temas kazanma; üçüncü yanlış temas geçerli bir mağlubiyet gönderimidir.
+    validateAnswer: (puzzle, answer) => validateDigitAttackChallengeAnswer(puzzle, answer),
+    isWinningAnswer: (puzzle, answer) => digitAttackAnswerIsWinning(puzzle, answer),
   }),
   shortest_path: Object.freeze({
     key: "shortest_path",
@@ -5384,7 +5591,7 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
       playerId: realWinner.playerId,
       generalDelta: reward,
       xpDelta: winnerXp,
-      finishSampleMs: normalizeBaseGameKey(room.gameKey) === "shortest_path" &&
+      finishSampleMs: ["shortest_path", "digit_attack"].includes(normalizeBaseGameKey(room.gameKey)) &&
         realWinner.wonRoundBecauseOpponentWrongAnswer === true
         ? null
         : safeTwoPlayerFinishSampleMs(realWinner.totalElapsedMs, room.roundCount, room.gameKey),
@@ -6291,6 +6498,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     const answerWon = challengeAnswerIsWinning(
       challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer
     );
+    const wrongAnswerReason = gameKey === "shortest_path"
+      ? "wrong_route"
+      : gameKey === "digit_attack" ? "three_mistakes" : "wrong_answer";
 
     let won = null;
     let outcomeReason = null;
@@ -6298,7 +6508,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
       const outcome = answerWon
         ? botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true)
-        : { resolvable: true, won: false, reason: "wrong_route" };
+        : { resolvable: true, won: false, reason: wrongAnswerReason };
       won = outcome.won;
       outcomeReason = outcome.reason;
       rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
@@ -6322,7 +6532,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         ok: true, gameKey, ...hundredResult,
         runScore: hundredResult.runScore || 0,
         won: answerWon ? hundredResult.won : false,
-        outcomeReason: answerWon ? null : "wrong_route",
+        outcomeReason: answerWon ? null : wrongAnswerReason,
         elapsedServerMs,
       };
       await client.query(
@@ -6382,7 +6592,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       const response = {
         ok: true, gameKey, ...state,
         generalDelta: 0, infiniteDelta: 0, xpDelta: 0,
-        runScore: 0, won: false, outcomeReason: "wrong_route", elapsedServerMs,
+        runScore: 0, won: false, outcomeReason: wrongAnswerReason, elapsedServerMs,
       };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
@@ -7780,8 +7990,13 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
       ? Math.max(1, roundLimitMs - 1)
       : Math.min(botPlan.finishMs, Math.max(1, roundLimitMs - 1));
     room.botFinishHandle = setTimeout(() => {
-      if (botPlan.wrongRoute === true) {
-        registerRealtimeRoundLoss(room, botParticipant, botElapsedMs, "bot_wrong_route");
+      if (botPlan.wrongRoute === true || botPlan.forcedLoss === true) {
+        registerRealtimeRoundLoss(
+          room,
+          botParticipant,
+          botElapsedMs,
+          botPlan.forcedLoss === true ? "bot_three_mistakes" : "bot_wrong_route"
+        );
       } else {
         registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
       }
@@ -9658,7 +9873,13 @@ io.on("connection", (socket) => {
       if (challengeAnswerIsWinning(room.puzzle, payload.numberSlots, payload.operators, payload.answer)) {
         registerRealtimeRoundFinish(room, participant, elapsedMs);
       } else {
-        registerRealtimeRoundLoss(room, participant, elapsedMs, "wrong_route");
+        registerRealtimeRoundLoss(
+          room,
+          participant,
+          elapsedMs,
+          normalizeBaseGameKey(room.gameKey) === "shortest_path" ? "wrong_route" :
+            normalizeBaseGameKey(room.gameKey) === "digit_attack" ? "three_mistakes" : "wrong_answer"
+        );
       }
     }
   );
