@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "digit-attack-chain-v3-20260824";
+const SERVER_BUILD_ID = "digit-attack-drag-flow-v4-20260827";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2084,7 +2084,9 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "RAKAM SALDIRISI",
     roundDurationMs: 2 * 60 * 1000,
     hundredStageDurationMs: 2 * 60 * 1000,
-    botFinishMinMs: 80 * 1000,
+    // İlk 5: 90-119 sn. Sonrasında oyuncunun Rakam Saldırısı ortalaması ±4 sn;
+    // eski 80 sn alt sınırı bu ortak davranışı bozduğu için kaldırıldı.
+    botFinishMinMs: 1 * 1000,
     botFinishMaxMs: 119 * 1000,
     botCalibrationMinMs: 90 * 1000,
     botCalibrationMaxMs: 119 * 1000,
@@ -4674,7 +4676,7 @@ function validateTargetNumberChallengeAnswer(puzzle, answer = {}) {
 
 const DIGIT_ATTACK_REQUIRED_HITS = 20;
 const DIGIT_ATTACK_MAX_MISTAKES = 3;
-const DIGIT_ATTACK_WAVE_COUNT = 28;
+const DIGIT_ATTACK_WAVE_COUNT = 20;
 const DIGIT_ATTACK_WAVE_STRIDE = 6;
 
 function digitAttackApply(baseValue, operationValue, operandValue) {
@@ -4811,10 +4813,10 @@ function generateDigitAttackWaveFromBase(base, operation, nextOperation = null) 
 }
 
 function generateDigitAttackPuzzle() {
-  // Dört işlemin her biri tam 7 kez bulunur. İşlem sırası rastgele kalır; fakat
+  // Dört işlemin her biri tam 5 kez bulunur. İşlem sırası rastgele kalır; fakat
   // hedef bir sonraki dalganın alt sayısı olduğundan zincirin tamamı birlikte üretilir.
   for (let puzzleAttempt = 0; puzzleAttempt < 2500; puzzleAttempt += 1) {
-    const operations = shuffled(Array.from({ length: 7 }, () => [0, 1, 2, 3]).flat());
+    const operations = shuffled(Array.from({ length: 5 }, () => [0, 1, 2, 3]).flat());
     let base = secureRandomInt(4, 11);
     const waves = [];
     let failed = false;
@@ -4868,11 +4870,11 @@ function digitAttackEvaluateAnswer(puzzle, answer = {}) {
     const correctLane = digitAttackCorrectLane(waves[index]);
     if (choices[index] === correctLane) correct += 1;
     else mistakes += 1;
-    const won = correct >= DIGIT_ATTACK_REQUIRED_HITS;
     const lost = mistakes >= DIGIT_ATTACK_MAX_MISTAKES;
-    if (won || lost) {
+    const completedAllWaves = index + 1 >= DIGIT_ATTACK_WAVE_COUNT;
+    if (lost || completedAllWaves) {
       if (index !== choices.length - 1) return null;
-      return { terminal: true, won, correct, mistakes };
+      return { terminal: true, won: !lost && completedAllWaves, correct, mistakes };
     }
   }
   return { terminal: false, won: false, correct, mistakes };
@@ -4890,6 +4892,185 @@ function validateDigitAttackChallengeAnswer(puzzle, answer = {}) {
 function digitAttackAnswerIsWinning(puzzle, answer = {}) {
   const result = digitAttackEvaluateAnswer(puzzle, answer);
   return result?.terminal === true && result.won === true;
+}
+
+
+// Rakam Saldırısı gerçek zamanlı akış motoru.
+// Oyuncu bağlıyken her temas sunucuya bildirilir. Bağlantı koptuğunda ise son bilinen
+// alt-taş şeridi kullanılarak 4.5 saniyelik dalga ritmi sunucuda ilerlemeye devam eder.
+const DIGIT_ATTACK_FLOW_FALL_MS = 4_500;
+
+function isDigitAttackRealtimeRoom(room) {
+  return normalizeBaseGameKey(room?.gameKey) === "digit_attack" &&
+    isDigitAttackPuzzleEncodingValid(room?.puzzle);
+}
+
+function clearDigitAttackAutoHandle(participant) {
+  if (participant?.digitAttackAutoHandle) {
+    clearTimeout(participant.digitAttackAutoHandle);
+    participant.digitAttackAutoHandle = null;
+  }
+}
+
+function resetDigitAttackParticipantFlow(room, participant) {
+  clearDigitAttackAutoHandle(participant);
+  participant.digitAttackChoices = [];
+  participant.digitAttackLane = 1;
+  participant.digitAttackCorrect = 0;
+  participant.digitAttackMistakes = 0;
+  participant.digitAttackWaveStartedAt = Number(room?.startsAtMillis || Date.now());
+}
+
+function ensureDigitAttackParticipantFlow(room, participant) {
+  if (!isDigitAttackRealtimeRoom(room) || !participant) return null;
+  if (!Array.isArray(participant.digitAttackChoices)) {
+    resetDigitAttackParticipantFlow(room, participant);
+  }
+  participant.digitAttackLane = Math.max(0, Math.min(2, Number(participant.digitAttackLane ?? 1) || 0));
+  participant.digitAttackCorrect = Math.max(0, Number(participant.digitAttackCorrect || 0));
+  participant.digitAttackMistakes = Math.max(0, Number(participant.digitAttackMistakes || 0));
+  participant.digitAttackWaveStartedAt = Math.max(
+    Number(room?.startsAtMillis || room?.createdAt || Date.now()),
+    Number(participant.digitAttackWaveStartedAt || room?.startsAtMillis || Date.now())
+  );
+  return participant;
+}
+
+function digitAttackProgressSlots(room, participant) {
+  const state = ensureDigitAttackParticipantFlow(room, participant);
+  if (!state) return null;
+  const choices = state.digitAttackChoices.slice(0, DIGIT_ATTACK_WAVE_COUNT);
+  return [
+    choices.length,
+    state.digitAttackCorrect,
+    state.digitAttackMistakes,
+    state.digitAttackLane,
+    ...Array.from({ length: DIGIT_ATTACK_WAVE_COUNT }, (_, index) =>
+      index < choices.length ? choices[index] : null
+    ),
+  ];
+}
+
+function emitDigitAttackState(room, participant) {
+  if (!room || !participant || !isDigitAttackRealtimeRoom(room)) return;
+  emitToRoomParticipant(participant, "digit_attack_state", {
+    roomId: room.roomId,
+    roundIndex: room.roundIndex,
+    progressSlots: digitAttackProgressSlots(room, participant),
+    waveStartedAtMillis: Number(participant.digitAttackWaveStartedAt || room.startsAtMillis || Date.now()),
+  });
+}
+
+function applyRealtimeDigitAttackChoice(room, participant, laneValue, expectedWaveIndex = null, source = "player") {
+  const state = ensureDigitAttackParticipantFlow(room, participant);
+  if (!state || room.resolved || participant.finishedRoundIndex === room.roundIndex) return false;
+  if (Date.now() < Number(room.startsAtMillis || room.createdAt || 0)) return false;
+
+  const waves = digitAttackDecodeWaves(room.puzzle?.numbers);
+  if (!waves) return false;
+  const waveIndex = state.digitAttackChoices.length;
+  if (expectedWaveIndex !== null && Number(expectedWaveIndex) !== waveIndex) {
+    // Eski/stale istemci teması authoritative akışı geri saramaz.
+    emitDigitAttackState(room, participant);
+    return false;
+  }
+  if (waveIndex >= DIGIT_ATTACK_WAVE_COUNT) return false;
+
+  const lane = Math.max(0, Math.min(2, Math.floor(Number(laneValue) || 0)));
+  state.digitAttackChoices.push(lane);
+  if (lane === digitAttackCorrectLane(waves[waveIndex])) state.digitAttackCorrect += 1;
+  else state.digitAttackMistakes += 1;
+  // Her temastan sonra yeni alt taş merkezde doğar. Bağlantı kopukken ilk kaçırılan
+  // dalga oyuncunun son şeridini, sonraki kaçırılan dalgalar merkez şeridi kullanır.
+  state.digitAttackLane = 1;
+
+  const elapsedMs = Math.max(1, Date.now() - Number(room.startsAtMillis || room.createdAt || Date.now()));
+  const lost = state.digitAttackMistakes >= DIGIT_ATTACK_MAX_MISTAKES;
+  const completed = state.digitAttackChoices.length >= DIGIT_ATTACK_WAVE_COUNT;
+
+  if (lost || completed) {
+    const wasAway = !participant.connected || participant.backgrounded || Boolean(participant.awaySince);
+    const preservedAwaySince = participant.awaySince || Date.now();
+    const preservedReconnectDeadline = participant.reconnectDeadlineAt || (preservedAwaySince + ROOM_RECONNECT_TIMEOUT_MS);
+    clearDigitAttackAutoHandle(state);
+
+    if (lost) {
+      registerRealtimeRoundLoss(
+        room,
+        participant,
+        elapsedMs,
+        source === "away" ? "digit_attack_away_three_mistakes" : "three_mistakes"
+      );
+    } else {
+      registerRealtimeRoundFinish(room, participant, elapsedMs);
+    }
+
+    // Çok elli maçta bir el bağlantı kesikken sonuçlanabilir. Ortak round motoru
+    // clearParticipantAwayState çağırdığı için kopuk oyuncuyu yanlışlıkla bağlı saymamak adına
+    // aynı away oturumunu sonraki ele taşı ve canlı akışı orada da sürdür.
+    if (wasAway && !room.resolved) {
+      participant.connected = false;
+      participant.backgrounded = true;
+      participant.awaySince = preservedAwaySince;
+      participant.reconnectDeadlineAt = preservedReconnectDeadline;
+      scheduleParticipantAwayTimeout(room, participant.playerId);
+      scheduleDigitAttackAwayFlow(room, participant.playerId);
+    }
+    return true;
+  }
+
+  state.digitAttackWaveStartedAt = Date.now();
+  emitDigitAttackState(room, participant);
+  // `away` kaynaklı catch-up zaten advanceDigitAttackAwayFlowToNow döngüsü içindedir.
+  // Buradan yeniden schedule çağırmak recursive catch-up oluşturur; yalnız canlı oyuncu
+  // tam bu sırada away durumuna geçtiyse yeni zamanlayıcı kur.
+  if (source !== "away" && (!participant.connected || participant.backgrounded || participant.awaySince)) {
+    scheduleDigitAttackAwayFlow(room, participant.playerId);
+  }
+  return true;
+}
+
+function advanceDigitAttackAwayFlowToNow(room, participant) {
+  const state = ensureDigitAttackParticipantFlow(room, participant);
+  if (!state || room.resolved || participant.finishedRoundIndex === room.roundIndex) return;
+  if (participant.connected && !participant.backgrounded && !participant.awaySince) return;
+
+  let guard = DIGIT_ATTACK_WAVE_COUNT + 2;
+  const now = Date.now();
+  while (guard-- > 0 && !room.resolved && participant.finishedRoundIndex !== room.roundIndex) {
+    const dueAt = Number(state.digitAttackWaveStartedAt || room.startsAtMillis || now) + DIGIT_ATTACK_FLOW_FALL_MS;
+    if (dueAt > now) break;
+    // Gecikmeli callback / uygulamanın tamamen kapalı kalması durumunda geçmiş dalgaları
+    // tek tek işler; sonraki başlangıcı gerçek ritme göre ilerletir.
+    const previousStart = Number(state.digitAttackWaveStartedAt || dueAt - DIGIT_ATTACK_FLOW_FALL_MS);
+    const applied = applyRealtimeDigitAttackChoice(room, participant, state.digitAttackLane, null, "away");
+    if (!applied || room.resolved || participant.finishedRoundIndex === room.roundIndex) break;
+    state.digitAttackWaveStartedAt = previousStart + DIGIT_ATTACK_FLOW_FALL_MS;
+  }
+}
+
+function scheduleDigitAttackAwayFlow(room, playerId) {
+  const participant = getParticipant(room, playerId);
+  const state = ensureDigitAttackParticipantFlow(room, participant);
+  if (!state || room.resolved || participant.finishedRoundIndex === room.roundIndex) return;
+  if (participant.connected && !participant.backgrounded && !participant.awaySince) return;
+
+  clearDigitAttackAutoHandle(state);
+  advanceDigitAttackAwayFlowToNow(room, participant);
+  if (room.resolved || participant.finishedRoundIndex === room.roundIndex) return;
+
+  const dueAt = Number(state.digitAttackWaveStartedAt || room.startsAtMillis || Date.now()) + DIGIT_ATTACK_FLOW_FALL_MS;
+  const waitMs = Math.max(0, dueAt - Date.now());
+  state.digitAttackAutoHandle = setTimeout(() => {
+    state.digitAttackAutoHandle = null;
+    const liveRoom = realtimeRooms.get(room.roomId);
+    const liveParticipant = getParticipant(liveRoom, playerId);
+    if (!liveRoom || !liveParticipant || liveRoom.resolved) return;
+    if (liveParticipant.connected && !liveParticipant.backgrounded && !liveParticipant.awaySince) return;
+    advanceDigitAttackAwayFlowToNow(liveRoom, liveParticipant);
+    scheduleDigitAttackAwayFlow(liveRoom, playerId);
+  }, waitMs);
+  state.digitAttackAutoHandle.unref?.();
 }
 
 const SHORTEST_PATH_EDGE_PAIRS = Object.freeze([
@@ -5052,7 +5233,7 @@ const GAME_HANDLERS = Object.freeze({
   digit_attack: Object.freeze({
     key: "digit_attack",
     createPuzzle: () => generateDigitAttackPuzzle(),
-    // 20 doğru temas kazanma; üçüncü yanlış temas geçerli bir mağlubiyet gönderimidir.
+    // 20 dalgayı 3 yanlışa ulaşmadan tamamlama kazanır; üçüncü yanlış temas geçerli bir mağlubiyet gönderimidir.
     validateAnswer: (puzzle, answer) => validateDigitAttackChallengeAnswer(puzzle, answer),
     isWinningAnswer: (puzzle, answer) => digitAttackAnswerIsWinning(puzzle, answer),
   }),
@@ -7686,6 +7867,7 @@ function clearParticipantTimeout(
 
     participant.timeoutHandle = null;
   }
+  clearDigitAttackAutoHandle(participant);
 }
 
 function clearRoomTimeouts(room) {
@@ -8019,6 +8201,11 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
     participant.elapsedMs = null;
     participant.roundElapsedMs = null;
     participant.finishedRoundIndex = null;
+    if (isDigitAttackRealtimeRoom(room)) {
+      resetDigitAttackParticipantFlow(room, participant);
+    } else {
+      clearDigitAttackAutoHandle(participant);
+    }
   });
 
   const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
@@ -8582,6 +8769,7 @@ function markSocketDisconnected(socket) {
     room,
     participant.playerId
   );
+  scheduleDigitAttackAwayFlow(room, participant.playerId);
 }
 
 app.get("/", (req, res) => {
@@ -9429,6 +9617,8 @@ io.on("connection", (socket) => {
         return;
       }
 
+      advanceDigitAttackAwayFlowToNow(room, participant);
+
       if (room.resolved) {
         socket.emit(
           "resume_error",
@@ -9436,7 +9626,8 @@ io.on("connection", (socket) => {
             code:
               "MATCH_RESOLVED",
             message:
-              "Bu maç zaten sona ermiş.",
+              "Bu maç bağlantı kesikken veya siz uzaktayken sonuçlandı.",
+            won: room.winnerPlayerId === participant.playerId,
             opponentFinishedMs:
               Number(
                 opponent?.elapsedMs ||
@@ -9526,6 +9717,10 @@ io.on("connection", (socket) => {
           opponentRoundWins: Number(opponent?.roundWins || 0),
 
           opponentFinishedMs: Number(opponent?.roundElapsedMs || 0),
+          digitAttackProgressSlots: digitAttackProgressSlots(room, participant),
+          digitAttackWaveStartedAtMillis: Number(
+            participant.digitAttackWaveStartedAt || room.startsAtMillis || room.createdAt || 0
+          ),
         }
       );
 
@@ -9587,6 +9782,7 @@ io.on("connection", (socket) => {
         room,
         participant.playerId
       );
+      scheduleDigitAttackAwayFlow(room, participant.playerId);
 
       realtimeLog(
         "Player backgrounded:",
@@ -9654,10 +9850,24 @@ io.on("connection", (socket) => {
         return;
       }
 
+      advanceDigitAttackAwayFlowToNow(room, participant);
+      if (room.resolved) {
+        socket.emit("resume_error", {
+          code: "MATCH_RESOLVED",
+          message: "Maç bağlantı kesikken sonuçlandı.",
+          won: room.winnerPlayerId === participant.playerId,
+          opponentFinishedMs: Number(
+            getOpponentParticipant(room, participant.playerId)?.elapsedMs || 0
+          ),
+        });
+        return;
+      }
+
       clearParticipantAwayState(
         room,
         participant.playerId
       );
+      emitDigitAttackState(room, participant);
 
       realtimeLog(
         "Player foregrounded:",
@@ -9897,6 +10107,42 @@ io.on("connection", (socket) => {
           room.gameKey,
           room.difficulty
         )
+      );
+    }
+  );
+
+  socket.on(
+    "digit_attack_lane",
+    (payload = {}) => {
+      const roomId = String(payload.roomId || "").trim();
+      const room = realtimeRooms.get(roomId);
+      const active = activeRooms.get(socket.id);
+      if (!room || !active || active.roomId !== roomId || room.resolved || !isDigitAttackRealtimeRoom(room)) return;
+      const participant = getParticipant(room, active.playerId);
+      const state = ensureDigitAttackParticipantFlow(room, participant);
+      if (!state || participant.isBot || participant.finishedRoundIndex === room.roundIndex) return;
+      if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
+      state.digitAttackLane = Math.max(0, Math.min(2, Math.floor(Number(payload.lane) || 0)));
+    }
+  );
+
+  socket.on(
+    "digit_attack_choice",
+    async (payload = {}) => {
+      const roomId = String(payload.roomId || "").trim();
+      const room = realtimeRooms.get(roomId);
+      const active = activeRooms.get(socket.id);
+      if (!room || !active || active.roomId !== roomId || room.resolved || !isDigitAttackRealtimeRoom(room)) return;
+      const participant = getParticipant(room, active.playerId);
+      if (!participant || participant.isBot || participant.finishedRoundIndex === room.roundIndex) return;
+      if (!(await socketHasActiveGameplaySession(socket, participant.playerId, "match_error"))) return;
+      if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
+      applyRealtimeDigitAttackChoice(
+        room,
+        participant,
+        payload.lane,
+        Number(payload.waveIndex),
+        "player"
       );
     }
   );
