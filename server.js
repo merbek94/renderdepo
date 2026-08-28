@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "digit-attack-drag-flow-v4-20260827";
+const SERVER_BUILD_ID = "digit-attack-chain-v3-20260824";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -761,6 +761,8 @@ async function initDatabase() {
       hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12),
       two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0),
       two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0),
+      two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0),
+      two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0),
       stats JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (player_id, game_key)
@@ -792,6 +794,10 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS stats JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE player_game_progress
@@ -2084,9 +2090,7 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "RAKAM SALDIRISI",
     roundDurationMs: 2 * 60 * 1000,
     hundredStageDurationMs: 2 * 60 * 1000,
-    // İlk 5: 90-119 sn. Sonrasında oyuncunun Rakam Saldırısı ortalaması ±4 sn;
-    // eski 80 sn alt sınırı bu ortak davranışı bozduğu için kaldırıldı.
-    botFinishMinMs: 1 * 1000,
+    botFinishMinMs: 80 * 1000,
     botFinishMaxMs: 119 * 1000,
     botCalibrationMinMs: 90 * 1000,
     botCalibrationMaxMs: 119 * 1000,
@@ -2096,15 +2100,75 @@ const GAME_DEFINITIONS = Object.freeze({
   consecutive: Object.freeze({
     key: "consecutive",
     displayName: "ARDIŞIK",
-    // 15 taşlı 5x5 tahta için ortak rekabet süresi 5 dakika.
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Ortak bot motoru; Toplam Eşittir ile aynı 4-5 dk kalibrasyon + oyuncu ortalamasının ±7 sn çevresi.
     botFinishMinMs: 1 * 1000,
     botFinishMaxMs: 299 * 1000,
     botCalibrationMinMs: 4 * 60 * 1000,
     botCalibrationMaxMs: 5 * 60 * 1000,
     botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  merge_5120: Object.freeze({
+    key: "merge_5120",
+    displayName: "5120",
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // Bu oyunda bot süreyle değil authoritative oyun-içi skorla yarışır.
+    scoreBasedCompetition: true,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 119 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 0,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  number_puzzle: Object.freeze({
+    key: "number_puzzle",
+    displayName: "SAYI BULMACASI",
+    roundDurationMs: 5 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
+    botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  sudoku: Object.freeze({
+    key: "sudoku",
+    displayName: "SUDOKU",
+    roundDurationMs: 15 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 899 * 1000,
+    botCalibrationMinMs: 12 * 60 * 1000,
+    botCalibrationMaxMs: 15 * 60 * 1000,
+    botAverageVarianceMs: 15 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  nonogram: Object.freeze({
+    key: "nonogram",
+    displayName: "NONOGRAM",
+    roundDurationMs: 15 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 899 * 1000,
+    botCalibrationMinMs: 12 * 60 * 1000,
+    botCalibrationMaxMs: 15 * 60 * 1000,
+    botAverageVarianceMs: 15 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  result_find: Object.freeze({
+    key: "result_find",
+    displayName: "SONUCU BUL",
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 24 * 1000,
+    botFinishMaxMs: 105 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
 });
@@ -3183,6 +3247,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
   const result = await client.query(
     `SELECT s.general_score, p.game_rights, p.game_rights_refill_at,
             gp.two_player_finish_count, gp.two_player_finish_total_ms,
+            gp.two_player_score_count, gp.two_player_score_total,
             gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
             gp.tournament_completed, p.tournament_tickets, gp.tournament_entry_active
      FROM player_scores s
@@ -3199,6 +3264,8 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
   state.finishProfile = normalizeTwoPlayerFinishProfile({
     finishCount: lockedRow.two_player_finish_count,
     finishTotalMs: lockedRow.two_player_finish_total_ms,
+    scoreCount: lockedRow.two_player_score_count,
+    scoreTotal: lockedRow.two_player_score_total,
   });
   state.tournamentResponse = {
     currentStage: Math.max(1, Math.min(Number(lockedRow.tournament_stage || 1), 8)),
@@ -4179,17 +4246,20 @@ function normalizeTwoPlayerFinishProfile(profile = {}) {
   const finishTotalMs = Number.isFinite(parsedFinishTotalMs)
     ? Math.max(0, Math.floor(parsedFinishTotalMs))
     : 0;
-  const averageFinishMs = finishCount > 0
-    ? Math.round(finishTotalMs / finishCount)
-    : null;
-  return { finishCount, finishTotalMs, averageFinishMs };
+  const parsedScoreCount = Number(profile.scoreCount || 0);
+  const parsedScoreTotal = Number(profile.scoreTotal || 0);
+  const scoreCount = Number.isFinite(parsedScoreCount) ? Math.max(0, Math.floor(parsedScoreCount)) : 0;
+  const scoreTotal = Number.isFinite(parsedScoreTotal) ? Math.max(0, Math.floor(parsedScoreTotal)) : 0;
+  const averageFinishMs = finishCount > 0 ? Math.round(finishTotalMs / finishCount) : null;
+  const averageScore = scoreCount > 0 ? Math.round(scoreTotal / scoreCount) : null;
+  return { finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore };
 }
 
 async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey = "target_number") {
   const normalizedGameKey = normalizeBaseGameKey(gameKey);
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
-    `SELECT two_player_finish_count, two_player_finish_total_ms
+    `SELECT two_player_finish_count, two_player_finish_total_ms, two_player_score_count, two_player_score_total
      FROM player_game_progress
      WHERE player_id = $1 AND game_key = $2
      FOR UPDATE`,
@@ -4199,6 +4269,8 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey
   return normalizeTwoPlayerFinishProfile({
     finishCount: row.two_player_finish_count,
     finishTotalMs: row.two_player_finish_total_ms,
+    scoreCount: row.two_player_score_count,
+    scoreTotal: row.two_player_score_total,
   });
 }
 
@@ -4223,6 +4295,27 @@ async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedM
          updated_at = NOW()
      WHERE player_id = $1 AND game_key = $3`,
     [playerId, safeElapsedMs, normalizedGameKey]
+  );
+}
+
+async function recordTwoPlayerScoreInTransaction(client, playerId, scoreValue, gameKey = "merge_5120") {
+  const score = Math.max(0, Math.min(2_000_000_000, Math.floor(Number(scoreValue) || 0)));
+  const normalizedGameKey = normalizeBaseGameKey(gameKey);
+  await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
+  await client.query(
+    `UPDATE player_game_progress
+     SET two_player_score_count = LEAST(two_player_score_count + 1, 2000000000),
+         two_player_score_total = LEAST(two_player_score_total + $2::bigint, 9223372036854775807::bigint),
+         stats = jsonb_set(
+           jsonb_set(
+             jsonb_set(COALESCE(stats, '{}'::jsonb), '{scoreGames}', to_jsonb(LEAST(COALESCE((stats->>'scoreGames')::bigint,0)+1,2000000000)), true),
+             '{totalGameScore}', to_jsonb(LEAST(COALESCE((stats->>'totalGameScore')::bigint,0)+$2::bigint,9223372036854775807::bigint)), true
+           ),
+           '{bestGameScore}', to_jsonb(GREATEST(COALESCE((stats->>'bestGameScore')::bigint,0),$2::bigint)), true
+         ),
+         updated_at = NOW()
+     WHERE player_id = $1 AND game_key = $3`,
+    [playerId, score, normalizedGameKey]
   );
 }
 
@@ -4307,6 +4400,23 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
   const config = gameDefinition(gameKey);
   const baseGameKey = normalizeBaseGameKey(gameKey);
 
+  if (baseGameKey === "merge_5120") {
+    const profile = normalizeTwoPlayerFinishProfile(finishProfile);
+    const botScore = profile.scoreCount < 5 || profile.averageScore === null
+      ? secureRandomInt(300, 401)
+      : secureRandomInt(
+          Math.max(0, profile.averageScore - 200),
+          Math.max(1, Math.min(2_000_000_000, profile.averageScore + 200) + 1)
+        );
+    return {
+      finishMs: null,
+      leaveMs: null,
+      scoreBased: true,
+      score: botScore,
+      roundDurationMs: Number(config.roundDurationMs || 120_000),
+    };
+  }
+
   // Oyun-bazlı %21 özel yenilgi davranışları diğer bot kurallarından tamamen izoledir.
   // Kalan %79'da ayrılma / çözememe / kalibrasyon dahil ortak bot motoru aynen çalışır.
   const wrongShortestPathRoute = baseGameKey === "shortest_path" && secureRandomInt(0, 10000) < 2100;
@@ -4353,6 +4463,15 @@ function botPlanTimeMs(value) {
 }
 
 function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
+  if (plan?.scoreBased === true) {
+    const roundDurationMs = Math.max(1_000, Number(plan?.roundDurationMs || 120_000));
+    if (elapsedMs >= roundDurationMs) {
+      // Skor tabanlı 5120 botunda oyuncu süre sonuna kadar sonuç göndermediyse botun
+      // pozitif skoru karşısında hükmen kaybeder; bağlantıyı keserek beraberlik kazanılamaz.
+      return { resolvable: true, won: false, reason: "lower_score" };
+    }
+    return { resolvable: false, won: null, reason: "score_round_active" };
+  }
   const leaveMs = botPlanTimeMs(plan?.leaveMs);
   const finishMs = botPlanTimeMs(plan?.finishMs);
   if (leaveMs !== null && elapsedMs >= leaveMs) {
@@ -4676,7 +4795,7 @@ function validateTargetNumberChallengeAnswer(puzzle, answer = {}) {
 
 const DIGIT_ATTACK_REQUIRED_HITS = 20;
 const DIGIT_ATTACK_MAX_MISTAKES = 3;
-const DIGIT_ATTACK_WAVE_COUNT = 20;
+const DIGIT_ATTACK_WAVE_COUNT = 28;
 const DIGIT_ATTACK_WAVE_STRIDE = 6;
 
 function digitAttackApply(baseValue, operationValue, operandValue) {
@@ -4813,10 +4932,10 @@ function generateDigitAttackWaveFromBase(base, operation, nextOperation = null) 
 }
 
 function generateDigitAttackPuzzle() {
-  // Dört işlemin her biri tam 5 kez bulunur. İşlem sırası rastgele kalır; fakat
+  // Dört işlemin her biri tam 7 kez bulunur. İşlem sırası rastgele kalır; fakat
   // hedef bir sonraki dalganın alt sayısı olduğundan zincirin tamamı birlikte üretilir.
   for (let puzzleAttempt = 0; puzzleAttempt < 2500; puzzleAttempt += 1) {
-    const operations = shuffled(Array.from({ length: 5 }, () => [0, 1, 2, 3]).flat());
+    const operations = shuffled(Array.from({ length: 7 }, () => [0, 1, 2, 3]).flat());
     let base = secureRandomInt(4, 11);
     const waves = [];
     let failed = false;
@@ -4870,11 +4989,11 @@ function digitAttackEvaluateAnswer(puzzle, answer = {}) {
     const correctLane = digitAttackCorrectLane(waves[index]);
     if (choices[index] === correctLane) correct += 1;
     else mistakes += 1;
+    const won = correct >= DIGIT_ATTACK_REQUIRED_HITS;
     const lost = mistakes >= DIGIT_ATTACK_MAX_MISTAKES;
-    const completedAllWaves = index + 1 >= DIGIT_ATTACK_WAVE_COUNT;
-    if (lost || completedAllWaves) {
+    if (won || lost) {
       if (index !== choices.length - 1) return null;
-      return { terminal: true, won: !lost && completedAllWaves, correct, mistakes };
+      return { terminal: true, won, correct, mistakes };
     }
   }
   return { terminal: false, won: false, correct, mistakes };
@@ -4892,185 +5011,6 @@ function validateDigitAttackChallengeAnswer(puzzle, answer = {}) {
 function digitAttackAnswerIsWinning(puzzle, answer = {}) {
   const result = digitAttackEvaluateAnswer(puzzle, answer);
   return result?.terminal === true && result.won === true;
-}
-
-
-// Rakam Saldırısı gerçek zamanlı akış motoru.
-// Oyuncu bağlıyken her temas sunucuya bildirilir. Bağlantı koptuğunda ise son bilinen
-// alt-taş şeridi kullanılarak 4.5 saniyelik dalga ritmi sunucuda ilerlemeye devam eder.
-const DIGIT_ATTACK_FLOW_FALL_MS = 4_500;
-
-function isDigitAttackRealtimeRoom(room) {
-  return normalizeBaseGameKey(room?.gameKey) === "digit_attack" &&
-    isDigitAttackPuzzleEncodingValid(room?.puzzle);
-}
-
-function clearDigitAttackAutoHandle(participant) {
-  if (participant?.digitAttackAutoHandle) {
-    clearTimeout(participant.digitAttackAutoHandle);
-    participant.digitAttackAutoHandle = null;
-  }
-}
-
-function resetDigitAttackParticipantFlow(room, participant) {
-  clearDigitAttackAutoHandle(participant);
-  participant.digitAttackChoices = [];
-  participant.digitAttackLane = 1;
-  participant.digitAttackCorrect = 0;
-  participant.digitAttackMistakes = 0;
-  participant.digitAttackWaveStartedAt = Number(room?.startsAtMillis || Date.now());
-}
-
-function ensureDigitAttackParticipantFlow(room, participant) {
-  if (!isDigitAttackRealtimeRoom(room) || !participant) return null;
-  if (!Array.isArray(participant.digitAttackChoices)) {
-    resetDigitAttackParticipantFlow(room, participant);
-  }
-  participant.digitAttackLane = Math.max(0, Math.min(2, Number(participant.digitAttackLane ?? 1) || 0));
-  participant.digitAttackCorrect = Math.max(0, Number(participant.digitAttackCorrect || 0));
-  participant.digitAttackMistakes = Math.max(0, Number(participant.digitAttackMistakes || 0));
-  participant.digitAttackWaveStartedAt = Math.max(
-    Number(room?.startsAtMillis || room?.createdAt || Date.now()),
-    Number(participant.digitAttackWaveStartedAt || room?.startsAtMillis || Date.now())
-  );
-  return participant;
-}
-
-function digitAttackProgressSlots(room, participant) {
-  const state = ensureDigitAttackParticipantFlow(room, participant);
-  if (!state) return null;
-  const choices = state.digitAttackChoices.slice(0, DIGIT_ATTACK_WAVE_COUNT);
-  return [
-    choices.length,
-    state.digitAttackCorrect,
-    state.digitAttackMistakes,
-    state.digitAttackLane,
-    ...Array.from({ length: DIGIT_ATTACK_WAVE_COUNT }, (_, index) =>
-      index < choices.length ? choices[index] : null
-    ),
-  ];
-}
-
-function emitDigitAttackState(room, participant) {
-  if (!room || !participant || !isDigitAttackRealtimeRoom(room)) return;
-  emitToRoomParticipant(participant, "digit_attack_state", {
-    roomId: room.roomId,
-    roundIndex: room.roundIndex,
-    progressSlots: digitAttackProgressSlots(room, participant),
-    waveStartedAtMillis: Number(participant.digitAttackWaveStartedAt || room.startsAtMillis || Date.now()),
-  });
-}
-
-function applyRealtimeDigitAttackChoice(room, participant, laneValue, expectedWaveIndex = null, source = "player") {
-  const state = ensureDigitAttackParticipantFlow(room, participant);
-  if (!state || room.resolved || participant.finishedRoundIndex === room.roundIndex) return false;
-  if (Date.now() < Number(room.startsAtMillis || room.createdAt || 0)) return false;
-
-  const waves = digitAttackDecodeWaves(room.puzzle?.numbers);
-  if (!waves) return false;
-  const waveIndex = state.digitAttackChoices.length;
-  if (expectedWaveIndex !== null && Number(expectedWaveIndex) !== waveIndex) {
-    // Eski/stale istemci teması authoritative akışı geri saramaz.
-    emitDigitAttackState(room, participant);
-    return false;
-  }
-  if (waveIndex >= DIGIT_ATTACK_WAVE_COUNT) return false;
-
-  const lane = Math.max(0, Math.min(2, Math.floor(Number(laneValue) || 0)));
-  state.digitAttackChoices.push(lane);
-  if (lane === digitAttackCorrectLane(waves[waveIndex])) state.digitAttackCorrect += 1;
-  else state.digitAttackMistakes += 1;
-  // Her temastan sonra yeni alt taş merkezde doğar. Bağlantı kopukken ilk kaçırılan
-  // dalga oyuncunun son şeridini, sonraki kaçırılan dalgalar merkez şeridi kullanır.
-  state.digitAttackLane = 1;
-
-  const elapsedMs = Math.max(1, Date.now() - Number(room.startsAtMillis || room.createdAt || Date.now()));
-  const lost = state.digitAttackMistakes >= DIGIT_ATTACK_MAX_MISTAKES;
-  const completed = state.digitAttackChoices.length >= DIGIT_ATTACK_WAVE_COUNT;
-
-  if (lost || completed) {
-    const wasAway = !participant.connected || participant.backgrounded || Boolean(participant.awaySince);
-    const preservedAwaySince = participant.awaySince || Date.now();
-    const preservedReconnectDeadline = participant.reconnectDeadlineAt || (preservedAwaySince + ROOM_RECONNECT_TIMEOUT_MS);
-    clearDigitAttackAutoHandle(state);
-
-    if (lost) {
-      registerRealtimeRoundLoss(
-        room,
-        participant,
-        elapsedMs,
-        source === "away" ? "digit_attack_away_three_mistakes" : "three_mistakes"
-      );
-    } else {
-      registerRealtimeRoundFinish(room, participant, elapsedMs);
-    }
-
-    // Çok elli maçta bir el bağlantı kesikken sonuçlanabilir. Ortak round motoru
-    // clearParticipantAwayState çağırdığı için kopuk oyuncuyu yanlışlıkla bağlı saymamak adına
-    // aynı away oturumunu sonraki ele taşı ve canlı akışı orada da sürdür.
-    if (wasAway && !room.resolved) {
-      participant.connected = false;
-      participant.backgrounded = true;
-      participant.awaySince = preservedAwaySince;
-      participant.reconnectDeadlineAt = preservedReconnectDeadline;
-      scheduleParticipantAwayTimeout(room, participant.playerId);
-      scheduleDigitAttackAwayFlow(room, participant.playerId);
-    }
-    return true;
-  }
-
-  state.digitAttackWaveStartedAt = Date.now();
-  emitDigitAttackState(room, participant);
-  // `away` kaynaklı catch-up zaten advanceDigitAttackAwayFlowToNow döngüsü içindedir.
-  // Buradan yeniden schedule çağırmak recursive catch-up oluşturur; yalnız canlı oyuncu
-  // tam bu sırada away durumuna geçtiyse yeni zamanlayıcı kur.
-  if (source !== "away" && (!participant.connected || participant.backgrounded || participant.awaySince)) {
-    scheduleDigitAttackAwayFlow(room, participant.playerId);
-  }
-  return true;
-}
-
-function advanceDigitAttackAwayFlowToNow(room, participant) {
-  const state = ensureDigitAttackParticipantFlow(room, participant);
-  if (!state || room.resolved || participant.finishedRoundIndex === room.roundIndex) return;
-  if (participant.connected && !participant.backgrounded && !participant.awaySince) return;
-
-  let guard = DIGIT_ATTACK_WAVE_COUNT + 2;
-  const now = Date.now();
-  while (guard-- > 0 && !room.resolved && participant.finishedRoundIndex !== room.roundIndex) {
-    const dueAt = Number(state.digitAttackWaveStartedAt || room.startsAtMillis || now) + DIGIT_ATTACK_FLOW_FALL_MS;
-    if (dueAt > now) break;
-    // Gecikmeli callback / uygulamanın tamamen kapalı kalması durumunda geçmiş dalgaları
-    // tek tek işler; sonraki başlangıcı gerçek ritme göre ilerletir.
-    const previousStart = Number(state.digitAttackWaveStartedAt || dueAt - DIGIT_ATTACK_FLOW_FALL_MS);
-    const applied = applyRealtimeDigitAttackChoice(room, participant, state.digitAttackLane, null, "away");
-    if (!applied || room.resolved || participant.finishedRoundIndex === room.roundIndex) break;
-    state.digitAttackWaveStartedAt = previousStart + DIGIT_ATTACK_FLOW_FALL_MS;
-  }
-}
-
-function scheduleDigitAttackAwayFlow(room, playerId) {
-  const participant = getParticipant(room, playerId);
-  const state = ensureDigitAttackParticipantFlow(room, participant);
-  if (!state || room.resolved || participant.finishedRoundIndex === room.roundIndex) return;
-  if (participant.connected && !participant.backgrounded && !participant.awaySince) return;
-
-  clearDigitAttackAutoHandle(state);
-  advanceDigitAttackAwayFlowToNow(room, participant);
-  if (room.resolved || participant.finishedRoundIndex === room.roundIndex) return;
-
-  const dueAt = Number(state.digitAttackWaveStartedAt || room.startsAtMillis || Date.now()) + DIGIT_ATTACK_FLOW_FALL_MS;
-  const waitMs = Math.max(0, dueAt - Date.now());
-  state.digitAttackAutoHandle = setTimeout(() => {
-    state.digitAttackAutoHandle = null;
-    const liveRoom = realtimeRooms.get(room.roomId);
-    const liveParticipant = getParticipant(liveRoom, playerId);
-    if (!liveRoom || !liveParticipant || liveRoom.resolved) return;
-    if (liveParticipant.connected && !liveParticipant.backgrounded && !liveParticipant.awaySince) return;
-    advanceDigitAttackAwayFlowToNow(liveRoom, liveParticipant);
-    scheduleDigitAttackAwayFlow(liveRoom, playerId);
-  }, waitMs);
-  state.digitAttackAutoHandle.unref?.();
 }
 
 const SHORTEST_PATH_EDGE_PAIRS = Object.freeze([
@@ -5199,6 +5139,588 @@ function shortestPathAnswerIsWinning(puzzle, answer = {}) {
   return shortestPathRouteTotal(puzzle.numbers, route) === Number(puzzle.target);
 }
 
+// ============================================================================
+// 5120 / SAYI BULMACASI / SUDOKU / NONOGRAM / SONUCU BUL authoritative rules
+// ============================================================================
+const MERGE_5120_ROWS = 8;
+const MERGE_5120_COLS = 6;
+const MERGE_5120_CELLS = MERGE_5120_ROWS * MERGE_5120_COLS;
+const MERGE_5120_MOVE_CAP = 512;
+const NUMBER_PUZZLE_COLS = 17;
+const NUMBER_PUZZLE_ROWS = 17;
+const NUMBER_PUZZLE_CELLS = NUMBER_PUZZLE_COLS * NUMBER_PUZZLE_ROWS;
+const NUMBER_PUZZLE_EMPTY = -9000;
+const NUMBER_PUZZLE_PLUS = -9001;
+const NUMBER_PUZZLE_MINUS = -9002;
+const NUMBER_PUZZLE_MULTIPLY = -9003;
+const NUMBER_PUZZLE_DIVIDE = -9004;
+const NUMBER_PUZZLE_EQUALS = -9005;
+
+function merge5120Hash(seedValue, orderValue) {
+  let x = (Number(seedValue) | 0) ^ Math.imul(Number(orderValue) | 0, 0x9E3779B9 | 0);
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x7FEB352D | 0);
+  x ^= x >>> 15;
+  x = Math.imul(x, 0x846CA68B | 0);
+  x ^= x >>> 16;
+  return (x >>> 0) / 4294967296;
+}
+
+function merge5120Tile(seed, orderValue) {
+  const order = Math.max(1, Math.floor(Number(orderValue) || 1));
+  if (order <= 12) {
+    const values = [2, 3, 4, 6];
+    return values[Math.min(values.length - 1, Math.floor(merge5120Hash(seed, order) * values.length))];
+  }
+  let groups;
+  let multiplier = 1;
+  if (order <= 39) {
+    groups = [[[2, 3], 17.5], [[4, 6], 12.5], [[8, 12], 35], [[16, 24], 22.5], [[32, 48], 12.5]];
+  } else if (order <= 97) {
+    groups = [[[2, 3], 20], [[4, 6], 15], [[8, 12], 10], [[16, 24], 15], [[32, 48], 15], [[64, 96], 25]];
+  } else {
+    groups = [[[4, 6], 25], [[8, 12], 40], [[16, 24], 5], [[32, 48], 10], [[64, 96], 5], [[128, 192], 8], [[256, 384], 7]];
+    if (order > 200) {
+      let upper = 400;
+      let shift = 1;
+      while (order > upper && upper < 0x3fffffff) { upper *= 2; shift += 1; }
+      multiplier = 2 ** Math.min(20, shift);
+    }
+  }
+  const r = merge5120Hash(seed, order) * 100;
+  let cursor = 0;
+  let pair = groups[groups.length - 1][0];
+  for (const [candidate, weight] of groups) {
+    cursor += weight;
+    if (r < cursor) { pair = candidate; break; }
+  }
+  const pairPick = merge5120Hash((Number(seed) | 0) ^ (0x5A17C9E3 | 0), order);
+  const base = pairPick < 0.5 ? pair[0] : pair[1];
+  return Math.min(2_000_000_000, base * multiplier);
+}
+
+function merge5120FamilyLevel(value) {
+  const safe = Math.floor(Number(value) || 0);
+  if (safe <= 0) return null;
+  for (const family of [2, 3, 5]) {
+    let current = family;
+    let level = 0;
+    while (current > 0 && current <= safe && level <= 30) {
+      if (current === safe) return { family, level };
+      current *= 2;
+      level += 1;
+    }
+  }
+  return null;
+}
+
+function merge5120CombinedValue(first, second) {
+  const a = merge5120FamilyLevel(first);
+  const b = merge5120FamilyLevel(second);
+  if (!a || !b || a.level !== b.level) return null;
+  if (a.family === b.family) return Math.min(2_000_000_000, Number(first) * 2);
+  if ((a.family === 2 && b.family === 3) || (a.family === 3 && b.family === 2)) {
+    return Math.min(2_000_000_000, 5 * (2 ** Math.min(30, a.level)));
+  }
+  return null;
+}
+
+function merge5120Gravity(board) {
+  for (let col = 0; col < MERGE_5120_COLS; col += 1) {
+    const values = [];
+    for (let row = MERGE_5120_ROWS - 1; row >= 0; row -= 1) {
+      const value = board[row * MERGE_5120_COLS + col];
+      if (value != null) values.push(value);
+      board[row * MERGE_5120_COLS + col] = null;
+    }
+    values.forEach((value, index) => {
+      board[(MERGE_5120_ROWS - 1 - index) * MERGE_5120_COLS + col] = value;
+    });
+  }
+}
+
+function merge5120DropState(state, seed, columnValue) {
+  const column = Math.floor(Number(columnValue));
+  if (!Number.isInteger(column) || column < 0 || column >= MERGE_5120_COLS) return null;
+  const board = state.board.slice();
+  let currentRow = -1;
+  for (let r = MERGE_5120_ROWS - 1; r >= 0; r -= 1) {
+    if (board[r * MERGE_5120_COLS + column] == null) { currentRow = r; break; }
+  }
+  if (currentRow < 0) return null;
+
+  const currentCol = column;
+  let currentValue = merge5120Tile(seed, state.moves.length + 1);
+  board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
+  let score = Math.max(0, Number(state.score || 0));
+
+  // Yeni düşen/birleşmeden doğan taşın koordinatını açıkça takip et. Sütunda aynı değerde
+  // başka taş bulunması zincirin yanlış taş üzerinden devam etmesine yol açmamalı.
+  for (let chain = 0; chain < 32; chain += 1) {
+    const currentIndex = currentRow * MERGE_5120_COLS + currentCol;
+    const neighbors = [
+      [currentRow + 1, currentCol],
+      [currentRow, currentCol - 1],
+      [currentRow, currentCol + 1],
+      [currentRow - 1, currentCol],
+    ];
+    let match = null;
+    for (const [nr, nc] of neighbors) {
+      if (nr < 0 || nr >= MERGE_5120_ROWS || nc < 0 || nc >= MERGE_5120_COLS) continue;
+      const otherIndex = nr * MERGE_5120_COLS + nc;
+      if (board[otherIndex] == null) continue;
+      const merged = merge5120CombinedValue(currentValue, board[otherIndex]);
+      if (merged != null) { match = { otherIndex, merged }; break; }
+    }
+    if (!match) break;
+
+    board[currentIndex] = null;
+    board[match.otherIndex] = null;
+    merge5120Gravity(board);
+    currentValue = match.merged;
+    score = Math.min(2_000_000_000, score + currentValue);
+
+    currentRow = -1;
+    for (let r = MERGE_5120_ROWS - 1; r >= 0; r -= 1) {
+      if (board[r * MERGE_5120_COLS + currentCol] == null) { currentRow = r; break; }
+    }
+    if (currentRow < 0) break;
+    board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
+  }
+
+  merge5120Gravity(board);
+  return { board, moves: state.moves.concat(column), score };
+}
+
+function replayMerge5120(puzzle, answer = {}) {
+  const seed = Number(puzzle?.numbers?.[0]);
+  const moves = Array.isArray(answer?.moves) ? answer.moves : [];
+  if (!Number.isInteger(seed) || moves.length > MERGE_5120_MOVE_CAP) return null;
+  let state = { board: Array(MERGE_5120_CELLS).fill(null), moves: [], score: 0 };
+  for (const move of moves) {
+    if (!Number.isInteger(Number(move))) return null;
+    const next = merge5120DropState(state, seed, Number(move));
+    if (!next) return null;
+    state = next;
+  }
+  return state;
+}
+
+function validateMerge5120Answer(puzzle, answer = {}) {
+  const state = replayMerge5120(puzzle, answer);
+  if (!state) return false;
+  if (!Number.isInteger(Number(answer?.score)) || Number(answer.score) !== state.score) return false;
+  const board = Array.isArray(answer?.board) ? answer.board : [];
+  if (board.length !== MERGE_5120_CELLS) return false;
+  return board.every((value, index) => {
+    const expected = state.board[index];
+    return expected == null ? value == null : Number(value) === expected;
+  });
+}
+
+function merge5120AnswerIsWinning(puzzle, answer = {}) {
+  if (!validateMerge5120Answer(puzzle, answer)) return false;
+  return Number(answer.score) >= Math.max(100, Number(puzzle?.target || 100));
+}
+
+function generateMerge5120Puzzle() {
+  return {
+    difficulty: "Standard",
+    target: 100,
+    numbers: [secureRandomInt(1, 0x7fffffff)],
+    gameKey: "merge_5120",
+    initialGrid: [],
+  };
+}
+
+function numberPuzzlePath(equationIndex) {
+  // Ağaç biçimli, tamamen bağlı CrossMath yerleşimi. 0. denklem üç ayrı sayısından
+  // dallanır; ara denklemler iki, uç denklemler bir ortak sayıya sahiptir.
+  const coords = [
+    // 0 merkez: yatay
+    [[8,4],[8,5],[8,6],[8,7],[8,8],[8,9],[8,10]],
+    // 1 merkez ilk sayısından aşağı
+    [[8,4],[9,4],[10,4],[11,4],[12,4],[13,4],[14,4]],
+    // 2 merkez ikinci sayısından yukarı
+    [[8,6],[7,6],[6,6],[5,6],[4,6],[3,6],[2,6]],
+    // 3 merkez sonuç sayısından yukarı
+    [[8,10],[7,10],[6,10],[5,10],[4,10],[3,10],[2,10]],
+    // 4, 1'in sonucundan sağa
+    [[14,4],[14,5],[14,6],[14,7],[14,8],[14,9],[14,10]],
+    // 5, 2'nin sonucundan sola
+    [[2,6],[2,5],[2,4],[2,3],[2,2],[2,1],[2,0]],
+    // 6, 3'ün sonucundan sağa
+    [[2,10],[2,11],[2,12],[2,13],[2,14],[2,15],[2,16]],
+    // 7, 4'ün sonucundan sağa devam
+    [[14,10],[14,11],[14,12],[14,13],[14,14],[14,15],[14,16]],
+    // 8, 5'in sonucundan aşağı (yalnız 9 denklemlik varyant)
+    [[2,0],[3,0],[4,0],[5,0],[6,0],[7,0],[8,0]],
+  ];
+  const path = coords[equationIndex];
+  if (!path) throw new Error("Sayı bulmacası yol indeksi geçersiz.");
+  return path.map(([row, col]) => row * NUMBER_PUZZLE_COLS + col);
+}
+
+function applySimpleMath(a, op, b) {
+  if (op === NUMBER_PUZZLE_PLUS) return a + b;
+  if (op === NUMBER_PUZZLE_MINUS) return a - b;
+  if (op === NUMBER_PUZZLE_MULTIPLY) return a * b;
+  if (op === NUMBER_PUZZLE_DIVIDE) return b !== 0 && a % b === 0 ? a / b : null;
+  return null;
+}
+
+function generateNumberPuzzleEquation(start, doubleOperation) {
+  const operators = [NUMBER_PUZZLE_PLUS, NUMBER_PUZZLE_MINUS, NUMBER_PUZZLE_MULTIPLY, NUMBER_PUZZLE_DIVIDE];
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const op1 = operators[secureRandomInt(0, operators.length)];
+    const b = secureRandomInt(1, op1 === NUMBER_PUZZLE_MULTIPLY ? 10 : 30);
+    if (!doubleOperation) {
+      const result = applySimpleMath(start, op1, b);
+      if (Number.isInteger(result) && result >= 1 && result < 50) {
+        return [start, op1, b, NUMBER_PUZZLE_EMPTY, NUMBER_PUZZLE_EQUALS, NUMBER_PUZZLE_EMPTY, result];
+      }
+      continue;
+    }
+    const op2 = operators[secureRandomInt(0, operators.length)];
+    const c = secureRandomInt(1, op2 === NUMBER_PUZZLE_MULTIPLY ? 8 : 20);
+    // Standart işlem önceliği.
+    const nums = [start, b, c];
+    const ops = [op1, op2];
+    let result;
+    if (op2 === NUMBER_PUZZLE_MULTIPLY || op2 === NUMBER_PUZZLE_DIVIDE) {
+      const right = applySimpleMath(b, op2, c);
+      result = right == null ? null : applySimpleMath(start, op1, right);
+    } else {
+      const left = (op1 === NUMBER_PUZZLE_MULTIPLY || op1 === NUMBER_PUZZLE_DIVIDE)
+        ? applySimpleMath(start, op1, b)
+        : null;
+      result = left == null ? applySimpleMath(applySimpleMath(start, op1, b), op2, c) : applySimpleMath(left, op2, c);
+    }
+    if (Number.isInteger(result) && result >= 1 && result < 50) {
+      return [start, op1, b, op2, c, NUMBER_PUZZLE_EQUALS, result];
+    }
+  }
+  return [start, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_EMPTY, NUMBER_PUZZLE_EQUALS, NUMBER_PUZZLE_EMPTY, Math.min(49, start + 1)];
+}
+
+function generateNumberPuzzle() {
+  const equationCount = secureRandomInt(8, 10); // 8 veya 9
+  // 8 denklemde bazen tek bir iki-işlemli denklem kullanılır: toplam sayı oluşumu 24 veya 25.
+  // 9 denklemde tümü tek işlemlidir: toplam sayı oluşumu 27. Böylece istenen 24-27 aralığı korunur.
+  const useDouble = equationCount === 8 && secureRandomInt(0, 100) < 48;
+  const doubleIndex = useDouble ? secureRandomInt(0, equationCount) : -1;
+  const solution = Array(NUMBER_PUZZLE_CELLS).fill(NUMBER_PUZZLE_EMPTY);
+  let numberOccurrences = 0;
+  const numberCellSet = new Set();
+
+  for (let eq = 0; eq < equationCount; eq += 1) {
+    const path = numberPuzzlePath(eq);
+    const existingStart = solution[path[0]];
+    const startValue = existingStart > 0 ? existingStart : secureRandomInt(2, 30);
+    const tokens = generateNumberPuzzleEquation(startValue, eq === doubleIndex);
+    tokens.forEach((token, tokenIndex) => {
+      const cell = path[tokenIndex];
+      if (solution[cell] !== NUMBER_PUZZLE_EMPTY && solution[cell] !== token) {
+        throw new Error("Sayı bulmacası kesişim üretimi tutarsız.");
+      }
+      solution[cell] = token;
+      if (token > 0) {
+        numberOccurrences += 1;
+        numberCellSet.add(cell);
+      }
+    });
+  }
+
+  if (numberOccurrences < 24 || numberOccurrences > 27) {
+    throw new Error(`Sayı bulmacası sayı adedi aralık dışında: ${numberOccurrences}`);
+  }
+
+  const initialGrid = solution.map((value) => value);
+  const numberCells = shuffled([...numberCellSet]);
+  // Kullanıcının istediği 24-27 toplam sayı oluşumunun yarısı havuzda başlar.
+  // Tek toplamda bir eksiğinin yarısı kullanılır: 24→12, 25→12, 27→13.
+  const hiddenCount = Math.floor(numberOccurrences / 2);
+  numberCells.slice(0, hiddenCount).forEach((index) => { initialGrid[index] = null; });
+  return { difficulty: "Standard", target: equationCount, numbers: solution, gameKey: "number_puzzle", initialGrid };
+}
+
+function validateNumberPuzzleAnswer(puzzle, answer = {}) {
+  const grid = Array.isArray(answer?.grid) ? answer.grid : [];
+  if (!Array.isArray(puzzle?.numbers) || puzzle.numbers.length !== NUMBER_PUZZLE_CELLS || grid.length !== NUMBER_PUZZLE_CELLS) return false;
+  return puzzle.numbers.every((expected, index) => expected <= NUMBER_PUZZLE_EMPTY || Number(grid[index]) === Number(expected));
+}
+
+function sudokuSolutionCount(gridInput, limit = 2) {
+  const grid = gridInput.map((value) => Number(value) || 0);
+  const rowMask = Array(9).fill(0);
+  const colMask = Array(9).fill(0);
+  const boxMask = Array(9).fill(0);
+  for (let index = 0; index < 81; index += 1) {
+    const value = grid[index];
+    if (value === 0) continue;
+    if (value < 1 || value > 9) return 0;
+    const row = Math.floor(index / 9);
+    const col = index % 9;
+    const box = Math.floor(row / 3) * 3 + Math.floor(col / 3);
+    const bit = 1 << value;
+    if ((rowMask[row] & bit) || (colMask[col] & bit) || (boxMask[box] & bit)) return 0;
+    rowMask[row] |= bit; colMask[col] |= bit; boxMask[box] |= bit;
+  }
+
+  let count = 0;
+  function search() {
+    if (count >= limit) return;
+    let bestIndex = -1;
+    let bestCandidates = 0;
+    let bestCount = 10;
+    for (let index = 0; index < 81; index += 1) {
+      if (grid[index] !== 0) continue;
+      const row = Math.floor(index / 9);
+      const col = index % 9;
+      const box = Math.floor(row / 3) * 3 + Math.floor(col / 3);
+      const used = rowMask[row] | colMask[col] | boxMask[box];
+      let candidates = 0;
+      let candidateCount = 0;
+      for (let value = 1; value <= 9; value += 1) {
+        const bit = 1 << value;
+        if ((used & bit) === 0) { candidates |= bit; candidateCount += 1; }
+      }
+      if (candidateCount === 0) return;
+      if (candidateCount < bestCount) {
+        bestCount = candidateCount;
+        bestIndex = index;
+        bestCandidates = candidates;
+        if (candidateCount === 1) break;
+      }
+    }
+    if (bestIndex < 0) { count += 1; return; }
+
+    const row = Math.floor(bestIndex / 9);
+    const col = bestIndex % 9;
+    const box = Math.floor(row / 3) * 3 + Math.floor(col / 3);
+    for (let value = 1; value <= 9 && count < limit; value += 1) {
+      const bit = 1 << value;
+      if ((bestCandidates & bit) === 0) continue;
+      grid[bestIndex] = value;
+      rowMask[row] |= bit; colMask[col] |= bit; boxMask[box] |= bit;
+      search();
+      rowMask[row] &= ~bit; colMask[col] &= ~bit; boxMask[box] &= ~bit;
+      grid[bestIndex] = 0;
+    }
+  }
+  search();
+  return count;
+}
+
+function generateSudokuPuzzle() {
+  for (let generationAttempt = 0; generationAttempt < 12; generationAttempt += 1) {
+    const shuffledGroups = () => shuffled([0, 1, 2]).flatMap((group) =>
+      shuffled([0, 1, 2]).map((inner) => group * 3 + inner)
+    );
+    const rows = shuffledGroups();
+    const cols = shuffledGroups();
+    const digits = shuffled([1,2,3,4,5,6,7,8,9]);
+    const pattern = (r, c) => (r * 3 + Math.floor(r / 3) + c) % 9;
+    const solution = rows.flatMap((row) => cols.map((col) => digits[pattern(row, col)]));
+    const working = solution.slice();
+    let clueCount = 81;
+
+    // Hücreleri yalnız tek çözüm korunuyorsa kaldır. Hedef tam 40 başlangıç hücresidir.
+    for (const index of shuffled(Array.from({ length: 81 }, (_, cell) => cell))) {
+      if (clueCount <= 40) break;
+      const previous = working[index];
+      working[index] = 0;
+      if (sudokuSolutionCount(working, 2) === 1) {
+        clueCount -= 1;
+      } else {
+        working[index] = previous;
+      }
+    }
+
+    if (clueCount === 40) {
+      const initialGrid = working.map((value) => value === 0 ? null : value);
+      return { difficulty: "Standard", target: 81, numbers: solution, gameKey: "sudoku", initialGrid };
+    }
+  }
+  throw new Error("40 ipuçlu tek çözümlü Sudoku üretilemedi.");
+}
+
+function validateSudokuAnswer(puzzle, answer = {}) {
+  const grid = Array.isArray(answer?.grid) ? answer.grid : [];
+  return Array.isArray(puzzle?.numbers) && puzzle.numbers.length === 81 && grid.length === 81 &&
+    puzzle.numbers.every((value, index) => Number(grid[index]) === Number(value));
+}
+
+// Satır+sütun toplam 20 çizgide tam dağılım: 10 tek ipucu (%50), 6 çift (%30),
+// 4 üçlü (%20). Aşağıdaki şablonların her biri bu dağılımı taşır ve clue seti tek çözümlüdür.
+const NONOGRAM_PATTERNS = [
+  "1111100001111011000100111100110001111000000111000000111100000000101100000000110000110011010000011100",
+  "0000011110010111001100101110010001111000001111100010001110001101111000000111100000111110100001000000",
+  "0001100000000111000000111100101111110101100000000000000001100000001111000100101000010001000011000010",
+  "0000001100010111111000011111000000111110000011000000100100111110000111001000010110000011001100000000",
+  "0100011011011100010001000000000001100000001110000110001000011110000000111000001111100000001110000000",
+  "0000001000110000100011110110001111000000111000000001100010001110110011000111111010110111000000011100",
+  "0000001010111100111001100000001110000000111000000000101011000010000000000001111000000110100100001001",
+  "1000010000000011001100110000000111111000011111100001111110001111010010111111000010111111001001011110",
+  "1000001100000000011100000001001001000010000100011000010000000001000000001000000011101100000101011100",
+  "1000010100111111010001011101110111111111001111110001111111000011101100000000111011110011000000001000",
+  "1000110110011000011000100101000011111111000011110000011111000000011100000010110000001110001000111000",
+  "0000000001000010000101011111010001111010000011111000011110000010010100111110011011111000000011000000",
+  "0000001100000000110000000011000011111100011111010000101001101100001100011000111100000000010100100011",
+  "0111110001011101000000111110000011111000101101111001111111100000110000000010000000011000110101100001",
+  "1000000000101000010011001101101111111100001111110000000011100000001000000100001100110001100001000111",
+  "0000000010000000000101110000010111010010010001111001111111010111100000101110001111111000001100000000"
+];
+
+function transformNonogramPattern(bits, variant) {
+  const source = Array.from({ length: 10 }, (_, r) => Array.from({ length: 10 }, (_, c) => Number(bits[r * 10 + c])));
+  const out = Array.from({ length: 10 }, () => Array(10).fill(0));
+  for (let r = 0; r < 10; r += 1) for (let c = 0; c < 10; c += 1) {
+    let rr = r, cc = c;
+    if (variant & 1) cc = 9 - cc;
+    if (variant & 2) rr = 9 - rr;
+    if (variant & 4) { const t = rr; rr = cc; cc = t; }
+    out[r][c] = source[rr][cc];
+  }
+  return out.flat();
+}
+
+function generateNonogramPuzzle() {
+  const pattern = NONOGRAM_PATTERNS[secureRandomInt(0, NONOGRAM_PATTERNS.length)];
+  const solution = transformNonogramPattern(pattern, secureRandomInt(0, 8));
+  return { difficulty: "Standard", target: 100, numbers: solution, gameKey: "nonogram", initialGrid: [] };
+}
+
+function validateNonogramAnswer(puzzle, answer = {}) {
+  const cells = Array.isArray(answer?.cells) ? answer.cells : [];
+  if (!Array.isArray(puzzle?.numbers) || puzzle.numbers.length !== 100 || cells.length !== 100) return false;
+  return puzzle.numbers.every((expected, index) => expected === 1 ? Number(cells[index]) === 1 : Number(cells[index]) !== 1);
+}
+
+function resultFindApply(a, op, b) {
+  if (op === 0) return a + b;
+  if (op === 1) return a - b;
+  if (op === 2) return a * b;
+  if (op === 3) return b !== 0 ? a / b : null;
+  return null;
+}
+
+function evaluateResultFind(nums, ops, ranges) {
+  const values = nums.map(Number);
+  const operators = ops.slice();
+  const groups = ranges.slice().sort((a,b) => b[0]-a[0]);
+  for (const [start, end] of groups) {
+    if (end !== start + 1 || start < 0 || end >= values.length) return null;
+    const inner = resultFindApply(values[start], operators[start], values[end]);
+    if (inner == null) return null;
+    values.splice(start, 2, inner);
+    operators.splice(start, 1);
+    // Earlier indexes are unaffected because groups processed right-to-left.
+  }
+  for (let i = 0; i < operators.length;) {
+    if (operators[i] === 2 || operators[i] === 3) {
+      const v = resultFindApply(values[i], operators[i], values[i+1]);
+      if (v == null) return null;
+      values.splice(i,2,v); operators.splice(i,1);
+    } else i += 1;
+  }
+  let result = values[0];
+  for (let i = 0; i < operators.length; i += 1) {
+    result = resultFindApply(result, operators[i], values[i+1]);
+    if (result == null) return null;
+  }
+  return result;
+}
+
+function resultFindBigIntGcd(a, b) {
+  let x = a < 0n ? -a : a;
+  let y = b < 0n ? -b : b;
+  while (y !== 0n) { const t = x % y; x = y; y = t; }
+  return x === 0n ? 1n : x;
+}
+
+function normalizeResultFindFraction(numerator, denominator) {
+  if (denominator === 0n) return null;
+  let n = numerator;
+  let d = denominator;
+  if (d < 0n) { n = -n; d = -d; }
+  const g = resultFindBigIntGcd(n, d);
+  return { n: n / g, d: d / g };
+}
+
+function resultFindFractionApply(a, op, b) {
+  if (!a || !b) return null;
+  if (op === 0) return normalizeResultFindFraction(a.n * b.d + b.n * a.d, a.d * b.d);
+  if (op === 1) return normalizeResultFindFraction(a.n * b.d - b.n * a.d, a.d * b.d);
+  if (op === 2) return normalizeResultFindFraction(a.n * b.n, a.d * b.d);
+  if (op === 3) return b.n !== 0n ? normalizeResultFindFraction(a.n * b.d, a.d * b.n) : null;
+  return null;
+}
+
+function evaluateResultFindExact(nums, ops, ranges) {
+  const values = nums.map((value) => ({ n: BigInt(value), d: 1n }));
+  const operators = ops.slice();
+  const groups = ranges.slice().sort((a, b) => b[0] - a[0]);
+  for (const [start, end] of groups) {
+    if (end !== start + 1 || start < 0 || end >= values.length) return null;
+    const inner = resultFindFractionApply(values[start], operators[start], values[end]);
+    if (!inner) return null;
+    values.splice(start, 2, inner);
+    operators.splice(start, 1);
+  }
+  for (let i = 0; i < operators.length;) {
+    if (operators[i] === 2 || operators[i] === 3) {
+      const value = resultFindFractionApply(values[i], operators[i], values[i + 1]);
+      if (!value) return null;
+      values.splice(i, 2, value);
+      operators.splice(i, 1);
+    } else {
+      i += 1;
+    }
+  }
+  let result = values[0];
+  for (let i = 0; i < operators.length; i += 1) {
+    result = resultFindFractionApply(result, operators[i], values[i + 1]);
+    if (!result) return null;
+  }
+  return result;
+}
+
+function generateResultFindPuzzle() {
+  for (let attempt = 0; attempt < 3000; attempt += 1) {
+    const count = secureRandomInt(8, 11);
+    const nums = Array.from({ length: count }, () => secureRandomInt(2, 50));
+    const ops = Array.from({ length: count - 1 }, () => secureRandomInt(0, 4));
+    const starts = count >= 10 ? [1, count - 3] : [1, count - 3];
+    const ranges = [[starts[0], starts[0] + 1], [starts[1], starts[1] + 1]];
+    if (ranges[0][1] >= ranges[1][0]) continue;
+
+    // İki parantezin içi +/−, doğrudan bağlı dış işlemleri ×/÷ olacak şekilde kurulur.
+    // Böylece her bulmacada dört işlem türünün tamamı gerçekten bulunur.
+    const firstInner = ranges[0][0];
+    const secondInner = ranges[1][0];
+    const firstExternal = Math.max(0, ranges[0][0] - 1);
+    const secondExternal = Math.min(ops.length - 1, ranges[1][1]);
+    ops[firstInner] = 0;      // +
+    ops[secondInner] = 1;     // −
+    ops[firstExternal] = 2;   // ×
+    ops[secondExternal] = 3;  // ÷
+    const exactResult = evaluateResultFindExact(nums, ops, ranges);
+    if (!exactResult || exactResult.d !== 1n) continue;
+    if (exactResult.n < -2_000_000n || exactResult.n > 2_000_000n) continue;
+    const integerResult = Number(exactResult.n);
+    const encoding = [count, ...nums, ...ops, ranges[0][0], ranges[0][1], ranges[1][0], ranges[1][1]];
+    return { difficulty: "Standard", target: integerResult, numbers: encoding, gameKey: "result_find", initialGrid: [] };
+  }
+  return { difficulty: "Standard", target: 66, numbers: [8,8,4,3,2,12,6,5,1,2,0,1,0,2,1,3,1,2,5,6], gameKey: "result_find", initialGrid: [] };
+}
+
+function validateResultFindAnswer(puzzle, answer = {}) {
+  const result = Number(answer?.result);
+  return Number.isInteger(result) && result === Number(puzzle?.target);
+}
+
+
 const GAME_HANDLERS = Object.freeze({
   target_number: Object.freeze({
     key: "target_number",
@@ -5233,7 +5755,7 @@ const GAME_HANDLERS = Object.freeze({
   digit_attack: Object.freeze({
     key: "digit_attack",
     createPuzzle: () => generateDigitAttackPuzzle(),
-    // 20 dalgayı 3 yanlışa ulaşmadan tamamlama kazanır; üçüncü yanlış temas geçerli bir mağlubiyet gönderimidir.
+    // 20 doğru temas kazanma; üçüncü yanlış temas geçerli bir mağlubiyet gönderimidir.
     validateAnswer: (puzzle, answer) => validateDigitAttackChallengeAnswer(puzzle, answer),
     isWinningAnswer: (puzzle, answer) => digitAttackAnswerIsWinning(puzzle, answer),
   }),
@@ -5249,6 +5771,32 @@ const GAME_HANDLERS = Object.freeze({
     key: "consecutive",
     createPuzzle: () => generateConsecutivePuzzle(),
     validateAnswer: (puzzle, answer) => validateConsecutiveChallengeAnswer(puzzle, answer),
+  }),
+  merge_5120: Object.freeze({
+    key: "merge_5120",
+    createPuzzle: () => generateMerge5120Puzzle(),
+    validateAnswer: (puzzle, answer) => validateMerge5120Answer(puzzle, answer),
+    isWinningAnswer: (puzzle, answer) => merge5120AnswerIsWinning(puzzle, answer),
+  }),
+  number_puzzle: Object.freeze({
+    key: "number_puzzle",
+    createPuzzle: () => generateNumberPuzzle(),
+    validateAnswer: (puzzle, answer) => validateNumberPuzzleAnswer(puzzle, answer),
+  }),
+  sudoku: Object.freeze({
+    key: "sudoku",
+    createPuzzle: () => generateSudokuPuzzle(),
+    validateAnswer: (puzzle, answer) => validateSudokuAnswer(puzzle, answer),
+  }),
+  nonogram: Object.freeze({
+    key: "nonogram",
+    createPuzzle: () => generateNonogramPuzzle(),
+    validateAnswer: (puzzle, answer) => validateNonogramAnswer(puzzle, answer),
+  }),
+  result_find: Object.freeze({
+    key: "result_find",
+    createPuzzle: () => generateResultFindPuzzle(),
+    validateAnswer: (puzzle, answer) => validateResultFindAnswer(puzzle, answer),
   }),
 });
 
@@ -5676,12 +6224,14 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
        player_id, game_key, infinite_score, infinite_run_score, infinite_next_stage,
        tournament_stage, tournament_rights, tournament_bank, tournament_completed,
        tournament_entry_active, hundred_active, hundred_stage,
-       two_player_finish_count, two_player_finish_total_ms, stats, updated_at
+       two_player_finish_count, two_player_finish_total_ms,
+       two_player_score_count, two_player_score_total, stats, updated_at
      )
      SELECT $2, game_key, infinite_score, infinite_run_score, infinite_next_stage,
             tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active, hundred_active, hundred_stage,
-            two_player_finish_count, two_player_finish_total_ms, stats, NOW()
+            two_player_finish_count, two_player_finish_total_ms,
+            two_player_score_count, two_player_score_total, stats, NOW()
      FROM player_game_progress
      WHERE player_id = $1
      ON CONFLICT (player_id, game_key) DO UPDATE SET
@@ -5701,6 +6251,14 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
        )::integer,
        two_player_finish_total_ms = LEAST(
          player_game_progress.two_player_finish_total_ms + EXCLUDED.two_player_finish_total_ms,
+         9223372036854775807::bigint
+       ),
+       two_player_score_count = LEAST(
+         player_game_progress.two_player_score_count::bigint + EXCLUDED.two_player_score_count::bigint,
+         2000000000
+       )::integer,
+       two_player_score_total = LEAST(
+         player_game_progress.two_player_score_total + EXCLUDED.two_player_score_total,
          9223372036854775807::bigint
        ),
        stats = CASE
@@ -5825,8 +6383,9 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
       playerId: realWinner.playerId,
       generalDelta: reward,
       xpDelta: winnerXp,
-      finishSampleMs: ["shortest_path", "digit_attack"].includes(normalizeBaseGameKey(room.gameKey)) &&
-        realWinner.wonRoundBecauseOpponentWrongAnswer === true
+      finishSampleMs: normalizeBaseGameKey(room.gameKey) === "merge_5120" ||
+        (["shortest_path", "digit_attack"].includes(normalizeBaseGameKey(room.gameKey)) &&
+          realWinner.wonRoundBecauseOpponentWrongAnswer === true)
         ? null
         : safeTwoPlayerFinishSampleMs(realWinner.totalElapsedMs, room.roundCount, room.gameKey),
     });
@@ -6546,7 +7105,8 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       const progressResult = await client.query(
         `SELECT gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
                 gp.tournament_completed, gp.tournament_entry_active,
-                p.tournament_tickets, gp.two_player_finish_count, gp.two_player_finish_total_ms
+                p.tournament_tickets, gp.two_player_finish_count, gp.two_player_finish_total_ms,
+                gp.two_player_score_count, gp.two_player_score_total
          FROM player_game_progress gp
          JOIN player_progress p ON p.player_id = gp.player_id
          WHERE gp.player_id = $1 AND gp.game_key = $2
@@ -6568,6 +7128,8 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       finishProfile = normalizeTwoPlayerFinishProfile({
         finishCount: progress.two_player_finish_count,
         finishTotalMs: progress.two_player_finish_total_ms,
+        scoreCount: progress.two_player_score_count,
+        scoreTotal: progress.two_player_score_total,
       });
       tournamentResponse = {
         currentStage: stage,
@@ -6651,6 +7213,10 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
       ? secureDifficulty(difficultyResolver(stage, requestedDifficulty))
       : requestedDifficulty;
     const puzzle = generatePuzzleForGame(gameKey, difficulty);
+    if (gameKey === "merge_5120") {
+      // 5120 sonsuz modu: N. aşama N×100 oyun-içi skorda tamamlanır.
+      puzzle.target = Math.min(2_000_000_000, stage * 100);
+    }
 
     await client.query(
       `WITH superseded AS (
@@ -6740,12 +7306,29 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.stage);
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
-      const outcome = answerWon
-        ? botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true)
-        : { resolvable: true, won: false, reason: wrongAnswerReason };
-      won = outcome.won;
-      outcomeReason = outcome.reason;
-      rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
+      if (gameKey === "merge_5120") {
+        const roundLimitMs = gameDefinition(gameKey).roundDurationMs;
+        if (elapsedServerMs < roundLimitMs - 2_000) {
+          const error = new Error("5120 skoru iki dakikalık turun sonundan önce gönderilemez.");
+          error.statusCode = 409;
+          throw error;
+        }
+        const playerScore = Math.max(0, Number(req.body?.answer?.score || 0));
+        const botScore = Math.max(0, Number(challenge.result?.plan?.score || 0));
+        won = playerScore === botScore ? null : playerScore > botScore;
+        outcomeReason = won === null ? "score_draw" : won ? "higher_score" : "lower_score";
+        rewards = won === null
+          ? { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 }
+          : twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
+        await recordTwoPlayerScoreInTransaction(client, req.auth.sub, playerScore, gameKey);
+      } else {
+        const outcome = answerWon
+          ? botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true)
+          : { resolvable: true, won: false, reason: wrongAnswerReason };
+        won = outcome.won;
+        outcomeReason = outcome.reason;
+        rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
+      }
     }
 
     if (challenge.mode === "hundred") {
@@ -6883,7 +7466,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         client,
         req.auth.sub,
         rewards,
-        { finishElapsedMs: answerWon ? elapsedServerMs : null, gameKey }
+        { finishElapsedMs: gameKey === "merge_5120" ? null : (answerWon ? elapsedServerMs : null), gameKey }
       );
       await recordTaskEventInTransaction(client, {
         playerId: req.auth.sub,
@@ -6905,6 +7488,8 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       won,
       outcomeReason,
       elapsedServerMs,
+      gameScore: gameKey === "merge_5120" ? Math.max(0, Number(req.body?.answer?.score || 0)) : null,
+      opponentGameScore: gameKey === "merge_5120" ? Math.max(0, Number(challenge.result?.plan?.score || 0)) : null,
     };
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
@@ -7867,7 +8452,6 @@ function clearParticipantTimeout(
 
     participant.timeoutHandle = null;
   }
-  clearDigitAttackAutoHandle(participant);
 }
 
 function clearRoomTimeouts(room) {
@@ -8165,10 +8749,43 @@ function realtimeMatchWinner(room) {
   return String(first.playerId).localeCompare(String(second.playerId)) <= 0 ? first : second;
 }
 
+async function recordMergeRealtimeScores(room) {
+  if (!pool || normalizeBaseGameKey(room?.gameKey) !== "merge_5120") return;
+  const realParticipants = roomParticipants(room).filter((item) => !item.isBot);
+  if (realParticipants.length === 0) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const participant of realParticipants) {
+      await recordTwoPlayerScoreInTransaction(client, participant.playerId, Number(participant.roundScore || 0), "merge_5120");
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("merge_5120 score profile error:", error);
+  } finally { client.release(); }
+}
+
+function finishRealtimeDraw(room, reason = "draw") {
+  if (!room || room.resolved) return;
+  markRoomResolved(room, reason, null, null);
+  recordMergeRealtimeScores(room).catch(() => {});
+  roomParticipants(room).forEach((participant) => {
+    const opponent = getOpponentParticipant(room, participant.playerId);
+    emitToRoomParticipant(participant, "match_completed", {
+      roomId: room.roomId, won: null, myRoundWins: Number(participant.roundWins || 0),
+      opponentRoundWins: Number(opponent?.roundWins || 0),
+      myTotalElapsedMs: Number(participant.totalElapsedMs || 0), opponentTotalElapsedMs: Number(opponent?.totalElapsedMs || 0),
+      myScore: Math.max(0, Number(participant.roundScore || 0)), opponentScore: Math.max(0, Number(opponent?.roundScore || 0))
+    });
+  });
+}
+
 function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
   if (!room || room.resolved || !winner) return;
   const loser = getOpponentParticipant(room, winner.playerId);
   markRoomResolved(room, reason, winner.playerId, loser?.playerId);
+  if (normalizeBaseGameKey(room.gameKey) === "merge_5120") recordMergeRealtimeScores(room).catch(() => {});
 
   roomParticipants(room).forEach((participant) => {
     const opponent = getOpponentParticipant(room, participant.playerId);
@@ -8179,6 +8796,8 @@ function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
       opponentRoundWins: Number(opponent?.roundWins || 0),
       myTotalElapsedMs: Number(participant.totalElapsedMs || 0),
       opponentTotalElapsedMs: Number(opponent?.totalElapsedMs || 0),
+      myScore: normalizeBaseGameKey(room.gameKey) === "merge_5120" ? Math.max(0, Number(participant.roundScore || 0)) : null,
+      opponentScore: normalizeBaseGameKey(room.gameKey) === "merge_5120" ? Math.max(0, Number(opponent?.roundScore || 0)) : null,
     });
   });
 
@@ -8201,26 +8820,24 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
     participant.elapsedMs = null;
     participant.roundElapsedMs = null;
     participant.finishedRoundIndex = null;
-    if (isDigitAttackRealtimeRoom(room)) {
-      resetDigitAttackParticipantFlow(room, participant);
-    } else {
-      clearDigitAttackAutoHandle(participant);
-    }
+    participant.roundScore = null;
   });
 
   const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
   room.deadlineHandle = setTimeout(() => {
     if (room.resolved) return;
+    const scoreBased = normalizeBaseGameKey(room.gameKey) === "merge_5120";
     roomParticipants(room).forEach((participant) => {
       if (participant.finishedRoundIndex !== room.roundIndex) {
         participant.finishedAt = Date.now();
         participant.elapsedMs = roundLimitMs;
         participant.roundElapsedMs = roundLimitMs;
         participant.finishedRoundIndex = room.roundIndex;
+        if (scoreBased && participant.roundScore == null) participant.roundScore = 0;
       }
     });
     resolveRealtimeRound(room);
-  }, safePrepareMs + roundLimitMs);
+  }, safePrepareMs + roundLimitMs + (normalizeBaseGameKey(room.gameKey) === "merge_5120" ? 2_000 : 0));
   if (typeof room.deadlineHandle.unref === "function") room.deadlineHandle.unref();
 
   const botParticipant = roomParticipants(room).find((participant) => participant.isBot);
@@ -8230,17 +8847,18 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
       ? Math.max(1, roundLimitMs - 1)
       : Math.min(botPlan.finishMs, Math.max(1, roundLimitMs - 1));
     room.botFinishHandle = setTimeout(() => {
-      if (botPlan.wrongRoute === true || botPlan.forcedLoss === true) {
+      if (botPlan.scoreBased === true && normalizeBaseGameKey(room.gameKey) === "merge_5120") {
+        registerRealtimeRoundScore(room, botParticipant, Number(botPlan.score || 0), roundLimitMs);
+      } else if (botPlan.wrongRoute === true || botPlan.forcedLoss === true) {
         registerRealtimeRoundLoss(
-          room,
-          botParticipant,
+          room, botParticipant,
           botElapsedMs,
           botPlan.forcedLoss === true ? "bot_three_mistakes" : "bot_wrong_route"
         );
       } else {
         registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
       }
-    }, safePrepareMs + botElapsedMs);
+    }, safePrepareMs + (botPlan.scoreBased === true ? roundLimitMs - 50 : botElapsedMs));
     if (typeof room.botFinishHandle.unref === "function") room.botFinishHandle.unref();
   }
 }
@@ -8276,6 +8894,24 @@ function registerRealtimeRoundFinish(room, participant, elapsedMs) {
     unfinishedOpponent.roundElapsedMs = gameDefinition(room.gameKey).roundDurationMs;
     unfinishedOpponent.finishedRoundIndex = room.roundIndex;
   }
+  resolveRealtimeRound(room);
+}
+
+function registerRealtimeRoundScore(room, participant, scoreValue, elapsedMs) {
+  if (!room || !participant || room.resolved) return;
+  if (participant.finishedRoundIndex === room.roundIndex) return;
+  const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
+  const safeScore = Math.max(0, Math.min(2_000_000_000, Math.floor(Number(scoreValue) || 0)));
+  participant.roundScore = safeScore;
+  participant.finishedAt = Date.now();
+  participant.elapsedMs = Math.max(1, Math.min(Number(elapsedMs || roundLimitMs), roundLimitMs));
+  participant.roundElapsedMs = roundLimitMs;
+  participant.finishedRoundIndex = room.roundIndex;
+  clearParticipantAwayState(room, participant.playerId);
+  const opponent = getOpponentParticipant(room, participant.playerId);
+  emitToRoomParticipant(opponent, "opponent_finished", {
+    roomId: room.roomId, elapsedMs: roundLimitMs, roundIndex: room.roundIndex, roundCount: room.roundCount, score: safeScore
+  });
   resolveRealtimeRound(room);
 }
 
@@ -8324,6 +8960,18 @@ function resolveRealtimeRound(room) {
   }
 
   const [first, second] = participants;
+  if (normalizeBaseGameKey(room.gameKey) === "merge_5120") {
+    const firstScore = Math.max(0, Number(first.roundScore || 0));
+    const secondScore = Math.max(0, Number(second.roundScore || 0));
+    first.totalElapsedMs += gameDefinition(room.gameKey).roundDurationMs;
+    second.totalElapsedMs += gameDefinition(room.gameKey).roundDurationMs;
+    if (firstScore === secondScore) {
+      finishRealtimeDraw(room, "score_draw");
+    } else {
+      finishRealtimeMatch(room, firstScore > secondScore ? first : second, "higher_score");
+    }
+    return;
+  }
   const roundWinner = realtimeRoundWinner(room, first, second);
   roundWinner.roundWins += 1;
   participants.forEach((participant) => {
@@ -8388,7 +9036,10 @@ function createRealtimeRoom(
     : crypto.randomBytes(16).toString("hex");
 
   const createdAt = Date.now();
-  const roundCount = String(gameKey || "").endsWith("_tournament") ? 1 : normalizeRoundCount(roundCountValue);
+  const baseGameKey = normalizeBaseGameKey(gameKey);
+  const roundCount = (String(gameKey || "").endsWith("_tournament") || baseGameKey === "merge_5120")
+    ? 1
+    : normalizeRoundCount(roundCountValue);
   const puzzles = Array.isArray(suppliedPuzzles) && suppliedPuzzles.length >= roundCount
     ? suppliedPuzzles.slice(0, roundCount)
     : [puzzle, ...Array.from({ length: Math.max(0, roundCount - 1) }, () => generatePuzzleForGame(gameKey, difficulty))];
@@ -8769,7 +9420,6 @@ function markSocketDisconnected(socket) {
     room,
     participant.playerId
   );
-  scheduleDigitAttackAwayFlow(room, participant.playerId);
 }
 
 app.get("/", (req, res) => {
@@ -8928,7 +9578,8 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
               gp.tournament_stage, gp.tournament_rights,
               gp.tournament_completed, gp.tournament_entry_active,
               s.general_score,
-              gp.two_player_finish_count, gp.two_player_finish_total_ms
+              gp.two_player_finish_count, gp.two_player_finish_total_ms,
+              gp.two_player_score_count, gp.two_player_score_total
        FROM players p
        JOIN player_progress g ON g.player_id = p.player_id
        JOIN player_game_progress gp ON gp.player_id = p.player_id AND gp.game_key = $3
@@ -8958,6 +9609,8 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       twoPlayerFinishProfile: normalizeTwoPlayerFinishProfile({
         finishCount: row.two_player_finish_count,
         finishTotalMs: row.two_player_finish_total_ms,
+        scoreCount: row.two_player_score_count,
+        scoreTotal: row.two_player_score_total,
       }),
     };
   } catch (error) {
@@ -9617,8 +10270,6 @@ io.on("connection", (socket) => {
         return;
       }
 
-      advanceDigitAttackAwayFlowToNow(room, participant);
-
       if (room.resolved) {
         socket.emit(
           "resume_error",
@@ -9626,8 +10277,7 @@ io.on("connection", (socket) => {
             code:
               "MATCH_RESOLVED",
             message:
-              "Bu maç bağlantı kesikken veya siz uzaktayken sonuçlandı.",
-            won: room.winnerPlayerId === participant.playerId,
+              "Bu maç zaten sona ermiş.",
             opponentFinishedMs:
               Number(
                 opponent?.elapsedMs ||
@@ -9717,10 +10367,6 @@ io.on("connection", (socket) => {
           opponentRoundWins: Number(opponent?.roundWins || 0),
 
           opponentFinishedMs: Number(opponent?.roundElapsedMs || 0),
-          digitAttackProgressSlots: digitAttackProgressSlots(room, participant),
-          digitAttackWaveStartedAtMillis: Number(
-            participant.digitAttackWaveStartedAt || room.startsAtMillis || room.createdAt || 0
-          ),
         }
       );
 
@@ -9782,7 +10428,6 @@ io.on("connection", (socket) => {
         room,
         participant.playerId
       );
-      scheduleDigitAttackAwayFlow(room, participant.playerId);
 
       realtimeLog(
         "Player backgrounded:",
@@ -9850,24 +10495,10 @@ io.on("connection", (socket) => {
         return;
       }
 
-      advanceDigitAttackAwayFlowToNow(room, participant);
-      if (room.resolved) {
-        socket.emit("resume_error", {
-          code: "MATCH_RESOLVED",
-          message: "Maç bağlantı kesikken sonuçlandı.",
-          won: room.winnerPlayerId === participant.playerId,
-          opponentFinishedMs: Number(
-            getOpponentParticipant(room, participant.playerId)?.elapsedMs || 0
-          ),
-        });
-        return;
-      }
-
       clearParticipantAwayState(
         room,
         participant.playerId
       );
-      emitDigitAttackState(room, participant);
 
       realtimeLog(
         "Player foregrounded:",
@@ -10112,42 +10743,6 @@ io.on("connection", (socket) => {
   );
 
   socket.on(
-    "digit_attack_lane",
-    (payload = {}) => {
-      const roomId = String(payload.roomId || "").trim();
-      const room = realtimeRooms.get(roomId);
-      const active = activeRooms.get(socket.id);
-      if (!room || !active || active.roomId !== roomId || room.resolved || !isDigitAttackRealtimeRoom(room)) return;
-      const participant = getParticipant(room, active.playerId);
-      const state = ensureDigitAttackParticipantFlow(room, participant);
-      if (!state || participant.isBot || participant.finishedRoundIndex === room.roundIndex) return;
-      if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
-      state.digitAttackLane = Math.max(0, Math.min(2, Math.floor(Number(payload.lane) || 0)));
-    }
-  );
-
-  socket.on(
-    "digit_attack_choice",
-    async (payload = {}) => {
-      const roomId = String(payload.roomId || "").trim();
-      const room = realtimeRooms.get(roomId);
-      const active = activeRooms.get(socket.id);
-      if (!room || !active || active.roomId !== roomId || room.resolved || !isDigitAttackRealtimeRoom(room)) return;
-      const participant = getParticipant(room, active.playerId);
-      if (!participant || participant.isBot || participant.finishedRoundIndex === room.roundIndex) return;
-      if (!(await socketHasActiveGameplaySession(socket, participant.playerId, "match_error"))) return;
-      if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
-      applyRealtimeDigitAttackChoice(
-        room,
-        participant,
-        payload.lane,
-        Number(payload.waveIndex),
-        "player"
-      );
-    }
-  );
-
-  socket.on(
     "player_finished",
     async (payload = {}) => {
       const roomId = String(payload.roomId || "").trim();
@@ -10169,6 +10764,15 @@ io.on("connection", (socket) => {
       }
 
       const elapsedMs = Math.max(1, Date.now() - Number(room.startsAtMillis || room.createdAt));
+      if (normalizeBaseGameKey(room.gameKey) === "merge_5120") {
+        const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
+        if (elapsedMs < roundLimitMs - 2_000) {
+          socket.emit("match_error", { code: "SCORE_TOO_EARLY", message: "5120 skoru tur bitmeden gönderilemez." });
+          return;
+        }
+        registerRealtimeRoundScore(room, participant, Number(payload?.answer?.score || 0), elapsedMs);
+        return;
+      }
       if (challengeAnswerIsWinning(room.puzzle, payload.numberSlots, payload.operators, payload.answer)) {
         registerRealtimeRoundFinish(room, participant, elapsedMs);
       } else {
