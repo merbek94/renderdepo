@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "gameplay-polish-5120-v4-20260829";
+const SERVER_BUILD_ID = "gameplay-polish-puzzles-v5-20260829";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5342,18 +5342,19 @@ function generateMerge5120Puzzle() {
 }
 
 function numberPuzzlePath(equationIndex) {
-  // 8 denklemli tek zincir. Yatay ve dikey denklemler sırayla ilerlediği için aynı yöndeki
-  // iki bulmaca hiçbir hücrede kesişmez. Bütün yollar soldan sağa / yukarıdan aşağıya
-  // aktığından sonuç yatayda daima sağda, dikeyde daima alttadır.
+  // 8 işlem, ekranda yatay kaydırma gerektirmeyecek biçimde en fazla 9 sütun ve
+  // en fazla 13 satır içine yerleşir. İşlemler bağımsız tutulduğu için bir işlemin
+  // sonucu başka bir işlemin başlangıcı gibi ters yönde okunamaz.
+  // Yatayların sonucu daima sağda, dikeylerin sonucu daima alttadır.
   const coords = [
     [[0,0],[0,1],[0,2],[0,3],[0,4]],
-    [[0,4],[1,4],[2,4],[3,4],[4,4]],
-    [[4,4],[4,5],[4,6],[4,7],[4,8]],
-    [[4,8],[5,8],[6,8],[7,8],[8,8]],
-    [[8,8],[8,9],[8,10],[8,11],[8,12]],
-    [[8,12],[9,12],[10,12],[11,12],[12,12]],
-    [[12,12],[12,13],[12,14],[12,15],[12,16]],
-    [[12,16],[13,16],[14,16],[15,16],[16,16]],
+    [[3,0],[3,1],[3,2],[3,3],[3,4]],
+    [[6,0],[6,1],[6,2],[6,3],[6,4]],
+    [[9,0],[9,1],[9,2],[9,3],[9,4]],
+    [[0,5],[1,5],[2,5],[3,5],[4,5]],
+    [[0,6],[1,6],[2,6],[3,6],[4,6]],
+    [[0,7],[1,7],[2,7],[3,7],[4,7]],
+    [[0,8],[1,8],[2,8],[3,8],[4,8]],
   ];
   const path = coords[equationIndex];
   if (!path) throw new Error("Sayı bulmacası yol indeksi geçersiz.");
@@ -5406,7 +5407,7 @@ function generateNumberPuzzleEquation(start, doubleOperation) {
 
 function generateNumberPuzzle() {
   const equationCount = 8;
-  // 8 tek-işlemli denklem × 3 sayı oluşumu = 24. Ağ tek bir yatay/dikey zincirdir.
+  // 8 tek-işlemli denklem × 3 sayı oluşumu = 24. Tümü 9×13 görünür alan içinde bağımsız yerleşir.
   const solution = Array(NUMBER_PUZZLE_CELLS).fill(NUMBER_PUZZLE_EMPTY);
   let numberOccurrences = 0;
   const numberCellSet = new Set();
@@ -5698,9 +5699,16 @@ function generateResultFindPuzzle() {
     ops[1] = highPriorityOp;     // ilk parantezin tek dış bağlantısı
     ops[count - 3] = highPriorityOp; // ikinci parantezin tek dış bağlantısı
 
+    // Her iki parantezin iç sonucu da pozitif olmalı. İlk grup toplama olduğu için zaten
+    // pozitiftir; ikinci grup çıkarma olduğundan soldaki sayı sağdakinden büyük olmalıdır.
+    if (nums[count - 2] <= nums[count - 1]) continue;
+    const firstParen = resultFindApply(nums[0], ops[0], nums[1]);
+    const secondParen = resultFindApply(nums[count - 2], ops[count - 2], nums[count - 1]);
+    if (!(firstParen > 0) || !(secondParen > 0)) continue;
+
     const exactResult = evaluateResultFindExact(nums, ops, ranges);
     if (!exactResult || exactResult.d !== 1n) continue;
-    if (exactResult.n < -100n || exactResult.n > 100n) continue;
+    if (exactResult.n <= 0n || exactResult.n > 100n) continue;
     const integerResult = Number(exactResult.n);
     const encoding = [count, ...nums, ...ops, ranges[0][0], ranges[0][1], ranges[1][0], ranges[1][1]];
     return { difficulty: "Standard", target: integerResult, numbers: encoding, gameKey: "result_find", initialGrid: [] };
