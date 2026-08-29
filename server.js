@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "advanced-games-v2-20260828";
+const SERVER_BUILD_ID = "gameplay-polish-5120-v4-20260829";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5318,23 +5318,17 @@ function validateMerge5120Answer(puzzle, answer = {}) {
   });
 }
 
+function merge5120OverflowColumnIsValid(state, columnValue) {
+  const column = Number(columnValue);
+  if (!state || !Array.isArray(state.board)) return false;
+  if (!Number.isInteger(column) || column < 0 || column >= MERGE_5120_COLS) return false;
+  // Yerçekimi nedeniyle üst hücre doluysa bu sütunda artık yeni taş için yer yoktur.
+  return state.board[column] != null;
+}
+
 function merge5120AnswerIsWinning(puzzle, answer = {}) {
   if (!validateMerge5120Answer(puzzle, answer)) return false;
   return Number(answer.score) >= Math.max(100, Number(puzzle?.target || 100));
-}
-
-function merge5120InfiniteAnswerIsTerminal(puzzle, answer = {}) {
-  if (!validateMerge5120Answer(puzzle, answer) || answer?.gameOver !== true) return false;
-  const overflowColumn = Number(answer?.overflowColumn);
-  if (!Number.isInteger(overflowColumn) || overflowColumn < 0 || overflowColumn >= MERGE_5120_COLS) return false;
-  const state = replayMerge5120(puzzle, answer);
-  if (!state) return false;
-  // Sonsuz oyunda taş tamamen dolu bir sütuna bırakılmaya çalışıldığında üst sınır aşılmış sayılır.
-  // Sunucu da yalnız gerçekten dolu olan sütun için bitiş kabul eder.
-  for (let row = 0; row < MERGE_5120_ROWS; row += 1) {
-    if (state.board[row * MERGE_5120_COLS + overflowColumn] == null) return false;
-  }
-  return true;
 }
 
 function generateMerge5120Puzzle() {
@@ -5348,24 +5342,18 @@ function generateMerge5120Puzzle() {
 }
 
 function numberPuzzlePath(equationIndex) {
-  // CrossMath ağı: aynı yönlü iki denklem hiçbir hücrede kesişmez.
-  // Yalnız yatay-dikey denklemler sayı hücrelerinde kesişebilir. Her yol 7 hücrelidir;
-  // tek işlemli denklem ilk 5 hücreyi, çift işlemli denklem 7 hücrenin tamamını kullanır.
-  // Bağlantılar 0/2/4 numaralı tokenlarda kurulduğu için bunlar her iki denklem tipinde de sayıdır.
+  // 8 denklemli tek zincir. Yatay ve dikey denklemler sırayla ilerlediği için aynı yöndeki
+  // iki bulmaca hiçbir hücrede kesişmez. Bütün yollar soldan sağa / yukarıdan aşağıya
+  // aktığından sonuç yatayda daima sağda, dikeyde daima alttadır.
   const coords = [
-    // 0 merkez yatay
-    [[8,6],[8,7],[8,8],[8,9],[8,10],[8,11],[8,12]],
-    // 1-3 merkezden çıkan dikey kollar
-    [[8,6],[9,6],[10,6],[11,6],[12,6],[13,6],[14,6]],
-    [[8,8],[7,8],[6,8],[5,8],[4,8],[3,8],[2,8]],
-    [[8,10],[9,10],[10,10],[11,10],[12,10],[13,10],[14,10]],
-    // 4-6 yatay dış kollar; aynı satırdaki 4 ve 6 arasında boşluk bırakılır.
-    [[12,6],[12,5],[12,4],[12,3],[12,2],[12,1],[12,0]],
-    [[4,8],[4,7],[4,6],[4,5],[4,4],[4,3],[4,2]],
-    [[12,10],[12,11],[12,12],[12,13],[12,14],[12,15],[12,16]],
-    // 7 ve 8 yeniden dikey dallar; 8 yalnız 9 denklemlik varyantta kullanılır.
-    [[12,2],[11,2],[10,2],[9,2],[8,2],[7,2],[6,2]],
-    [[4,4],[5,4],[6,4],[7,4],[8,4],[9,4],[10,4]],
+    [[0,0],[0,1],[0,2],[0,3],[0,4]],
+    [[0,4],[1,4],[2,4],[3,4],[4,4]],
+    [[4,4],[4,5],[4,6],[4,7],[4,8]],
+    [[4,8],[5,8],[6,8],[7,8],[8,8]],
+    [[8,8],[8,9],[8,10],[8,11],[8,12]],
+    [[8,12],[9,12],[10,12],[11,12],[12,12]],
+    [[12,12],[12,13],[12,14],[12,15],[12,16]],
+    [[12,16],[13,16],[14,16],[15,16],[16,16]],
   ];
   const path = coords[equationIndex];
   if (!path) throw new Error("Sayı bulmacası yol indeksi geçersiz.");
@@ -5388,13 +5376,14 @@ function generateNumberPuzzleEquation(start, doubleOperation) {
     if (!doubleOperation) {
       const result = applySimpleMath(start, op1, b);
       if (Number.isInteger(result) && result >= 1 && result < 50) {
-        // sayı • işlem • sayı • = • sonuç: bütün kareler bitişiktir.
+        // Tek işlemli denklem de artık aralıksızdır: sayı işlem sayı = sonuç.
         return [start, op1, b, NUMBER_PUZZLE_EQUALS, result];
       }
       continue;
     }
     const op2 = operators[secureRandomInt(0, operators.length)];
     const c = secureRandomInt(1, op2 === NUMBER_PUZZLE_MULTIPLY ? 8 : 20);
+    // Standart işlem önceliği.
     let result;
     if (op2 === NUMBER_PUZZLE_MULTIPLY || op2 === NUMBER_PUZZLE_DIVIDE) {
       const right = applySimpleMath(b, op2, c);
@@ -5409,17 +5398,15 @@ function generateNumberPuzzleEquation(start, doubleOperation) {
       return [start, op1, b, op2, c, NUMBER_PUZZLE_EQUALS, result];
     }
   }
-  return doubleOperation
-    ? [start, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_EQUALS, Math.min(49, start + 2)]
-    : [start, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_EQUALS, Math.min(49, start + 1)];
+  if (doubleOperation) {
+    return [start, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_EQUALS, Math.min(49, start + 2)];
+  }
+  return [start, NUMBER_PUZZLE_PLUS, 1, NUMBER_PUZZLE_EQUALS, Math.min(49, start + 1)];
 }
 
 function generateNumberPuzzle() {
-  const equationCount = secureRandomInt(8, 10); // 8 veya 9
-  // 8 denklemde bazen tek bir iki-işlemli denklem kullanılır: toplam sayı oluşumu 24 veya 25.
-  // 9 denklemde tümü tek işlemlidir: toplam sayı oluşumu 27. Böylece istenen 24-27 aralığı korunur.
-  const useDouble = equationCount === 8 && secureRandomInt(0, 100) < 48;
-  const doubleIndex = useDouble ? secureRandomInt(0, equationCount) : -1;
+  const equationCount = 8;
+  // 8 tek-işlemli denklem × 3 sayı oluşumu = 24. Ağ tek bir yatay/dikey zincirdir.
   const solution = Array(NUMBER_PUZZLE_CELLS).fill(NUMBER_PUZZLE_EMPTY);
   let numberOccurrences = 0;
   const numberCellSet = new Set();
@@ -5428,7 +5415,8 @@ function generateNumberPuzzle() {
     const path = numberPuzzlePath(eq);
     const existingStart = solution[path[0]];
     const startValue = existingStart > 0 ? existingStart : secureRandomInt(2, 30);
-    const tokens = generateNumberPuzzleEquation(startValue, eq === doubleIndex);
+    const tokens = generateNumberPuzzleEquation(startValue, false);
+    if (tokens.length !== path.length) throw new Error("Sayı bulmacası yol/denklem uzunluğu uyuşmuyor.");
     tokens.forEach((token, tokenIndex) => {
       const cell = path[tokenIndex];
       if (solution[cell] !== NUMBER_PUZZLE_EMPTY && solution[cell] !== token) {
@@ -5442,15 +5430,13 @@ function generateNumberPuzzle() {
     });
   }
 
-  if (numberOccurrences < 24 || numberOccurrences > 27) {
-    throw new Error(`Sayı bulmacası sayı adedi aralık dışında: ${numberOccurrences}`);
+  if (numberOccurrences !== 24) {
+    throw new Error(`Sayı bulmacası sayı adedi beklenenden farklı: ${numberOccurrences}`);
   }
 
   const initialGrid = solution.map((value) => value);
   const numberCells = shuffled([...numberCellSet]);
-  // Kullanıcının istediği 24-27 toplam sayı oluşumunun yarısı havuzda başlar.
-  // Tek toplamda bir eksiğinin yarısı kullanılır: 24→12, 25→12, 27→13.
-  const hiddenCount = Math.floor(numberOccurrences / 2);
+  const hiddenCount = Math.min(12, numberCells.length);
   numberCells.slice(0, hiddenCount).forEach((index) => { initialGrid[index] = null; });
   return { difficulty: "Standard", target: equationCount, numbers: solution, gameKey: "number_puzzle", initialGrid };
 }
@@ -5698,43 +5684,29 @@ function evaluateResultFindExact(nums, ops, ranges) {
 }
 
 function generateResultFindPuzzle() {
-  for (let attempt = 0; attempt < 6000; attempt += 1) {
+  for (let attempt = 0; attempt < 3000; attempt += 1) {
     const count = secureRandomInt(8, 11);
     const nums = Array.from({ length: count }, () => secureRandomInt(2, 31)); // en fazla 30
-    const ops = Array.from({ length: count - 1 }, () => secureRandomInt(0, 4));
-    const ranges = [[1, 2], [count - 3, count - 2]];
-    if (ranges[0][1] >= ranges[1][0]) continue;
+    const highPriorityOp = secureRandomInt(0, 2) === 0 ? 2 : 3; // bulmaca genelinde ya × ya ÷
+    const ops = Array.from({ length: count - 1 }, () => [0, 1, highPriorityOp][secureRandomInt(0, 3)]);
 
-    // Her parantezin yalnız TEK tarafında çarpma/bölme bağlantısı vardır.
-    // Diğer tarafı +/− tutulur; böylece aynı parantez hem × hem ÷ ile bağlanmaz.
-    const firstInner = ranges[0][0];
-    const firstBefore = ranges[0][0] - 1;
-    const firstAfter = ranges[0][1];
-    const secondInner = ranges[1][0];
-    const secondBefore = ranges[1][0] - 1;
-    const secondAfter = ranges[1][1];
-    ops[firstInner] = 0;   // ilk parantez içi +
-    ops[firstBefore] = 2;  // ilk parantezin tek yüksek öncelikli dış bağlantısı ×
-    ops[firstAfter] = 1;   // diğer taraf −
-    ops[secondInner] = 1;  // ikinci parantez içi −
-    ops[secondBefore] = 0; // diğer taraf +
-    ops[secondAfter] = 3;  // ikinci parantezin tek yüksek öncelikli dış bağlantısı ÷
+    // Parantezleri ifadenin iki ucuna yerleştirerek her parantez grubunun yalnız bir dış işlemi
+    // olmasını garanti ederiz. Böylece tek bir parantezli sayı grubu hem × hem ÷ ile bağlanmaz.
+    const ranges = [[0, 1], [count - 2, count - 1]];
+    ops[0] = 0;                 // ilk parantezin içi +
+    ops[count - 2] = 1;         // ikinci parantezin içi −
+    ops[1] = highPriorityOp;     // ilk parantezin tek dış bağlantısı
+    ops[count - 3] = highPriorityOp; // ikinci parantezin tek dış bağlantısı
 
     const exactResult = evaluateResultFindExact(nums, ops, ranges);
     if (!exactResult || exactResult.d !== 1n) continue;
-    if (exactResult.n < 1n || exactResult.n > 100n) continue;
+    if (exactResult.n < -100n || exactResult.n > 100n) continue;
     const integerResult = Number(exactResult.n);
     const encoding = [count, ...nums, ...ops, ranges[0][0], ranges[0][1], ranges[1][0], ranges[1][1]];
     return { difficulty: "Standard", target: integerResult, numbers: encoding, gameKey: "result_find", initialGrid: [] };
   }
-  // 4 × (3 + 2) − 5 + 6 + (8 − 2) ÷ 3 = 23
-  return {
-    difficulty: "Standard",
-    target: 23,
-    numbers: [8, 4,3,2,5,6,8,2,3, 2,0,1,0,0,1,3, 1,2,5,6],
-    gameKey: "result_find",
-    initialGrid: [],
-  };
+  // (6+4) × 3 - 2 + 5 - 2 + (8-4) = 35; sayılar <=30, sonuç <=100, yalnız × kullanılır.
+  return { difficulty: "Standard", target: 35, numbers: [8,6,4,3,2,5,2,8,4,0,2,1,0,1,0,1,0,1,6,7], gameKey: "result_find", initialGrid: [] };
 }
 
 function validateResultFindAnswer(puzzle, answer = {}) {
@@ -7208,7 +7180,9 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
   const requestedDifficulty = secureDifficulty(req.body.difficulty);
   const freshInfiniteRun = req.body.fresh === true;
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
-  const lifetimeMs = 7 * 24 * 60 * 60 * 1000;
+  const lifetimeMs = gameKey === "merge_5120"
+    ? 10 * 365 * 24 * 60 * 60 * 1000
+    : 7 * 24 * 60 * 60 * 1000;
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -7229,15 +7203,26 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
        FOR UPDATE`,
       [req.auth.sub, gameKey]
     );
-    const stage = gameKey === "merge_5120"
-      ? 1
-      : Math.max(1, Math.min(Number(progressResult.rows[0]?.infinite_next_stage || 1), 1000));
+    const storedStage = Math.max(1, Math.min(Number(progressResult.rows[0]?.infinite_next_stage || 1), 1000));
+    const stage = gameKey === "merge_5120" ? 1 : storedStage;
+    if (gameKey === "merge_5120" && storedStage !== 1) {
+      await client.query(
+        `UPDATE player_game_progress SET infinite_next_stage = 1, updated_at = NOW()
+         WHERE player_id = $1 AND game_key = $2`,
+        [req.auth.sub, gameKey]
+      );
+    }
     const difficultyResolver = gameDefinition(gameKey).infiniteDifficultyForStage;
     const difficulty = typeof difficultyResolver === "function"
       ? secureDifficulty(difficultyResolver(stage, requestedDifficulty))
       : requestedDifficulty;
     const puzzle = generatePuzzleForGame(gameKey, difficulty);
-    // 5120 sonsuz modu tek, süresiz bir koşudur; puzzle.target yalnız normal mod uyumluluğu için kalır.
+    if (gameKey === "merge_5120") {
+      // 5120 sonsuz modu tek ve süresiz bir koşudur; hedef skor/aşama yoktur.
+      // Bitiş, oyuncunun dolu sütunun üstüne yeni taş bırakmaya çalışmasıdır.
+      puzzle.target = 0;
+      puzzle.endOnOverflow = true;
+    }
 
     await client.query(
       `WITH superseded AS (
@@ -7316,11 +7301,19 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer)) {
       const error = new Error("Oyun sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
     }
-    const answerWon = challenge.mode === "infinite" && gameKey === "merge_5120"
-      ? merge5120InfiniteAnswerIsTerminal(challenge.puzzle, req.body.answer)
-      : challengeAnswerIsWinning(
-          challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer
-        );
+    const mergeInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "merge_5120";
+    if (mergeInfiniteSingleRun) {
+      const replayedMergeState = replayMerge5120(challenge.puzzle, req.body.answer || {});
+      if (!replayedMergeState || !merge5120OverflowColumnIsValid(replayedMergeState, req.body?.answer?.overflowColumn)) {
+        const error = new Error("5120 sonsuz oyunu yalnız üst sınır aşıldığında tamamlanabilir.");
+        error.statusCode = 422;
+        throw error;
+      }
+    }
+    let answerWon = challengeAnswerIsWinning(
+      challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer
+    );
+    if (mergeInfiniteSingleRun) answerWon = true;
     const wrongAnswerReason = gameKey === "shortest_path"
       ? "wrong_route"
       : gameKey === "digit_attack" ? "three_mistakes" : "wrong_answer";
@@ -7328,6 +7321,13 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     let won = null;
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.stage);
+    if (mergeInfiniteSingleRun) {
+      const gameScore = Math.max(0, Math.floor(Number(req.body?.answer?.score || 0)));
+      const earnedInfinite = Math.floor(gameScore / 20);
+      rewards = { generalDelta: 0, infiniteDelta: earnedInfinite, xpDelta: earnedInfinite };
+      won = true;
+      outcomeReason = "top_overflow";
+    }
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
       if (gameKey === "merge_5120") {
         const roundLimitMs = gameDefinition(gameKey).roundDurationMs;
@@ -7410,70 +7410,6 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       return;
     }
 
-    if (challenge.mode === "infinite" && gameKey === "merge_5120") {
-      if (!answerWon) {
-        const error = new Error("5120 sonsuz oyunu yalnız üst sınır gerçekten aşıldığında tamamlanabilir.");
-        error.statusCode = 422;
-        throw error;
-      }
-      await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
-      const progressBefore = await client.query(
-        `SELECT infinite_score FROM player_game_progress
-         WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
-        [req.auth.sub, gameKey]
-      );
-      const gameScore = Math.max(0, Math.min(2_000_000_000, Number(req.body?.answer?.score || 0)));
-      const earnedInfinitePoints = Math.floor(gameScore / 20);
-      const oldHighScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
-      const newHighScore = Math.max(oldHighScore, earnedInfinitePoints);
-      const highScoreDelta = Math.max(0, newHighScore - oldHighScore);
-
-      // Tek koşu bittiği için aktif run/stage ilerlemesi tutulmaz. Yalnız bu oyundaki en iyi
-      // sonsuz puanı ve bundan türeyen global sonsuz skor güncellenir.
-      await client.query(
-        `UPDATE player_game_progress
-         SET infinite_score = $3,
-             infinite_run_score = 0,
-             infinite_next_stage = 1,
-             updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey, newHighScore]
-      );
-      if (highScoreDelta > 0) {
-        await applyLeaderboardScoreDeltaInTransaction(client, req.auth.sub, 0, highScoreDelta);
-      }
-      const state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
-      await recordTaskEventInTransaction(client, {
-        playerId: req.auth.sub,
-        sourceKey: `challenge:${challengeId}`,
-        eventType: "game",
-        gameKey,
-        multiplayer: false,
-        won: true,
-      });
-      const response = {
-        ok: true,
-        gameKey,
-        ...state,
-        generalDelta: 0,
-        infiniteDelta: earnedInfinitePoints,
-        xpDelta: 0,
-        runScore: earnedInfinitePoints,
-        won: true,
-        outcomeReason: "top_overflow",
-        elapsedServerMs,
-        gameScore,
-        opponentGameScore: null,
-      };
-      await client.query(
-        `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
-        [challengeId, JSON.stringify(compactChallengeResult(response))]
-      );
-      await client.query("COMMIT");
-      res.json(response);
-      return;
-    }
-
     let infiniteRunScore = 0;
     let state;
     if (challenge.mode === "infinite" && !answerWon) {
@@ -7515,19 +7451,33 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       );
       const oldHighScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
       const oldRunScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_run_score || 0));
-      infiniteRunScore = Math.min(2_000_000_000, oldRunScore + Math.max(0, Number(rewards.infiniteDelta || 0)));
+      infiniteRunScore = mergeInfiniteSingleRun
+        ? Math.max(0, Number(rewards.infiniteDelta || 0))
+        : Math.min(2_000_000_000, oldRunScore + Math.max(0, Number(rewards.infiniteDelta || 0)));
       const newHighScore = Math.max(oldHighScore, infiniteRunScore);
       const highScoreDelta = Math.max(0, newHighScore - oldHighScore);
 
-      await client.query(
-        `UPDATE player_game_progress
-         SET infinite_score = $3,
-             infinite_run_score = $4,
-             infinite_next_stage = GREATEST(infinite_next_stage, $5 + 1),
-             updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey, newHighScore, infiniteRunScore, Number(challenge.stage)]
-      );
+      if (mergeInfiniteSingleRun) {
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_score = $3,
+               infinite_run_score = $4,
+               infinite_next_stage = 1,
+               updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey, newHighScore, infiniteRunScore]
+        );
+      } else {
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_score = $3,
+               infinite_run_score = $4,
+               infinite_next_stage = GREATEST(infinite_next_stage, $5 + 1),
+               updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey, newHighScore, infiniteRunScore, Number(challenge.stage)]
+        );
+      }
       await client.query(
         `UPDATE player_progress
          SET total_xp = LEAST(total_xp + $2, 2000000000), updated_at = NOW()
