@@ -5342,19 +5342,31 @@ function generateMerge5120Puzzle() {
 }
 
 function numberPuzzlePath(equationIndex) {
-  // 8 işlem, ekranda yatay kaydırma gerektirmeyecek biçimde en fazla 9 sütun ve
-  // en fazla 13 satır içine yerleşir. İşlemler bağımsız tutulduğu için bir işlemin
-  // sonucu başka bir işlemin başlangıcı gibi ters yönde okunamaz.
-  // Yatayların sonucu daima sağda, dikeylerin sonucu daima alttadır.
+  // 8 işlemin tamamı tek bir bağlı ağın parçasıdır: hiçbir işlem bağımsız değildir.
+  // Aynı yöndeki iki işlem bitişik satır/sütunda bulunmaz; aralarında en az bir boş
+  // satır veya sütun vardır. Tüm ağ 9 sütun x 13 satır sınırının içinde kalır.
+  // Token sırası her zaman başlangıç -> işlem -> sayı -> '=' -> sonuç olduğundan
+  // yatay sonuç sağda, dikey sonuç alttadır.
+  //
+  // Üretim sırası özellikle topolojik seçildi: ilk işlem dışındaki her yolun ilk
+  // hücresi daha önce üretilmiş başka bir işlemin sayı hücresiyle kesişir. Böylece
+  // mevcut startValue mekanizması kesişimde aynı sayıyı garanti eder.
   const coords = [
+    // H0: kök
     [[0,0],[0,1],[0,2],[0,3],[0,4]],
-    [[3,0],[3,1],[3,2],[3,3],[3,4]],
-    [[6,0],[6,1],[6,2],[6,3],[6,4]],
-    [[9,0],[9,1],[9,2],[9,3],[9,4]],
-    [[0,5],[1,5],[2,5],[3,5],[4,5]],
-    [[0,6],[1,6],[2,6],[3,6],[4,6]],
-    [[0,7],[1,7],[2,7],[3,7],[4,7]],
-    [[0,8],[1,8],[2,8],[3,8],[4,8]],
+    // V0: H0'ın başlangıcıyla kesişir
+    [[0,0],[1,0],[2,0],[3,0],[4,0]],
+    // H1: V0'ın orta sayı hücresiyle kesişir
+    [[2,0],[2,1],[2,2],[2,3],[2,4]],
+    // H2: V0'ın sonuç hücresiyle kesişir
+    [[4,0],[4,1],[4,2],[4,3],[4,4]],
+    // V1: H2'nin orta sayı hücresiyle kesişir
+    [[4,2],[5,2],[6,2],[7,2],[8,2]],
+    // H3: V1'in orta sayı hücresiyle kesişir
+    [[6,2],[6,3],[6,4],[6,5],[6,6]],
+    // V2 ve V3: H3'ün sayı hücrelerinden dallanır; birbirlerine bitişik değildir.
+    [[6,4],[7,4],[8,4],[9,4],[10,4]],
+    [[6,6],[7,6],[8,6],[9,6],[10,6]],
   ];
   const path = coords[equationIndex];
   if (!path) throw new Error("Sayı bulmacası yol indeksi geçersiz.");
@@ -5407,7 +5419,8 @@ function generateNumberPuzzleEquation(start, doubleOperation) {
 
 function generateNumberPuzzle() {
   const equationCount = 8;
-  // 8 tek-işlemli denklem × 3 sayı oluşumu = 24. Tümü 9×13 görünür alan içinde bağımsız yerleşir.
+  // 8 tek-işlemli denklem tek bir kesişen ağ oluşturur. Tümü 9×13 görünür alan içindedir;
+  // aynı yöndeki işlemler arasında en az bir boş satır/sütun bulunur.
   const solution = Array(NUMBER_PUZZLE_CELLS).fill(NUMBER_PUZZLE_EMPTY);
   let numberOccurrences = 0;
   const numberCellSet = new Set();
