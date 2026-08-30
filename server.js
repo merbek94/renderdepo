@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "gameplay-polish-puzzles-v5-20260829";
+const SERVER_BUILD_ID = "five-new-shared-games-v6-20260830";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2037,6 +2037,67 @@ const GAME_DEFINITIONS = Object.freeze({
     botFinishMaxMs: 299 * 1000,
     // Toplam Eşittir ilk 5 bot kalibrasyonu 4-5 dakika. Gerçek bitiş süresi
     // createTwoPlayerBotFinishMs içinde tur sonundan 1 sn önce güvenli biçimde sınırlandırılır.
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
+    botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  ratio_proportion: Object.freeze({
+    key: "ratio_proportion",
+    displayName: "ORAN ORANTI",
+    roundDurationMs: 2 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    // İlk 5 bot maçı 1,5-2 dakika; sonrasında oyuncunun bu oyundaki ortalaması ±4 sn.
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 119 * 1000,
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  total_match: Object.freeze({
+    key: "total_match",
+    displayName: "TOPLAM EŞLEŞTİR",
+    roundDurationMs: 5 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
+    botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  triple_balance: Object.freeze({
+    key: "triple_balance",
+    displayName: "ÜÇLÜ DENGE",
+    roundDurationMs: 5 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
+    botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  sort_order: Object.freeze({
+    key: "sort_order",
+    displayName: "SIRALA",
+    roundDurationMs: 5 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
+    botCalibrationMinMs: 4 * 60 * 1000,
+    botCalibrationMaxMs: 5 * 60 * 1000,
+    botAverageVarianceMs: 7 * 1000,
+    infiniteDifficultyForStage: () => "Standard",
+  }),
+  dual_pyramid: Object.freeze({
+    key: "dual_pyramid",
+    displayName: "İKİLİ PİRAMİT",
+    roundDurationMs: 5 * 60 * 1000,
+    hundredStageDurationMs: 90 * 1000,
+    botFinishMinMs: 1 * 1000,
+    botFinishMaxMs: 299 * 1000,
     botCalibrationMinMs: 4 * 60 * 1000,
     botCalibrationMaxMs: 5 * 60 * 1000,
     botAverageVarianceMs: 7 * 1000,
@@ -5736,6 +5797,325 @@ function validateResultFindAnswer(puzzle, answer = {}) {
 }
 
 
+
+function integerMultisetKey(values) {
+  if (!Array.isArray(values)) return "";
+  return values.map((value) => Number(value)).sort((a, b) => a - b).join(",");
+}
+
+function gcdPositive(a, b) {
+  let x = Math.abs(Number(a) || 0);
+  let y = Math.abs(Number(b) || 0);
+  while (y !== 0) {
+    const t = x % y;
+    x = y;
+    y = t;
+  }
+  return x || 1;
+}
+
+function ratioPuzzleEncodingValid(puzzle) {
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (Number(puzzle?.target) !== 6 || numbers.length !== 12 || initialGrid.length !== 12) return false;
+  if (numbers.some((value) => !Number.isInteger(value) || value <= 0 || value > 100)) return false;
+  if (initialGrid.filter((value) => value !== null && value !== undefined).length !== 5) return false;
+  for (let i = 0; i < 12; i += 1) {
+    if (initialGrid[i] !== null && initialGrid[i] !== undefined && Number(initialGrid[i]) !== numbers[i]) return false;
+  }
+  const n0 = numbers[0];
+  const d0 = numbers[1];
+  const numerators = [];
+  for (let pair = 0; pair < 6; pair += 1) {
+    const n = numbers[pair * 2];
+    const d = numbers[pair * 2 + 1];
+    if (n * d0 !== n0 * d) return false;
+    numerators.push(n);
+  }
+  return new Set(numerators).size === 6;
+}
+
+function generateRatioProportionPuzzle() {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    let numerator = secureRandomInt(2, 13);
+    let denominator = secureRandomInt(2, 13);
+    if (numerator === denominator) continue;
+    const gcd = gcdPositive(numerator, denominator);
+    numerator = Math.floor(numerator / gcd);
+    denominator = Math.floor(denominator / gcd);
+    const maxMultiplier = Math.floor(100 / Math.max(numerator, denominator));
+    if (maxMultiplier < 6) continue;
+    const multipliers = shuffled(Array.from({ length: maxMultiplier }, (_, i) => i + 1)).slice(0, 6);
+    const numbers = [];
+    for (const multiplier of multipliers) {
+      numbers.push(numerator * multiplier, denominator * multiplier);
+    }
+    const fixed = new Set(shuffled(Array.from({ length: 12 }, (_, i) => i)).slice(0, 5));
+    const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
+    const puzzle = { difficulty: "Standard", target: 6, numbers, gameKey: "ratio_proportion", initialGrid };
+    if (ratioPuzzleEncodingValid(puzzle)) return puzzle;
+  }
+  return {
+    difficulty: "Standard",
+    target: 6,
+    numbers: [4,7,8,14,12,21,16,28,20,35,24,42],
+    gameKey: "ratio_proportion",
+    initialGrid: [4,null,null,14,12,null,null,28,null,null,24,null],
+  };
+}
+
+function validateRatioProportionAnswer(puzzle, answer = {}) {
+  if (!ratioPuzzleEncodingValid(puzzle)) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (grid.length !== 12 || grid.some((value) => !Number.isInteger(value) || value <= 0 || value > 100)) return false;
+  if (integerMultisetKey(grid) !== integerMultisetKey(puzzle.numbers)) return false;
+  const n0 = grid[0];
+  const d0 = grid[1];
+  const numerators = [];
+  for (let pair = 0; pair < 6; pair += 1) {
+    const n = grid[pair * 2];
+    const d = grid[pair * 2 + 1];
+    if (n * d0 !== n0 * d) return false;
+    numerators.push(n);
+  }
+  return new Set(numerators).size === 6;
+}
+
+function totalMatchPuzzleEncodingValid(puzzle) {
+  const target = Number(puzzle?.target);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (!Number.isInteger(target) || target < 13 || target > 36 || numbers.length !== 56) return false;
+  if (numbers.some((value) => !Number.isInteger(value) || value <= 0 || value >= target)) return false;
+  const counts = new Map();
+  for (const value of numbers) counts.set(value, (counts.get(value) || 0) + 1);
+  for (const [value, count] of counts.entries()) {
+    const complement = target - value;
+    if (value === complement) {
+      if (count % 2 !== 0) return false;
+    } else if ((counts.get(complement) || 0) !== count) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function generateTotalMatchPuzzle() {
+  const target = secureRandomInt(13, 37);
+  const values = [];
+  for (let pair = 0; pair < 28; pair += 1) {
+    const left = secureRandomInt(1, target);
+    values.push(left, target - left);
+  }
+  const numbers = shuffled(values);
+  return { difficulty: "Standard", target, numbers, gameKey: "total_match", initialGrid: [] };
+}
+
+function validateTotalMatchAnswer(puzzle, answer = {}) {
+  if (!totalMatchPuzzleEncodingValid(puzzle)) return false;
+  const remaining = Array.isArray(answer?.remaining) ? answer.remaining : [];
+  return remaining.length === 56 && remaining.every((value) => value === null || value === undefined);
+}
+
+const TRIPLE_BALANCE_DEVIATION_GROUPS = Object.freeze([
+  Object.freeze([-10,-9,-8,0,8,9,10]),
+  Object.freeze([-7,-6,-5,1,4,6,7]),
+  Object.freeze([-4,-3,-2,-1,2,3,5]),
+]);
+
+function tripleBalancePuzzleEncodingValid(puzzle) {
+  const target = Number(puzzle?.target);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (!Number.isInteger(target) || target < 50 || target > 150 || numbers.length !== 21) return false;
+  if (numbers.some((value) => !Number.isInteger(value) || value <= 0 || value > 60) || new Set(numbers).size !== 21) return false;
+  if (numbers.reduce((sum, value) => sum + value, 0) !== target * 3) return false;
+  const sums = [0,1,2].map((group) => numbers.slice(group * 7, group * 7 + 7).reduce((a, b) => a + b, 0));
+  return sums.every((sum) => sum >= 50 && sum <= 150) && new Set(sums).size === 3;
+}
+
+function generateTripleBalancePuzzle() {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const center = secureRandomInt(11, 22);
+    const target = center * 7;
+    const solution = TRIPLE_BALANCE_DEVIATION_GROUPS.flatMap((group) => group.map((delta) => center + delta));
+    if (new Set(solution).size !== 21 || solution.some((value) => value <= 0)) continue;
+    for (let shuffleAttempt = 0; shuffleAttempt < 30; shuffleAttempt += 1) {
+      const numbers = shuffled(solution);
+      const puzzle = { difficulty: "Standard", target, numbers, gameKey: "triple_balance", initialGrid: [] };
+      if (tripleBalancePuzzleEncodingValid(puzzle)) return puzzle;
+    }
+  }
+  return {
+    difficulty: "Standard", target: 77,
+    numbers: [1,4,7,10,13,16,19, 2,5,8,11,14,17,20, 3,6,9,12,15,18,21],
+    gameKey: "triple_balance", initialGrid: []
+  };
+}
+
+function validateTripleBalanceAnswer(puzzle, answer = {}) {
+  if (!tripleBalancePuzzleEncodingValid(puzzle)) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (grid.length !== 21 || grid.some((value) => !Number.isInteger(value))) return false;
+  if (integerMultisetKey(grid) !== integerMultisetKey(puzzle.numbers)) return false;
+  return [0,1,2].every((group) => grid.slice(group * 7, group * 7 + 7).reduce((a, b) => a + b, 0) === Number(puzzle.target));
+}
+
+function sortOrderExpressionResult(numbers, expressionIndex) {
+  if (!Array.isArray(numbers) || numbers.length !== 30) return null;
+  const base = expressionIndex * 3;
+  const a = Number(numbers[base]);
+  const op = Number(numbers[base + 1]);
+  const b = Number(numbers[base + 2]);
+  if (![a, op, b].every(Number.isInteger)) return null;
+  if (op === 0) return a + b;
+  if (op === 1) return a - b;
+  if (op === 2) return a * b;
+  if (op === 3) return b !== 0 && a % b === 0 ? a / b : null;
+  return null;
+}
+
+function createSortExpression(op, usedResults) {
+  if (op === 2) {
+    const candidates = [];
+    for (let a = 2; a <= 20; a += 1) for (let b = 2; b <= 20; b += 1) {
+      const result = a * b;
+      if (result >= 40 && result <= 80 && !usedResults.has(result)) candidates.push([a, op, b, result]);
+    }
+    return candidates.length ? candidates[secureRandomInt(0, candidates.length)] : null;
+  }
+  if (op === 3) {
+    const candidates = [];
+    for (let result = 40; result <= 80; result += 1) for (let b = 2; b <= 8; b += 1) {
+      const a = result * b;
+      if (a <= 150 && !usedResults.has(result)) candidates.push([a, op, b, result]);
+    }
+    return candidates.length ? candidates[secureRandomInt(0, candidates.length)] : null;
+  }
+  const availableResults = shuffled(Array.from({ length: 41 }, (_, i) => i + 40).filter((result) => !usedResults.has(result)));
+  for (const result of availableResults) {
+    if (op === 0) {
+      const a = secureRandomInt(2, result - 1);
+      const b = result - a;
+      if (a <= 150 && b <= 150 && b > 0) return [a, op, b, result];
+    } else {
+      const maxB = Math.min(60, 150 - result);
+      if (maxB >= 2) {
+        const b = secureRandomInt(2, maxB + 1);
+        const a = result + b;
+        return [a, op, b, result];
+      }
+    }
+  }
+  return null;
+}
+
+function sortOrderPuzzleEncodingValid(puzzle) {
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (Number(puzzle?.target) !== 10 || numbers.length !== 30) return false;
+  const results = [];
+  const ops = [];
+  for (let index = 0; index < 10; index += 1) {
+    const a = numbers[index * 3];
+    const op = numbers[index * 3 + 1];
+    const b = numbers[index * 3 + 2];
+    if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < 0 || a > 150 || b > 150 || !Number.isInteger(op) || op < 0 || op > 3) return false;
+    if ((op === 2 || op === 3) && (a === 1 || b === 1)) return false;
+    const result = sortOrderExpressionResult(numbers, index);
+    if (!Number.isInteger(result) || result < 40 || result > 80) return false;
+    results.push(result);
+    ops.push(op);
+  }
+  if (new Set(results).size !== 10 || new Set(ops).size !== 4) return false;
+  return !results.every((value, index) => index === 0 || results[index - 1] < value);
+}
+
+function generateSortOrderPuzzle() {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const ops = shuffled([0,1,2,3,0,1,2,3,0,1]);
+    const usedResults = new Set();
+    const expressions = [];
+    let failed = false;
+    for (const op of ops) {
+      const expression = createSortExpression(op, usedResults);
+      if (!expression) { failed = true; break; }
+      usedResults.add(expression[3]);
+      expressions.push(expression.slice(0, 3));
+    }
+    if (failed) continue;
+    const shuffledExpressions = shuffled(expressions);
+    const numbers = shuffledExpressions.flat();
+    const puzzle = { difficulty: "Standard", target: 10, numbers, gameKey: "sort_order", initialGrid: [] };
+    if (sortOrderPuzzleEncodingValid(puzzle)) return puzzle;
+  }
+  return {
+    difficulty: "Standard",
+    target: 10,
+    numbers: [10,2,7,65,1,20,142,3,2,25,0,25,39,0,41,6,2,9,100,1,25,120,3,2,30,0,35,70,1,8],
+    gameKey: "sort_order",
+    initialGrid: [],
+  };
+}
+
+function validateSortOrderAnswer(puzzle, answer = {}) {
+  if (!sortOrderPuzzleEncodingValid(puzzle)) return false;
+  const order = Array.isArray(answer?.order) ? answer.order.map(Number) : [];
+  if (order.length !== 10 || order.some((value) => !Number.isInteger(value) || value < 0 || value >= 10) || new Set(order).size !== 10) return false;
+  const results = order.map((index) => sortOrderExpressionResult(puzzle.numbers, index));
+  return results.every((value, index) => Number.isInteger(value) && (index === 0 || results[index - 1] < value));
+}
+
+function buildPyramid15(bottom) {
+  if (!Array.isArray(bottom) || bottom.length !== 5) return [];
+  const rows = [bottom.map(Number)];
+  for (let size = 4; size >= 1; size -= 1) {
+    const lower = rows[0];
+    const upper = Array.from({ length: size }, (_, i) => lower[i] + lower[i + 1]);
+    rows.unshift(upper);
+  }
+  return rows.flat();
+}
+
+function dualPyramidEncodingValid(puzzle) {
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (Number(puzzle?.target) !== 30 || numbers.length !== 30 || initialGrid.length !== 30) return false;
+  if (initialGrid.filter((value) => value !== null && value !== undefined).length !== 12) return false;
+  for (let i = 0; i < 30; i += 1) {
+    if (!Number.isInteger(numbers[i]) || numbers[i] <= 0) return false;
+    if (initialGrid[i] !== null && initialGrid[i] !== undefined && Number(initialGrid[i]) !== numbers[i]) return false;
+  }
+  for (let pyramid = 0; pyramid < 2; pyramid += 1) {
+    const offset = pyramid * 15;
+    const bottom = numbers.slice(offset + 10, offset + 15);
+    if (bottom.length !== 5 || new Set(bottom).size !== 5 || bottom.some((value) => value < 4 || value > 20)) return false;
+    for (let row = 0; row < 4; row += 1) {
+      const start = row * (row + 1) / 2;
+      const lowerStart = (row + 1) * (row + 2) / 2;
+      for (let col = 0; col <= row; col += 1) {
+        if (numbers[offset + start + col] !== numbers[offset + lowerStart + col] + numbers[offset + lowerStart + col + 1]) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function generateDualPyramidPuzzle() {
+  const range = Array.from({ length: 17 }, (_, i) => i + 4);
+  const firstBottom = shuffled(range).slice(0, 5);
+  const secondBottom = shuffled(range).slice(0, 5);
+  const numbers = [...buildPyramid15(firstBottom), ...buildPyramid15(secondBottom)];
+  const fixedFirst = shuffled(Array.from({ length: 15 }, (_, i) => i)).slice(0, 6);
+  const fixedSecond = shuffled(Array.from({ length: 15 }, (_, i) => i + 15)).slice(0, 6);
+  const fixed = new Set([...fixedFirst, ...fixedSecond]);
+  const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
+  return { difficulty: "Standard", target: 30, numbers, gameKey: "dual_pyramid", initialGrid };
+}
+
+function validateDualPyramidAnswer(puzzle, answer = {}) {
+  if (!dualPyramidEncodingValid(puzzle)) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  return grid.length === 30 && grid.every((value, index) => Number.isInteger(value) && value === Number(puzzle.numbers[index]));
+}
+
 const GAME_HANDLERS = Object.freeze({
   target_number: Object.freeze({
     key: "target_number",
@@ -5756,6 +6136,31 @@ const GAME_HANDLERS = Object.freeze({
     key: "total_equals",
     createPuzzle: () => generateTotalEqualsPuzzle(),
     validateAnswer: (puzzle, answer) => validateTotalEqualsChallengeAnswer(puzzle, answer),
+  }),
+  ratio_proportion: Object.freeze({
+    key: "ratio_proportion",
+    createPuzzle: () => generateRatioProportionPuzzle(),
+    validateAnswer: (puzzle, answer) => validateRatioProportionAnswer(puzzle, answer),
+  }),
+  total_match: Object.freeze({
+    key: "total_match",
+    createPuzzle: () => generateTotalMatchPuzzle(),
+    validateAnswer: (puzzle, answer) => validateTotalMatchAnswer(puzzle, answer),
+  }),
+  triple_balance: Object.freeze({
+    key: "triple_balance",
+    createPuzzle: () => generateTripleBalancePuzzle(),
+    validateAnswer: (puzzle, answer) => validateTripleBalanceAnswer(puzzle, answer),
+  }),
+  sort_order: Object.freeze({
+    key: "sort_order",
+    createPuzzle: () => generateSortOrderPuzzle(),
+    validateAnswer: (puzzle, answer) => validateSortOrderAnswer(puzzle, answer),
+  }),
+  dual_pyramid: Object.freeze({
+    key: "dual_pyramid",
+    createPuzzle: () => generateDualPyramidPuzzle(),
+    validateAnswer: (puzzle, answer) => validateDualPyramidAnswer(puzzle, answer),
   }),
   next_number: Object.freeze({
     key: "next_number",
