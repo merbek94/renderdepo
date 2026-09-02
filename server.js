@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "five-new-shared-games-v6-20260830";
+const SERVER_BUILD_ID = "arithmetic-grid-shortest-v7-20260902";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2030,16 +2030,15 @@ const GAME_DEFINITIONS = Object.freeze({
   }),
   total_equals: Object.freeze({
     key: "total_equals",
-    displayName: "TOPLAM EŞİTTİR",
-    roundDurationMs: 5 * 60 * 1000,
+    displayName: "ARİTMETİK",
+    roundDurationMs: 2 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
     botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    // Toplam Eşittir ilk 5 bot kalibrasyonu 4-5 dakika. Gerçek bitiş süresi
-    // createTwoPlayerBotFinishMs içinde tur sonundan 1 sn önce güvenli biçimde sınırlandırılır.
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botFinishMaxMs: 119 * 1000,
+    // ARİTMETİK ilk 5 bot kalibrasyonu 90-119 sn; sonrasında oyuncu ortalamasının ±4 sn çevresi.
+    botCalibrationMinMs: 90 * 1000,
+    botCalibrationMaxMs: 119 * 1000,
+    botAverageVarianceMs: 4 * 1000,
     infiniteDifficultyForStage: () => "Standard",
   }),
   ratio_proportion: Object.freeze({
@@ -2405,97 +2404,103 @@ function generateEqualSumPuzzle() {
   };
 }
 
-const TOTAL_EQUALS_PAIR_COUNT = 15;
-const TOTAL_EQUALS_NUMBER_COUNT = TOTAL_EQUALS_PAIR_COUNT * 2;
-const TOTAL_EQUALS_TARGET_MIN = 21;
-const TOTAL_EQUALS_TARGET_MAX = 40;
+const ARITHMETIC_GROUP_COUNT = 3;
+const ARITHMETIC_SLOTS_PER_GROUP = 3;
+const ARITHMETIC_SLOT_COUNT = 9;
+const ARITHMETIC_TARGET_MIN = 11;
+const ARITHMETIC_TARGET_MAX = 25;
 
-function totalEqualsSplitPuzzle(puzzle) {
+function arithmeticPuzzleParts(puzzle) {
   const target = Number(puzzle?.target);
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  if (!Number.isInteger(target) || target < TOTAL_EQUALS_TARGET_MIN || target > TOTAL_EQUALS_TARGET_MAX) return null;
-  if (numbers.length !== TOTAL_EQUALS_NUMBER_COUNT || numbers.some((value) => !Number.isInteger(value))) return null;
-  const left = numbers.slice(0, TOTAL_EQUALS_PAIR_COUNT);
-  const right = numbers.slice(TOTAL_EQUALS_PAIR_COUNT);
-  if (left.some((value) => value <= 0 || value >= target)) return null;
-  if (right.some((value) => value <= 0 || value >= target)) return null;
-  if (new Set(left).size !== TOTAL_EQUALS_PAIR_COUNT) return null;
-  if (new Set(right).size !== TOTAL_EQUALS_PAIR_COUNT) return null;
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (numbers.length !== 12 || initialGrid.length !== ARITHMETIC_SLOT_COUNT) return null;
+  const targets = numbers.slice(0, 3);
+  const values = numbers.slice(3);
+  if (!targets.every((v) => Number.isInteger(v) && v >= ARITHMETIC_TARGET_MIN && v <= ARITHMETIC_TARGET_MAX)) return null;
+  if (new Set(targets).size !== 3 || target !== targets[0]) return null;
+  if (!values.every((v) => Number.isInteger(v) && v > 0 && v <= 75)) return null;
+  if (initialGrid.filter((v) => v !== null && v !== undefined).length !== 3) return null;
 
-  const expectedRight = left.map((value) => target - value).sort((a, b) => a - b);
-  const actualRight = [...right].sort((a, b) => a - b);
-  if (!expectedRight.every((value, index) => value === actualRight[index])) return null;
-
-  // İki taraf bağımsız karışık görünür; doğru çift başlangıçta aynı satıra denk gelmez.
-  if (left.some((value, index) => value + right[index] === target)) return null;
-  return { target, left, right };
-}
-
-function derangeTotalEqualsRight(left, target) {
-  const complements = left.map((value) => target - value);
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const candidate = shuffled(complements);
-    if (candidate.every((value, index) => left[index] + value !== target)) return candidate;
+  const remaining = [...values];
+  for (const raw of initialGrid) {
+    if (raw === null || raw === undefined) continue;
+    const value = Number(raw);
+    const idx = remaining.indexOf(value);
+    if (idx < 0) return null;
+    remaining.splice(idx, 1);
   }
 
-  // Benzersiz complementler için bir hücrelik döndürme her satırdaki doğru eşleşmeyi kesin bozar.
-  return complements.slice(1).concat(complements[0]);
+  for (let group = 0; group < 3; group += 1) {
+    const groupValues = values.slice(group * 3, group * 3 + 3);
+    if (new Set(groupValues).size !== 3) return null;
+    if (groupValues.reduce((a, b) => a + b, 0) !== targets[group] * 3) return null;
+    const fixed = initialGrid.slice(group * 3, group * 3 + 3).filter((v) => v !== null && v !== undefined).map(Number);
+    if (fixed.length !== 1 || !groupValues.includes(fixed[0])) return null;
+  }
+  return { targets, values, initialGrid };
+}
+
+function makeArithmeticTriple(target) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const a = secureRandomInt(1, Math.min(9, target - 1) + 1);
+    const b = secureRandomInt(1, Math.min(9, target - 1) + 1);
+    const triple = [target - a, target + b, target + a - b];
+    if (triple.every((v) => Number.isInteger(v) && v > 0 && v <= 75) && new Set(triple).size === 3) {
+      return shuffled(triple);
+    }
+  }
+  return [target - 3, target, target + 3];
 }
 
 function generateTotalEqualsPuzzle() {
-  const target = secureRandomInt(TOTAL_EQUALS_TARGET_MIN, TOTAL_EQUALS_TARGET_MAX + 1);
-  const candidates = shuffled(Array.from({ length: target - 1 }, (_, index) => index + 1));
-  const left = shuffled(candidates.slice(0, TOTAL_EQUALS_PAIR_COUNT));
-  const right = derangeTotalEqualsRight(left, target);
-  return {
+  const targets = shuffled(Array.from({ length: 15 }, (_, i) => i + ARITHMETIC_TARGET_MIN)).slice(0, 3);
+  const groups = targets.map((target) => makeArithmeticTriple(target));
+  const values = groups.flat();
+  const initialGrid = Array(9).fill(null);
+  for (let group = 0; group < 3; group += 1) {
+    const local = secureRandomInt(0, 3);
+    const slot = group * 3 + local;
+    initialGrid[slot] = groups[group][local];
+  }
+  const puzzle = {
     gameKey: "total_equals",
     difficulty: "Standard",
-    target,
-    numbers: [...left, ...right],
-    initialGrid: [],
+    target: targets[0],
+    numbers: [...targets, ...values],
+    initialGrid,
   };
+  if (!arithmeticPuzzleParts(puzzle)) throw new Error("Aritmetik bulmacası üretilemedi.");
+  return puzzle;
 }
 
-function normalizeTotalEqualsMatches(answer = {}) {
-  if (Array.isArray(answer.matches)) {
-    return answer.matches.map((match) => ({
-      leftIndex: Number(match?.leftIndex),
-      rightIndex: Number(match?.rightIndex),
-    }));
-  }
-
-  // Yeni istemcide kullanılmaz; generic state'in numberSlots biçimini eski istemci/server
-  // geçişlerinde okuyabilmek için yalnız uyumluluk yolu olarak tutulur.
-  if (Array.isArray(answer.numberSlots) && answer.numberSlots.length === TOTAL_EQUALS_PAIR_COUNT) {
-    return answer.numberSlots.map((rightIndex, leftIndex) => ({
-      leftIndex,
-      rightIndex: Number(rightIndex),
-    }));
-  }
-  return [];
+function normalizeArithmeticSlots(answer = {}) {
+  const raw = Array.isArray(answer?.slots) ? answer.slots :
+    (Array.isArray(answer?.numberSlots) ? answer.numberSlots : null);
+  if (!raw || raw.length !== 9) return null;
+  const slots = raw.map((value) => Number(value));
+  return slots.every(Number.isInteger) ? slots : null;
 }
 
 function validateTotalEqualsChallengeAnswer(puzzle, answer = {}) {
-  const parsed = totalEqualsSplitPuzzle(puzzle);
-  if (!parsed) return false;
-  const matches = normalizeTotalEqualsMatches(answer);
-  if (matches.length !== TOTAL_EQUALS_PAIR_COUNT) return false;
+  const parsed = arithmeticPuzzleParts(puzzle);
+  const slots = normalizeArithmeticSlots(answer);
+  if (!parsed || !slots) return false;
 
-  const usedLeft = new Set();
-  const usedRight = new Set();
-  for (const match of matches) {
-    const leftIndex = Number(match.leftIndex);
-    const rightIndex = Number(match.rightIndex);
-    if (!Number.isInteger(leftIndex) || !Number.isInteger(rightIndex)) return false;
-    if (leftIndex < 0 || leftIndex >= TOTAL_EQUALS_PAIR_COUNT) return false;
-    if (rightIndex < 0 || rightIndex >= TOTAL_EQUALS_PAIR_COUNT) return false;
-    if (usedLeft.has(leftIndex) || usedRight.has(rightIndex)) return false;
-    if (parsed.left[leftIndex] + parsed.right[rightIndex] !== parsed.target) return false;
-    usedLeft.add(leftIndex);
-    usedRight.add(rightIndex);
+  const expected = [...parsed.values].sort((a, b) => a - b);
+  const actual = [...slots].sort((a, b) => a - b);
+  if (!expected.every((value, index) => value === actual[index])) return false;
+
+  for (let i = 0; i < 9; i += 1) {
+    const fixed = parsed.initialGrid[i];
+    if (fixed !== null && fixed !== undefined && slots[i] !== Number(fixed)) return false;
   }
-
-  return usedLeft.size === TOTAL_EQUALS_PAIR_COUNT && usedRight.size === TOTAL_EQUALS_PAIR_COUNT;
+  for (let group = 0; group < 3; group += 1) {
+    const values = slots.slice(group * 3, group * 3 + 3);
+    if (new Set(values).size !== 3) return false;
+    if (values.reduce((a, b) => a + b, 0) !== parsed.targets[group] * 3) return false;
+  }
+  return true;
 }
 
 const NEXT_NUMBER_MIN_VALUE = 0;
@@ -5107,131 +5112,109 @@ function digitAttackAnswerIsWinning(puzzle, answer = {}) {
   return result?.terminal === true && result.won === true;
 }
 
-const SHORTEST_PATH_EDGE_PAIRS = Object.freeze([
-  [0, 1], [0, 2], [0, 3], [0, 4],
-  [1, 2], [1, 3], [1, 4],
-  [2, 3], [2, 4],
-  [3, 4],
-]);
+const SHORTEST_PATH_ROWS = 3;
+const SHORTEST_PATH_COLS = 4;
+const SHORTEST_PATH_EDGE_COUNT = 17;
+const SHORTEST_PATH_END_NODE = 11;
 
-const SHORTEST_PATH_ROUTE_ORDERS = Object.freeze((() => {
-  const values = [1, 2, 3, 4];
-  const routes = [];
-  for (const a of values) for (const b of values) for (const c of values) for (const d of values) {
-    const route = [a, b, c, d];
-    if (new Set(route).size === 4) routes.push(Object.freeze(route));
-  }
-  return routes;
-})());
+function shortestPathHorizontalEdgeIndex(row, col) { return row * 3 + col; }
+function shortestPathVerticalEdgeIndex(row, col) { return 9 + row * 4 + col; }
 
-function shortestPathEdgeIndex(aValue, bValue) {
-  const a = Math.min(Number(aValue), Number(bValue));
-  const b = Math.max(Number(aValue), Number(bValue));
-  return SHORTEST_PATH_EDGE_PAIRS.findIndex(([left, right]) => left === a && right === b);
-}
-
-function shortestPathDistance(numbers, a, b) {
-  const index = shortestPathEdgeIndex(a, b);
+function shortestPathEdgeWeight(numbers, a, b) {
+  const ar = Math.floor(a / 4), ac = a % 4;
+  const br = Math.floor(b / 4), bc = b % 4;
+  let index = -1;
+  if (ar === br && Math.abs(ac - bc) === 1) index = shortestPathHorizontalEdgeIndex(ar, Math.min(ac, bc));
+  else if (ac === bc && Math.abs(ar - br) === 1) index = shortestPathVerticalEdgeIndex(Math.min(ar, br), ac);
   if (index < 0 || index >= numbers.length) return null;
   const value = Number(numbers[index]);
   return Number.isInteger(value) ? value : null;
 }
 
-function shortestPathRouteTotal(numbersRaw, routeOrderRaw) {
+function shortestPathRouteIsLegal(route) {
+  if (!Array.isArray(route) || route.length !== 6 || route[0] !== 0 || route[5] !== 11) return false;
+  for (let i = 0; i < route.length - 1; i += 1) {
+    const a = route[i], b = route[i + 1];
+    const ar = Math.floor(a / 4), ac = a % 4;
+    const br = Math.floor(b / 4), bc = b % 4;
+    if (!((br === ar && bc === ac + 1) || (br === ar + 1 && bc === ac))) return false;
+  }
+  return true;
+}
+
+function shortestPathRouteTotal(numbersRaw, routeRaw) {
   const numbers = Array.isArray(numbersRaw) ? numbersRaw.map(Number) : [];
-  const routeOrder = Array.isArray(routeOrderRaw) ? routeOrderRaw.map(Number) : [];
-  if (numbers.length !== 10 || routeOrder.length !== 4 || new Set(routeOrder).size !== 4) return null;
-  if (!routeOrder.every((value) => Number.isInteger(value) && value >= 1 && value <= 4)) return null;
-  const fullRoute = [0, ...routeOrder, 0];
+  const route = Array.isArray(routeRaw) ? routeRaw.map(Number) : [];
+  if (numbers.length !== 17 || !shortestPathRouteIsLegal(route)) return null;
   let total = 0;
-  for (let i = 0; i < fullRoute.length - 1; i += 1) {
-    const distance = shortestPathDistance(numbers, fullRoute[i], fullRoute[i + 1]);
-    if (distance === null) return null;
-    total += distance;
+  for (let i = 0; i < route.length - 1; i += 1) {
+    const weight = shortestPathEdgeWeight(numbers, route[i], route[i + 1]);
+    if (weight === null) return null;
+    total += weight;
   }
   return total;
 }
 
+function shortestPathAllRoutes() {
+  const out = [];
+  function walk(node, path) {
+    if (node === 11) { out.push(path); return; }
+    const row = Math.floor(node / 4), col = node % 4;
+    if (col + 1 < 4) walk(node + 1, [...path, node + 1]);
+    if (row + 1 < 3) walk(node + 4, [...path, node + 4]);
+  }
+  walk(0, [0]);
+  return out;
+}
+
+const SHORTEST_PATH_ROUTES = Object.freeze(shortestPathAllRoutes().map((route) => Object.freeze(route)));
+
 function shortestPathWinningRoutes(numbers) {
-  const totals = SHORTEST_PATH_ROUTE_ORDERS.map((route) => ({ route, total: shortestPathRouteTotal(numbers, route) }));
+  const totals = SHORTEST_PATH_ROUTES.map((route) => ({ route, total: shortestPathRouteTotal(numbers, route) }));
   const minimum = Math.min(...totals.map((item) => item.total ?? Number.MAX_SAFE_INTEGER));
-  return {
-    minimum,
-    routes: totals.filter((item) => item.total === minimum).map((item) => item.route),
-  };
+  return { minimum, routes: totals.filter((item) => item.total === minimum).map((item) => item.route) };
 }
 
 function isShortestPathPuzzleEncodingValid(puzzle) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  if (numbers.length !== 10) return false;
-  if (!numbers.every((value) => Number.isInteger(value) && value >= 5 && value <= 25)) return false;
-  if (new Set(numbers).size !== 10) return false;
+  if (numbers.length !== 17 || numbers.some((v) => !Number.isInteger(v))) return false;
+  if ([...numbers].sort((a,b)=>a-b).some((v,i)=>v !== i + 1)) return false;
   const winning = shortestPathWinningRoutes(numbers);
-  if (!Number.isInteger(winning.minimum) || Number(puzzle?.target) !== winning.minimum) return false;
-  // Ters yönde dolaşmak aynı çevrimi verir; bu yüzden tek bir geometrik en kısa rota
-  // tam olarak iki yönlü permütasyon olarak görünmelidir.
-  if (winning.routes.length !== 2) return false;
-  const first = winning.routes[0];
-  const second = winning.routes[1];
-  return first.every((value, index) => value === second[second.length - 1 - index]);
+  return Number(puzzle?.target) === winning.minimum && winning.routes.length === 1;
 }
 
 function generateShortestPathPuzzle() {
-  const candidates = Array.from({ length: 21 }, (_, index) => index + 5);
+  const base = Array.from({ length: 17 }, (_, i) => i + 1);
   for (let attempt = 0; attempt < 500; attempt += 1) {
-    const shuffled = [...candidates];
-    for (let i = shuffled.length - 1; i > 0; i -= 1) {
-      const j = secureRandomInt(0, i + 1);
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    const numbers = shuffled.slice(0, 10);
+    const numbers = shuffled(base);
     const winning = shortestPathWinningRoutes(numbers);
-    if (winning.routes.length !== 2) continue;
-    const first = winning.routes[0];
-    const second = winning.routes[1];
-    const reversePair = first.every((value, index) => value === second[second.length - 1 - index]);
-    if (!reversePair) continue;
-    return {
-      difficulty: "Standard",
-      target: winning.minimum,
-      numbers,
-      gameKey: "shortest_path",
-      initialGrid: [],
-    };
+    if (winning.routes.length !== 1) continue;
+    return { difficulty: "Standard", target: winning.minimum, numbers, gameKey: "shortest_path", initialGrid: [] };
   }
-  // Kriptografik rastgele üretimde bu kola pratikte düşülmez. Yine de servis hiçbir zaman
-  // geçersiz bulmaca döndürmesin diye önceden doğrulanmış deterministik bir dağılım tutulur.
-  const fallbackNumbers = [6, 21, 17, 12, 9, 25, 14, 7, 19, 11];
-  const winning = shortestPathWinningRoutes(fallbackNumbers);
-  if (winning.routes.length !== 2) throw new Error("En Kısa Yol bulmacası üretilemedi.");
-  return {
-    difficulty: "Standard",
-    target: winning.minimum,
-    numbers: fallbackNumbers,
-    gameKey: "shortest_path",
-    initialGrid: [],
-  };
+  const numbers = [1,17,15,14,13,12,11,10,9,2,8,7,3,6,5,4,16];
+  const winning = shortestPathWinningRoutes(numbers);
+  if (winning.routes.length !== 1) throw new Error("En Kısa Yol bulmacası üretilemedi.");
+  return { difficulty: "Standard", target: winning.minimum, numbers, gameKey: "shortest_path", initialGrid: [] };
 }
 
 function normalizeShortestPathRoute(answer = {}) {
-  if (!Array.isArray(answer.route)) return null;
-  const raw = answer.route.map(Number);
-  const route = raw.length === 6 && raw[0] === 0 && raw[5] === 0 ? raw.slice(1, 5) : raw;
-  if (route.length !== 4 || new Set(route).size !== 4) return null;
-  if (!route.every((value) => Number.isInteger(value) && value >= 1 && value <= 4)) return null;
-  return route;
+  if (!Array.isArray(answer?.route)) return null;
+  const route = answer.route.map(Number);
+  return shortestPathRouteIsLegal(route) ? route : null;
 }
 
 function validateShortestPathChallengeAnswer(puzzle, answer = {}) {
-  if (!isShortestPathPuzzleEncodingValid(puzzle)) return false;
-  return normalizeShortestPathRoute(answer) !== null;
+  return isShortestPathPuzzleEncodingValid(puzzle) && normalizeShortestPathRoute(answer) !== null;
 }
 
 function shortestPathAnswerIsWinning(puzzle, answer = {}) {
   const route = normalizeShortestPathRoute(answer);
-  if (route === null || !isShortestPathPuzzleEncodingValid(puzzle)) return false;
-  return shortestPathRouteTotal(puzzle.numbers, route) === Number(puzzle.target);
+  return route !== null && isShortestPathPuzzleEncodingValid(puzzle) &&
+    shortestPathRouteTotal(puzzle.numbers, route) === Number(puzzle.target);
 }
+
+// ============================================================================
+// 5120 / SAYI BULMACASI
 
 // ============================================================================
 // 5120 / SAYI BULMACASI / SUDOKU / NONOGRAM / SONUCU BUL authoritative rules
