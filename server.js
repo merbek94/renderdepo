@@ -2068,7 +2068,7 @@ const GAME_DEFINITIONS = Object.freeze({
   }),
   triple_balance: Object.freeze({
     key: "triple_balance",
-    displayName: "ÜÇLÜ DENGE",
+    displayName: "DÖRTLÜ DENGE",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
     botFinishMinMs: 1 * 1000,
@@ -2158,8 +2158,8 @@ const GAME_DEFINITIONS = Object.freeze({
   shortest_path: Object.freeze({
     key: "shortest_path",
     displayName: "EN KISA YOL",
-    // Beş şehirli rota oyunu ortak 2 dakikalık rekabet temposunu kullanır.
-    roundDurationMs: 2 * 60 * 1000,
+    // En Kısa Yol bütün normal/sonsuz/rekabetçi modlarda 5 dakikadır.
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
     // Botun bitirme zamanı ortak Hedef Sayıyı Bul / Sonraki Sayı profiliyle aynıdır.
     // Yalnızca bu oyuna özel %21 yanlış rota davranışı aşağıdaki ortak bot planına eklenir.
@@ -2560,12 +2560,12 @@ function generateNextNumberPuzzle() {
     const multiplier = secureRandomInt(2, 13); // x = 2..12; x her zaman en az 2.
     const ruleType = ruleTypes[secureRandomInt(0, ruleTypes.length)];
     const offsets = generateNextNumberOffsetSeries(ruleType);
-    const first = secureRandomInt(0, 21);
+    const first = secureRandomInt(1, 21);
     const sequence = [first];
 
     for (let index = 0; index < 3; index += 1) {
       const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offsets[index], ruleType);
-      if (!Number.isInteger(next) || next < NEXT_NUMBER_MIN_VALUE || next > NEXT_NUMBER_MAX_VALUE) break;
+      if (!Number.isInteger(next) || next <= 0 || next > NEXT_NUMBER_MAX_VALUE) break;
       sequence.push(next);
     }
 
@@ -2598,7 +2598,7 @@ function validateNextNumberChallengeAnswer(puzzle, answer = {}) {
   const submitted = Number(answer?.nextNumber);
   if (numbers.length !== 3 || numbers.some((value) => !Number.isInteger(value))) return false;
   if (!Number.isInteger(target) || target < NEXT_NUMBER_MIN_VALUE || target > NEXT_NUMBER_MAX_VALUE) return false;
-  if (numbers.some((value) => value < NEXT_NUMBER_MIN_VALUE || value > NEXT_NUMBER_MAX_VALUE)) return false;
+  if (numbers.some((value) => value <= 0 || value > NEXT_NUMBER_MAX_VALUE) || target <= 0) return false;
   if (new Set([...numbers, target]).size !== 4) return false;
   return Number.isInteger(submitted) && submitted === target;
 }
@@ -5533,9 +5533,42 @@ function generateNumberPuzzle() {
 }
 
 function validateNumberPuzzleAnswer(puzzle, answer = {}) {
-  const grid = Array.isArray(answer?.grid) ? answer.grid : [];
-  if (!Array.isArray(puzzle?.numbers) || puzzle.numbers.length !== NUMBER_PUZZLE_CELLS || grid.length !== NUMBER_PUZZLE_CELLS) return false;
-  return puzzle.numbers.every((expected, index) => expected <= NUMBER_PUZZLE_EMPTY || Number(grid[index]) === Number(expected));
+  const solution = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map((value) => value == null ? null : Number(value)) : [];
+  if (solution.length !== NUMBER_PUZZLE_CELLS || grid.length !== NUMBER_PUZZLE_CELLS) return false;
+
+  // İşlem, eşittir ve boş hücrelerin yapısı değişemez; başlangıçta sabit bırakılan sayılar da sabittir.
+  for (let index = 0; index < solution.length; index += 1) {
+    const expected = solution[index];
+    if (expected <= NUMBER_PUZZLE_EMPTY && Number(grid[index]) !== expected) return false;
+    const fixed = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid[index] : null;
+    if (fixed != null && Number(fixed) > 0 && Number(grid[index]) !== Number(fixed)) return false;
+  }
+
+  // Oyuncu yalnız verilen sayı taşlarını yeniden düzenleyebilir; yeni sayı üretemez.
+  const expectedNumbers = solution.filter((value) => value > 0).sort((a, b) => a - b);
+  const submittedNumbers = grid.filter((value, index) => solution[index] > 0 && Number.isInteger(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (expectedNumbers.length !== submittedNumbers.length) return false;
+  if (expectedNumbers.some((value, index) => value !== submittedNumbers[index])) return false;
+
+  // Tek bir üretilmiş dizilimi değil, kesişen bütün denklemleri aynı anda doğru yapan eşdeğer
+  // dizilimleri kabul et. Örn. 44-3=41 yerine 44-41=3 diğer kesişimleri bozmuyorsa geçerlidir.
+  const equationCount = Math.max(1, Math.min(8, Number(puzzle?.target || 8)));
+  for (let eq = 0; eq < equationCount; eq += 1) {
+    const path = numberPuzzlePath(eq);
+    if (!Array.isArray(path) || path.length !== 5) return false;
+    const a = Number(grid[path[0]]);
+    const operator = Number(grid[path[1]]);
+    const b = Number(grid[path[2]]);
+    const equals = Number(grid[path[3]]);
+    const result = Number(grid[path[4]]);
+    if (![a, operator, b, equals, result].every(Number.isInteger) || a <= 0 || b <= 0 || result <= 0) return false;
+    if (equals !== NUMBER_PUZZLE_EQUALS) return false;
+    const calculated = applySimpleMath(a, operator, b);
+    if (!Number.isInteger(calculated) || calculated !== result) return false;
+  }
+  return true;
 }
 
 function sudokuSolutionCount(gridInput, limit = 2) {
@@ -5932,37 +5965,33 @@ function validateTotalMatchAnswer(puzzle, answer = {}) {
   return remaining.length === 56 && remaining.every((value) => value === null || value === undefined);
 }
 
-const TRIPLE_BALANCE_DEVIATION_GROUPS = Object.freeze([
-  Object.freeze([-10,-9,-8,0,8,9,10]),
-  Object.freeze([-7,-6,-5,1,4,6,7]),
-  Object.freeze([-4,-3,-2,-1,2,3,5]),
-]);
-
 function tripleBalancePuzzleEncodingValid(puzzle) {
   const target = Number(puzzle?.target);
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  if (!Number.isInteger(target) || target < 50 || target > 150 || numbers.length !== 21) return false;
-  if (numbers.some((value) => !Number.isInteger(value) || value <= 0 || value > 60) || new Set(numbers).size !== 21) return false;
-  if (numbers.reduce((sum, value) => sum + value, 0) !== target * 3) return false;
-  const sums = [0,1,2].map((group) => numbers.slice(group * 7, group * 7 + 7).reduce((a, b) => a + b, 0));
-  return sums.every((sum) => sum >= 50 && sum <= 150) && new Set(sums).size === 3;
+  if (!Number.isInteger(target) || target < 40 || target > 180 || numbers.length !== 24) return false;
+  if (numbers.some((value) => !Number.isInteger(value) || value <= 0 || value > 60) || new Set(numbers).size !== 24) return false;
+  if (numbers.reduce((sum, value) => sum + value, 0) !== target * 4) return false;
+  const sums = [0,1,2,3].map((group) => numbers.slice(group * 6, group * 6 + 6).reduce((a, b) => a + b, 0));
+  // Başlangıçta dört kabın hiçbirisi denge sayısına eşit olamaz.
+  return sums.every((sum) => sum !== target);
 }
 
 function generateTripleBalancePuzzle() {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
-    const center = secureRandomInt(11, 22);
-    const target = center * 7;
-    const solution = TRIPLE_BALANCE_DEVIATION_GROUPS.flatMap((group) => group.map((delta) => center + delta));
-    if (new Set(solution).size !== 21 || solution.some((value) => value <= 0)) continue;
-    for (let shuffleAttempt = 0; shuffleAttempt < 30; shuffleAttempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    // 24 ardışık ve benzersiz taş. Uçlardan eşlenen her üç çift bir kabın hedefini verir;
+    // dolayısıyla her üretilen setin 4x6 çözümü garantilidir.
+    const shift = secureRandomInt(0, 18);
+    const solution = Array.from({ length: 24 }, (_, index) => index + 1 + shift);
+    const target = 75 + 6 * shift;
+    for (let shuffleAttempt = 0; shuffleAttempt < 80; shuffleAttempt += 1) {
       const numbers = shuffled(solution);
       const puzzle = { difficulty: "Standard", target, numbers, gameKey: "triple_balance", initialGrid: [] };
       if (tripleBalancePuzzleEncodingValid(puzzle)) return puzzle;
     }
   }
   return {
-    difficulty: "Standard", target: 77,
-    numbers: [1,4,7,10,13,16,19, 2,5,8,11,14,17,20, 3,6,9,12,15,18,21],
+    difficulty: "Standard", target: 75,
+    numbers: [1,2,3,16,17,21, 4,5,6,15,19,22, 7,8,9,14,20,24, 10,11,12,13,18,23],
     gameKey: "triple_balance", initialGrid: []
   };
 }
@@ -5970,9 +5999,10 @@ function generateTripleBalancePuzzle() {
 function validateTripleBalanceAnswer(puzzle, answer = {}) {
   if (!tripleBalancePuzzleEncodingValid(puzzle)) return false;
   const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
-  if (grid.length !== 21 || grid.some((value) => !Number.isInteger(value))) return false;
+  if (grid.length !== 24 || grid.some((value) => !Number.isInteger(value))) return false;
   if (integerMultisetKey(grid) !== integerMultisetKey(puzzle.numbers)) return false;
-  return [0,1,2].every((group) => grid.slice(group * 7, group * 7 + 7).reduce((a, b) => a + b, 0) === Number(puzzle.target));
+  return [0,1,2,3].every((group) => grid.slice(group * 6, group * 6 + 6)
+    .reduce((a, b) => a + b, 0) === Number(puzzle.target));
 }
 
 function sortOrderExpressionResult(numbers, expressionIndex) {
@@ -9579,11 +9609,19 @@ function finishRealtimeDraw(room, reason = "draw") {
   });
 }
 
-function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
+async function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
   if (!room || room.resolved || !winner) return;
   const loser = getOpponentParticipant(room, winner.playerId);
   markRoomResolved(room, reason, winner.playerId, loser?.playerId);
   if (isScoreBasedGameKey(room.gameKey)) recordMergeRealtimeScores(room).catch(() => {});
+
+  // Puan/XP otoritesi önce kesinleşir ve authoritative_reward istemciye gönderilir.
+  // Böylece özellikle mağlubiyette puan düşüşü sonuç ekranından sonra gecikmez.
+  try {
+    await awardRealtimeRoom(room, winner, loser);
+  } catch (error) {
+    console.error("realtime reward error:", error);
+  }
 
   roomParticipants(room).forEach((participant) => {
     const opponent = getOpponentParticipant(room, participant.playerId);
@@ -9597,10 +9635,6 @@ function finishRealtimeMatch(room, winner, reason = "rounds_completed") {
       myScore: isScoreBasedGameKey(room.gameKey) ? Math.max(0, Number(participant.roundScore || 0)) : null,
       opponentScore: isScoreBasedGameKey(room.gameKey) ? Math.max(0, Number(opponent?.roundScore || 0)) : null,
     });
-  });
-
-  awardRealtimeRoom(room, winner, loser).catch((error) => {
-    console.error("realtime reward error:", error);
   });
 }
 
