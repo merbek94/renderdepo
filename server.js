@@ -759,6 +759,7 @@ async function initDatabase() {
       tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE,
       hundred_active BOOLEAN NOT NULL DEFAULT FALSE,
       hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12),
+      two_player_game_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_game_count >= 0),
       two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0),
       two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0),
       two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0),
@@ -791,6 +792,8 @@ async function initDatabase() {
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12);
     ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS two_player_game_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_game_count >= 0);
+    ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0);
@@ -803,6 +806,28 @@ async function initDatabase() {
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
+    -- Bot kalibrasyonu artık "başarıyla bitirilen örnek" sayısına değil gerçekten sonuçlanan
+    -- ikili/turnuva oyun sayısına göre ilk 5 oyunu belirler. Eski kayıtlarda bilinen en az
+    -- oyun sayısını finish/score örneklerinden bir kez geri doldur.
+    DO $two_player_game_count_v1$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE migration_id = 'two_player_game_count_v1_20260905'
+      ) THEN
+        UPDATE player_game_progress
+        SET two_player_game_count = GREATEST(
+          two_player_game_count,
+          two_player_finish_count,
+          two_player_score_count
+        )
+        WHERE two_player_game_count < GREATEST(two_player_finish_count, two_player_score_count);
+        INSERT INTO schema_migrations (migration_id)
+        VALUES ('two_player_game_count_v1_20260905')
+        ON CONFLICT (migration_id) DO NOTHING;
+      END IF;
+    END
+    $two_player_game_count_v1$;
+
     CREATE INDEX IF NOT EXISTS idx_player_game_progress_game
       ON player_game_progress (game_key, player_id);
 
@@ -811,12 +836,12 @@ async function initDatabase() {
       player_id, game_key, infinite_score, infinite_run_score, infinite_next_stage,
       tournament_stage, tournament_rights, tournament_bank, tournament_completed,
       tournament_entry_active, hundred_active, hundred_stage,
-      two_player_finish_count, two_player_finish_total_ms, updated_at
+      two_player_game_count, two_player_finish_count, two_player_finish_total_ms, updated_at
     )
     SELECT p.player_id, 'target_number', s.infinite_score, p.infinite_run_score, p.infinite_next_stage,
            p.tournament_stage, p.tournament_rights, p.tournament_bank, p.tournament_completed,
            p.tournament_entry_active, p.hundred_active, p.hundred_stage,
-           p.two_player_finish_count, p.two_player_finish_total_ms, NOW()
+           p.two_player_finish_count, p.two_player_finish_count, p.two_player_finish_total_ms, NOW()
     FROM player_progress p
     JOIN player_scores s ON s.player_id = p.player_id
     ON CONFLICT (player_id, game_key) DO NOTHING;
@@ -3337,7 +3362,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
     `SELECT s.general_score, p.game_rights, p.game_rights_refill_at,
-            gp.two_player_finish_count, gp.two_player_finish_total_ms,
+            gp.two_player_game_count, gp.two_player_finish_count, gp.two_player_finish_total_ms,
             gp.two_player_score_count, gp.two_player_score_total,
             gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
             gp.tournament_completed, p.tournament_tickets, gp.tournament_entry_active
@@ -3353,6 +3378,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
     lockedRow, difficulty, wagerPoints, allowAutomatic
   );
   state.finishProfile = normalizeTwoPlayerFinishProfile({
+    gameCount: lockedRow.two_player_game_count,
     finishCount: lockedRow.two_player_finish_count,
     finishTotalMs: lockedRow.two_player_finish_total_ms,
     scoreCount: lockedRow.two_player_score_count,
@@ -4054,6 +4080,22 @@ async function applyTournamentOutcomeInTransaction(
     error.statusCode = 409; error.publicCode = "TOURNAMENT_STATE_MISMATCH"; throw error;
   }
 
+  if (won === null) {
+    return {
+      ...before,
+      gameKey: baseGameKey,
+      generalDelta: 0,
+      infiniteDelta: 0,
+      xpDelta: 0,
+      awardedScore: 0,
+      won: null,
+      tournament: {
+        ...before.tournament,
+        awardedScore: 0,
+      },
+    };
+  }
+
   let nextStage = currentStage;
   let nextRights = remainingRights;
   let nextBank = bank;
@@ -4325,7 +4367,7 @@ function secureRandomInt(minInclusive, maxExclusive) {
   return crypto.randomInt(minInclusive, maxExclusive);
 }
 
-const BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES = 5;
+const BOT_AVERAGE_REQUIRED_TWO_PLAYER_GAMES = 5;
 const BOT_MIN_FINISH_MS = 1_000;
 
 function normalizeTwoPlayerFinishProfile(profile = {}) {
@@ -4341,16 +4383,20 @@ function normalizeTwoPlayerFinishProfile(profile = {}) {
   const parsedScoreTotal = Number(profile.scoreTotal || 0);
   const scoreCount = Number.isFinite(parsedScoreCount) ? Math.max(0, Math.floor(parsedScoreCount)) : 0;
   const scoreTotal = Number.isFinite(parsedScoreTotal) ? Math.max(0, Math.floor(parsedScoreTotal)) : 0;
+  const parsedGameCount = Number(profile.gameCount ?? Math.max(finishCount, scoreCount));
+  const gameCount = Number.isFinite(parsedGameCount)
+    ? Math.max(0, Math.floor(parsedGameCount))
+    : Math.max(finishCount, scoreCount);
   const averageFinishMs = finishCount > 0 ? Math.round(finishTotalMs / finishCount) : null;
   const averageScore = scoreCount > 0 ? Math.round(scoreTotal / scoreCount) : null;
-  return { finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore };
+  return { gameCount, finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore };
 }
 
 async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey = "target_number") {
   const normalizedGameKey = normalizeBaseGameKey(gameKey);
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
-    `SELECT two_player_finish_count, two_player_finish_total_ms, two_player_score_count, two_player_score_total
+    `SELECT two_player_game_count, two_player_finish_count, two_player_finish_total_ms, two_player_score_count, two_player_score_total
      FROM player_game_progress
      WHERE player_id = $1 AND game_key = $2
      FOR UPDATE`,
@@ -4358,6 +4404,7 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey
   );
   const row = result.rows[0] || {};
   return normalizeTwoPlayerFinishProfile({
+    gameCount: row.two_player_game_count,
     finishCount: row.two_player_finish_count,
     finishTotalMs: row.two_player_finish_total_ms,
     scoreCount: row.two_player_score_count,
@@ -4439,7 +4486,7 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number
   // createGameAwareBotPlan en sonda oyunun kendi min/max sınırını uygular. Bu iki aşamalı
   // yapı Hedef Sayıyı Bul'un eski davranışını aynen korur.
   if (
-    profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
+    profile.gameCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_GAMES ||
     profile.averageFinishMs === null
   ) {
     const calibrationMinMs = Math.max(
@@ -4501,7 +4548,7 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
     const calibrationMin = baseGameKey === "digit_hunt" ? 40 : 300;
     const calibrationMax = baseGameKey === "digit_hunt" ? 60 : 400;
     const variance = baseGameKey === "digit_hunt" ? 30 : 200;
-    const botScore = profile.scoreCount < 5 || profile.averageScore === null
+    const botScore = profile.gameCount < 5 || profile.averageScore === null
       ? secureRandomInt(calibrationMin, calibrationMax + 1)
       : secureRandomInt(
           Math.max(0, profile.averageScore - variance),
@@ -4575,6 +4622,15 @@ function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
   const finishMs = botPlanTimeMs(plan?.finishMs);
   if (leaveMs !== null && elapsedMs >= leaveMs) {
     return { resolvable: true, won: true, reason: "bot_left" };
+  }
+  if (
+    solvedByPlayer &&
+    finishMs !== null &&
+    plan?.wrongRoute !== true &&
+    plan?.forcedLoss !== true &&
+    Math.floor(elapsedMs / 1000) === Math.floor(finishMs / 1000)
+  ) {
+    return { resolvable: true, won: null, reason: "time_draw" };
   }
   if (finishMs !== null && elapsedMs >= finishMs) {
     if (plan?.wrongRoute === true) {
@@ -4651,6 +4707,31 @@ function safeTwoPlayerFinishSample(elapsedMs, roundCountValue = 1, gameKey = "ta
   return Math.max(1, Math.min(Math.floor(parsedElapsedMs / roundCount), roundLimitMs));
 }
 
+async function recordTwoPlayerGameProfileInTransaction(
+  client,
+  playerId,
+  { gameKey = "target_number", finishElapsedMs = null, finishRoundCount = 1 } = {}
+) {
+  const normalizedGameKey = normalizeBaseGameKey(gameKey);
+  const finishSampleMs = safeTwoPlayerFinishSample(finishElapsedMs, finishRoundCount, normalizedGameKey);
+  await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
+  await client.query(
+    `UPDATE player_game_progress
+     SET two_player_game_count = LEAST(two_player_game_count + 1, 2000000000),
+         two_player_finish_count = LEAST(
+           two_player_finish_count + CASE WHEN $3::bigint IS NULL THEN 0 ELSE 1 END,
+           2000000000
+         ),
+         two_player_finish_total_ms = LEAST(
+           two_player_finish_total_ms + COALESCE($3::bigint, 0),
+           9223372036854775807::bigint
+         ),
+         updated_at = NOW()
+     WHERE player_id = $1 AND game_key = $2`,
+    [playerId, normalizedGameKey, finishSampleMs]
+  );
+}
+
 async function applyTwoPlayerBotRewardsInTransaction(
   client,
   playerId,
@@ -4722,21 +4803,15 @@ async function applyTwoPlayerBotRewardsInTransaction(
         monthKey,
       ]
     );
-    if (finishSampleMs !== null) {
-      await ensurePlayerGameProgress(client, playerId, gameKey);
-      await client.query(
-        `UPDATE player_game_progress
-         SET two_player_finish_count = LEAST(two_player_finish_count + 1, 2000000000),
-             two_player_finish_total_ms = LEAST(
-               two_player_finish_total_ms + $3::bigint,
-               9223372036854775807::bigint
-             ),
-             updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [playerId, normalizeBaseGameKey(gameKey), finishSampleMs]
-      );
-    }
   }
+
+  // Kalibrasyon sayacı yalnız başarılı bitirişleri değil, sonuçlanan bütün oyunları sayar.
+  // Ortalama süre örneği ise yalnız oyuncu gerçekten bitirdiyse eklenir.
+  await recordTwoPlayerGameProfileInTransaction(client, playerId, {
+    gameKey,
+    finishElapsedMs,
+    finishRoundCount,
+  });
 
   return {
     ...before,
@@ -4757,19 +4832,25 @@ async function settleTwoPlayerBotChallengeAsDrawInTransaction(
   challenge,
   playerId,
   gameKey = challenge?.game_key || "target_number",
-  elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime())
+  elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime()),
+  finishElapsedMs = null,
+  outcomeReason = "time_draw"
 ) {
   const baseGameKey = normalizeBaseGameKey(gameKey);
+  await recordTwoPlayerGameProfileInTransaction(client, playerId, {
+    gameKey: baseGameKey,
+    finishElapsedMs,
+  });
   const state = await readAuthoritativePlayerState(client, playerId, baseGameKey);
   const response = {
     ok: true,
     gameKey: baseGameKey,
+    ...state,
     generalDelta: 0,
     infiniteDelta: 0,
     xpDelta: 0,
-    ...state,
     won: null,
-    outcomeReason: "time_draw",
+    outcomeReason,
     elapsedServerMs,
   };
 
@@ -4796,6 +4877,7 @@ async function settleBotChallengeAsForfeitInTransaction(client, challenge, playe
   const elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime());
   let response;
   if (challenge.mode === "tournament_bot") {
+    await recordTwoPlayerGameProfileInTransaction(client, playerId, { gameKey: baseGameKey });
     const tournamentResult = await applyTournamentOutcomeInTransaction(
       client, playerId, false, Number(challenge.stage), baseGameKey
     );
@@ -6986,13 +7068,13 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
        player_id, game_key, infinite_score, infinite_run_score, infinite_next_stage,
        tournament_stage, tournament_rights, tournament_bank, tournament_completed,
        tournament_entry_active, hundred_active, hundred_stage,
-       two_player_finish_count, two_player_finish_total_ms,
+       two_player_game_count, two_player_finish_count, two_player_finish_total_ms,
        two_player_score_count, two_player_score_total, stats, updated_at
      )
      SELECT $2, game_key, infinite_score, infinite_run_score, infinite_next_stage,
             tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active, hundred_active, hundred_stage,
-            two_player_finish_count, two_player_finish_total_ms,
+            two_player_game_count, two_player_finish_count, two_player_finish_total_ms,
             two_player_score_count, two_player_score_total, stats, NOW()
      FROM player_game_progress
      WHERE player_id = $1
@@ -7007,6 +7089,10 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
        tournament_entry_active = player_game_progress.tournament_entry_active OR EXCLUDED.tournament_entry_active,
        hundred_active = player_game_progress.hundred_active OR EXCLUDED.hundred_active,
        hundred_stage = GREATEST(player_game_progress.hundred_stage, EXCLUDED.hundred_stage),
+       two_player_game_count = LEAST(
+         player_game_progress.two_player_game_count::bigint + EXCLUDED.two_player_game_count::bigint,
+         2000000000
+       )::integer,
        two_player_finish_count = LEAST(
          player_game_progress.two_player_finish_count::bigint + EXCLUDED.two_player_finish_count::bigint,
          2000000000
@@ -7204,30 +7290,12 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
       monthKey,
     ]
   );
-  const finishEntries = entries.filter((item) => item.finishSampleMs !== null);
-  if (finishEntries.length > 0) {
-    for (const item of finishEntries) {
-      await ensurePlayerGameProgress(client, item.playerId, room.gameKey);
-    }
-    await client.query(
-      `WITH changes AS (
-         SELECT * FROM UNNEST($1::text[], $2::bigint[]) AS c(player_id, finish_sample_ms)
-       )
-       UPDATE player_game_progress AS gp
-       SET two_player_finish_count = LEAST(gp.two_player_finish_count + 1, 2000000000),
-           two_player_finish_total_ms = LEAST(
-             gp.two_player_finish_total_ms + c.finish_sample_ms,
-             9223372036854775807::bigint
-           ),
-           updated_at = NOW()
-       FROM changes c
-       WHERE gp.player_id = c.player_id AND gp.game_key = $3`,
-      [
-        finishEntries.map((item) => item.playerId),
-        finishEntries.map((item) => item.finishSampleMs),
-        normalizeBaseGameKey(room.gameKey),
-      ]
-    );
+  for (const item of entries) {
+    await recordTwoPlayerGameProfileInTransaction(client, item.playerId, {
+      gameKey: room.gameKey,
+      finishElapsedMs: item.finishSampleMs,
+      finishRoundCount: 1,
+    });
   }
   return { reward, winnerXp };
 }
@@ -7266,6 +7334,16 @@ async function settleTournamentRealtimeRoom(room, realWinner, realLoser) {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    if (realWinner) {
+      await recordTwoPlayerGameProfileInTransaction(client, realWinner.playerId, {
+        gameKey: room.gameKey,
+        finishElapsedMs: isScoreBasedGameKey(room.gameKey) ? null : realWinner.totalElapsedMs,
+        finishRoundCount: room.roundCount,
+      });
+    }
+    if (realLoser) {
+      await recordTwoPlayerGameProfileInTransaction(client, realLoser.playerId, { gameKey: room.gameKey });
+    }
     const winnerState = realWinner
       ? await applyTournamentOutcomeInTransaction(client, realWinner.playerId, true, realWinner.tournamentStage, normalizeBaseGameKey(room.gameKey), true)
       : null;
@@ -7863,11 +7941,18 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       }
     }
 
+    if (!tournamentMode) {
+      // consumeGameRightInTransaction profili eski aktif challenge temizlenmeden önce okumuş olabilir.
+      // Temizlik bir oyunu sonuçlandırdıysa yeni bot planını güncel gameCount/ortalama ile üret.
+      finishProfile = await readTwoPlayerFinishProfileInTransaction(client, req.auth.sub, gameKey);
+    }
+
     if (tournamentMode) {
       const progressResult = await client.query(
         `SELECT gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
                 gp.tournament_completed, gp.tournament_entry_active,
-                p.tournament_tickets, gp.two_player_finish_count, gp.two_player_finish_total_ms,
+                p.tournament_tickets, gp.two_player_game_count,
+                gp.two_player_finish_count, gp.two_player_finish_total_ms,
                 gp.two_player_score_count, gp.two_player_score_total
          FROM player_game_progress gp
          JOIN player_progress p ON p.player_id = gp.player_id
@@ -7888,6 +7973,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       stage = Math.max(1, Math.min(Number(progress.tournament_stage || 1), 8));
       difficulty = "Standard";
       finishProfile = normalizeTwoPlayerFinishProfile({
+        gameCount: progress.two_player_game_count,
         finishCount: progress.two_player_finish_count,
         finishTotalMs: progress.two_player_finish_total_ms,
         scoreCount: progress.two_player_score_count,
@@ -8141,7 +8227,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
           : { resolvable: true, won: false, reason: wrongAnswerReason };
         won = outcome.won;
         outcomeReason = outcome.reason;
-        rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
+        rewards = won === null
+          ? { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 }
+          : twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
       }
     }
 
@@ -8175,7 +8263,26 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       return;
     }
 
+    if (challenge.mode === "two_player_bot" && won === null) {
+      const response = await settleTwoPlayerBotChallengeAsDrawInTransaction(
+        client,
+        challenge,
+        req.auth.sub,
+        gameKey,
+        elapsedServerMs,
+        (!isScoreBasedGameKey(gameKey) && answerWon) ? elapsedServerMs : null,
+        outcomeReason || "time_draw"
+      );
+      await client.query("COMMIT");
+      res.json(response);
+      return;
+    }
+
     if (challenge.mode === "tournament_bot") {
+      await recordTwoPlayerGameProfileInTransaction(client, req.auth.sub, {
+        gameKey,
+        finishElapsedMs: (!isScoreBasedGameKey(gameKey) && answerWon) ? elapsedServerMs : null,
+      });
       const tournamentResult = await applyTournamentOutcomeInTransaction(
         client, req.auth.sub, won, Number(challenge.stage), gameKey
       );
@@ -8385,6 +8492,7 @@ app.post("/game/bot/resolve", requireAuth, requireGameplaySession, async (req, r
 
     let response;
     if (challenge.mode === "tournament_bot") {
+      await recordTwoPlayerGameProfileInTransaction(client, req.auth.sub, { gameKey });
       const tournamentResult = await applyTournamentOutcomeInTransaction(
         client, req.auth.sub, outcome.won, Number(challenge.stage), gameKey
       );
@@ -8486,6 +8594,7 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
     const elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime());
     let response;
     if (challenge.mode === "tournament_bot") {
+      await recordTwoPlayerGameProfileInTransaction(client, req.auth.sub, { gameKey });
       const tournamentResult = await applyTournamentOutcomeInTransaction(
         client, req.auth.sub, false, Number(challenge.stage), gameKey
       );
@@ -9558,7 +9667,7 @@ function realtimeRoundWinner(room, first, second) {
   const secondElapsed = Number(second?.roundElapsedMs ?? roundLimitMs);
   if (firstElapsed < secondElapsed) return first;
   if (secondElapsed < firstElapsed) return second;
-  return String(first?.playerId || "").localeCompare(String(second?.playerId || "")) <= 0 ? first : second;
+  return null;
 }
 
 function realtimeMatchWinner(room) {
@@ -9574,7 +9683,7 @@ function realtimeMatchWinner(room) {
   if (first.totalElapsedMs !== second.totalElapsedMs) {
     return first.totalElapsedMs < second.totalElapsedMs ? first : second;
   }
-  return String(first.playerId).localeCompare(String(second.playerId)) <= 0 ? first : second;
+  return null;
 }
 
 async function recordMergeRealtimeScores(room) {
@@ -9594,10 +9703,43 @@ async function recordMergeRealtimeScores(room) {
   } finally { client.release(); }
 }
 
+async function recordRealtimeDrawProfiles(room) {
+  if (!pool || !room) return;
+  const realParticipants = roomParticipants(room).filter((item) => !item.isBot);
+  if (realParticipants.length === 0) return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const participant of realParticipants) {
+      await recordTwoPlayerGameProfileInTransaction(client, participant.playerId, {
+        gameKey: room.gameKey,
+        finishElapsedMs: isScoreBasedGameKey(room.gameKey) ? null : participant.totalElapsedMs,
+        finishRoundCount: room.roundCount,
+      });
+      await recordTaskEventInTransaction(client, {
+        playerId: participant.playerId,
+        sourceKey: `room:${room.roomId}`,
+        eventType: "game",
+        gameKey: normalizeBaseGameKey(room.gameKey),
+        multiplayer: true,
+        won: false,
+        playerAlreadyEnsured: true,
+      });
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("realtime draw profile error:", error);
+  } finally {
+    client.release();
+  }
+}
+
 function finishRealtimeDraw(room, reason = "draw") {
   if (!room || room.resolved) return;
   markRoomResolved(room, reason, null, null);
   recordMergeRealtimeScores(room).catch(() => {});
+  recordRealtimeDrawProfiles(room).catch(() => {});
   roomParticipants(room).forEach((participant) => {
     const opponent = getOpponentParticipant(room, participant.playerId);
     emitToRoomParticipant(participant, "match_completed", {
@@ -9805,7 +9947,7 @@ function resolveRealtimeRound(room) {
     return;
   }
   const roundWinner = realtimeRoundWinner(room, first, second);
-  roundWinner.roundWins += 1;
+  if (roundWinner) roundWinner.roundWins += 1;
   participants.forEach((participant) => {
     participant.totalElapsedMs += Number(participant.roundElapsedMs || gameDefinition(room.gameKey).roundDurationMs);
   });
@@ -9820,13 +9962,17 @@ function resolveRealtimeRound(room) {
       opponentRoundWins: opponent?.roundWins || 0,
       myElapsedMs: participant.roundElapsedMs,
       opponentElapsedMs: opponent?.roundElapsedMs || 0,
-      wonRound: participant.playerId === roundWinner.playerId,
+      wonRound: roundWinner ? participant.playerId === roundWinner.playerId : null,
     });
   });
 
   const matchWinner = realtimeMatchWinner(room);
   if (matchWinner) {
     finishRealtimeMatch(room, matchWinner);
+    return;
+  }
+  if (room.roundIndex + 1 >= room.roundCount) {
+    finishRealtimeDraw(room, "time_draw");
     return;
   }
 
@@ -10410,7 +10556,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
               gp.tournament_stage, gp.tournament_rights,
               gp.tournament_completed, gp.tournament_entry_active,
               s.general_score,
-              gp.two_player_finish_count, gp.two_player_finish_total_ms,
+              gp.two_player_game_count, gp.two_player_finish_count, gp.two_player_finish_total_ms,
               gp.two_player_score_count, gp.two_player_score_total
        FROM players p
        JOIN player_progress g ON g.player_id = p.player_id
@@ -10439,6 +10585,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       tournamentEntryActive: row.tournament_entry_active === true,
       generalScore: Math.max(0, Number(row.general_score || 0)),
       twoPlayerFinishProfile: normalizeTwoPlayerFinishProfile({
+        gameCount: row.two_player_game_count,
         finishCount: row.two_player_finish_count,
         finishTotalMs: row.two_player_finish_total_ms,
         scoreCount: row.two_player_score_count,
