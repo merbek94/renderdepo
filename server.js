@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "sudoku6-nonogram5-adjacent-v10-20260906";
+const SERVER_BUILD_ID = "sudoku6-nonogram5-consistent-clues-v11-20260906";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5759,21 +5759,37 @@ function nonogramSingleRunLength(line) {
 
 function nonogramSingleClues(solution) {
   if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELL_COUNT) return null;
+  const normalized = solution.map(Number);
+  if (normalized.some((value) => value !== 0 && value !== 1)) return null;
+
   const rowClues = [];
   const colClues = [];
   for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
-    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => Number(solution[row * NONOGRAM_SIZE + col]));
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => normalized[row * NONOGRAM_SIZE + col]);
     const clue = nonogramSingleRunLength(line);
     if (clue == null) return null;
     rowClues.push(clue);
   }
   for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
-    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => Number(solution[row * NONOGRAM_SIZE + col]));
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => normalized[row * NONOGRAM_SIZE + col]);
     const clue = nonogramSingleRunLength(line);
     if (clue == null) return null;
     colClues.push(clue);
   }
-  return { rowClues, colClues };
+
+  // Aynı siyah hücreler hem satır hem sütun ipuçlarında sayılır. Bu yüzden iki toplamın
+  // birbirine ve gerçek siyah hücre sayısına eşit olması zorunludur; aksi puzzle reddedilir.
+  const filledCellCount = normalized.reduce((sum, value) => sum + value, 0);
+  const rowFilledCount = rowClues.reduce((sum, value) => sum + value, 0);
+  const colFilledCount = colClues.reduce((sum, value) => sum + value, 0);
+  if (
+    filledCellCount <= 0 ||
+    rowFilledCount !== filledCellCount ||
+    colFilledCount !== filledCellCount ||
+    rowFilledCount !== colFilledCount
+  ) return null;
+
+  return { rowClues, colClues, filledCellCount };
 }
 
 function nonogramHasSingleCluePerLine(solution) {
@@ -5799,18 +5815,22 @@ function nonogramAnswerMatchesClues(solution, cells) {
 }
 
 function generateNonogramPuzzle() {
-  const pattern = NONOGRAM_PATTERNS[secureRandomInt(0, NONOGRAM_PATTERNS.length)];
-  const solution = transformNonogramPattern(pattern, secureRandomInt(0, 8));
-  if (!nonogramHasSingleCluePerLine(solution)) {
-    throw new Error("5×5 Nonogram tek-ipucu kuralını sağlamadı.");
+  // Şablon/transform kaynaklı en küçük bir tutarsızlık bile oyuncuya ulaşmasın: puzzle ancak
+  // satır toplamı = sütun toplamı = gerçek siyah hücre sayısı ve her çizgi tek blok ise döner.
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const pattern = NONOGRAM_PATTERNS[secureRandomInt(0, NONOGRAM_PATTERNS.length)];
+    const solution = transformNonogramPattern(pattern, secureRandomInt(0, 8));
+    const clues = nonogramSingleClues(solution);
+    if (!clues) continue;
+    return {
+      difficulty: "Standard",
+      target: NONOGRAM_CELL_COUNT,
+      numbers: solution,
+      gameKey: "nonogram",
+      initialGrid: [],
+    };
   }
-  return {
-    difficulty: "Standard",
-    target: NONOGRAM_CELL_COUNT,
-    numbers: solution,
-    gameKey: "nonogram",
-    initialGrid: [],
-  };
+  throw new Error("Tutarlı satır/sütun ipuçlarına sahip 5×5 Nonogram üretilemedi.");
 }
 
 function validateNonogramAnswer(puzzle, answer = {}) {
