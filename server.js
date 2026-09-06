@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "sudoku6-nonogram5-canonical-clues-v12-20260906";
+const SERVER_BUILD_ID = "sudoku6-nonogram5-v9-20260906";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5549,36 +5549,32 @@ function validateNumberPuzzleAnswer(puzzle, answer = {}) {
 }
 
 const SUDOKU_SIZE = 6;
+const SUDOKU_CELLS = SUDOKU_SIZE * SUDOKU_SIZE;
 const SUDOKU_BOX_ROWS = 2;
-const SUDOKU_BOX_COLUMNS = 3;
-const SUDOKU_CELL_COUNT = SUDOKU_SIZE * SUDOKU_SIZE;
-const SUDOKU_INITIAL_CLUE_COUNT = 14;
+const SUDOKU_BOX_COLS = 3;
+const SUDOKU_BOXES_PER_ROW = SUDOKU_SIZE / SUDOKU_BOX_COLS;
+const SUDOKU_GIVEN_COUNT = 14;
 
 function sudokuBoxIndex(row, col) {
-  const boxesPerRow = SUDOKU_SIZE / SUDOKU_BOX_COLUMNS;
-  return Math.floor(row / SUDOKU_BOX_ROWS) * boxesPerRow + Math.floor(col / SUDOKU_BOX_COLUMNS);
+  return Math.floor(row / SUDOKU_BOX_ROWS) * SUDOKU_BOXES_PER_ROW + Math.floor(col / SUDOKU_BOX_COLS);
 }
 
 function sudokuSolutionCount(gridInput, limit = 2) {
+  if (!Array.isArray(gridInput) || gridInput.length !== SUDOKU_CELLS) return 0;
   const grid = gridInput.map((value) => Number(value) || 0);
-  if (grid.length !== SUDOKU_CELL_COUNT) return 0;
-
   const rowMask = Array(SUDOKU_SIZE).fill(0);
   const colMask = Array(SUDOKU_SIZE).fill(0);
   const boxMask = Array(SUDOKU_SIZE).fill(0);
-
-  for (let index = 0; index < SUDOKU_CELL_COUNT; index += 1) {
+  for (let index = 0; index < SUDOKU_CELLS; index += 1) {
     const value = grid[index];
     if (value === 0) continue;
-    if (!Number.isInteger(value) || value < 1 || value > SUDOKU_SIZE) return 0;
+    if (value < 1 || value > SUDOKU_SIZE) return 0;
     const row = Math.floor(index / SUDOKU_SIZE);
     const col = index % SUDOKU_SIZE;
     const box = sudokuBoxIndex(row, col);
     const bit = 1 << value;
     if ((rowMask[row] & bit) || (colMask[col] & bit) || (boxMask[box] & bit)) return 0;
-    rowMask[row] |= bit;
-    colMask[col] |= bit;
-    boxMask[box] |= bit;
+    rowMask[row] |= bit; colMask[col] |= bit; boxMask[box] |= bit;
   }
 
   let count = 0;
@@ -5587,8 +5583,7 @@ function sudokuSolutionCount(gridInput, limit = 2) {
     let bestIndex = -1;
     let bestCandidates = 0;
     let bestCount = SUDOKU_SIZE + 1;
-
-    for (let index = 0; index < SUDOKU_CELL_COUNT; index += 1) {
+    for (let index = 0; index < SUDOKU_CELLS; index += 1) {
       if (grid[index] !== 0) continue;
       const row = Math.floor(index / SUDOKU_SIZE);
       const col = index % SUDOKU_SIZE;
@@ -5598,10 +5593,7 @@ function sudokuSolutionCount(gridInput, limit = 2) {
       let candidateCount = 0;
       for (let value = 1; value <= SUDOKU_SIZE; value += 1) {
         const bit = 1 << value;
-        if ((used & bit) === 0) {
-          candidates |= bit;
-          candidateCount += 1;
-        }
+        if ((used & bit) === 0) { candidates |= bit; candidateCount += 1; }
       }
       if (candidateCount === 0) return;
       if (candidateCount < bestCount) {
@@ -5611,11 +5603,7 @@ function sudokuSolutionCount(gridInput, limit = 2) {
         if (candidateCount === 1) break;
       }
     }
-
-    if (bestIndex < 0) {
-      count += 1;
-      return;
-    }
+    if (bestIndex < 0) { count += 1; return; }
 
     const row = Math.floor(bestIndex / SUDOKU_SIZE);
     const col = bestIndex % SUDOKU_SIZE;
@@ -5624,41 +5612,69 @@ function sudokuSolutionCount(gridInput, limit = 2) {
       const bit = 1 << value;
       if ((bestCandidates & bit) === 0) continue;
       grid[bestIndex] = value;
-      rowMask[row] |= bit;
-      colMask[col] |= bit;
-      boxMask[box] |= bit;
+      rowMask[row] |= bit; colMask[col] |= bit; boxMask[box] |= bit;
       search();
-      rowMask[row] &= ~bit;
-      colMask[col] &= ~bit;
-      boxMask[box] &= ~bit;
+      rowMask[row] &= ~bit; colMask[col] &= ~bit; boxMask[box] &= ~bit;
       grid[bestIndex] = 0;
     }
   }
-
   search();
   return count;
 }
 
+function sudokuSolutionIsValid(solution) {
+  if (!Array.isArray(solution) || solution.length !== SUDOKU_CELLS) return false;
+  const expected = new Set(Array.from({ length: SUDOKU_SIZE }, (_, i) => i + 1));
+  const complete = (values) => values.length === SUDOKU_SIZE && values.every((v) => expected.has(v)) && new Set(values).size === SUDOKU_SIZE;
+  for (let row = 0; row < SUDOKU_SIZE; row += 1) {
+    if (!complete(Array.from({ length: SUDOKU_SIZE }, (_, col) => Number(solution[row * SUDOKU_SIZE + col])))) return false;
+  }
+  for (let col = 0; col < SUDOKU_SIZE; col += 1) {
+    if (!complete(Array.from({ length: SUDOKU_SIZE }, (_, row) => Number(solution[row * SUDOKU_SIZE + col])))) return false;
+  }
+  for (let boxRow = 0; boxRow < SUDOKU_SIZE; boxRow += SUDOKU_BOX_ROWS) {
+    for (let boxCol = 0; boxCol < SUDOKU_SIZE; boxCol += SUDOKU_BOX_COLS) {
+      const values = [];
+      for (let r = 0; r < SUDOKU_BOX_ROWS; r += 1) {
+        for (let c = 0; c < SUDOKU_BOX_COLS; c += 1) {
+          values.push(Number(solution[(boxRow + r) * SUDOKU_SIZE + boxCol + c]));
+        }
+      }
+      if (!complete(values)) return false;
+    }
+  }
+  return true;
+}
+
+function sudokuPuzzleEncodingValid(puzzle) {
+  const solution = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (Number(puzzle?.target) !== SUDOKU_CELLS || !sudokuSolutionIsValid(solution)) return false;
+  if (initialGrid.length !== SUDOKU_CELLS || initialGrid.filter((v) => v !== null && v !== undefined).length !== SUDOKU_GIVEN_COUNT) return false;
+  for (let index = 0; index < SUDOKU_CELLS; index += 1) {
+    const fixed = initialGrid[index];
+    if (fixed !== null && fixed !== undefined && Number(fixed) !== solution[index]) return false;
+  }
+  const givens = initialGrid.map((v) => v == null ? 0 : Number(v));
+  return sudokuSolutionCount(givens, 2) === 1;
+}
+
 function generateSudokuPuzzle() {
-  for (let generationAttempt = 0; generationAttempt < 24; generationAttempt += 1) {
-    // 6×6 Sudoku 2×3 alt bölgelerden oluşur: 3 adet 2-satırlık bant ve
-    // 2 adet 3-sütunluk sütun grubu ayrı ayrı karıştırılır.
-    const rows = shuffled([0, 1, 2]).flatMap((band) =>
-      shuffled([0, 1]).map((inner) => band * SUDOKU_BOX_ROWS + inner)
+  for (let generationAttempt = 0; generationAttempt < 20; generationAttempt += 1) {
+    const shuffledGroups = (groupSize, groupCount) => shuffled(Array.from({ length: groupCount }, (_, i) => i)).flatMap((group) =>
+      shuffled(Array.from({ length: groupSize }, (_, i) => i)).map((inner) => group * groupSize + inner)
     );
-    const cols = shuffled([0, 1]).flatMap((stack) =>
-      shuffled([0, 1, 2]).map((inner) => stack * SUDOKU_BOX_COLUMNS + inner)
-    );
-    const digits = shuffled([1, 2, 3, 4, 5, 6]);
-    const pattern = (row, col) =>
-      (SUDOKU_BOX_COLUMNS * (row % SUDOKU_BOX_ROWS) + Math.floor(row / SUDOKU_BOX_ROWS) + col) % SUDOKU_SIZE;
+    const rows = shuffledGroups(SUDOKU_BOX_ROWS, SUDOKU_SIZE / SUDOKU_BOX_ROWS);
+    const cols = shuffledGroups(SUDOKU_BOX_COLS, SUDOKU_SIZE / SUDOKU_BOX_COLS);
+    const digits = shuffled(Array.from({ length: SUDOKU_SIZE }, (_, i) => i + 1));
+    const pattern = (r, c) => (r * SUDOKU_BOX_COLS + Math.floor(r / SUDOKU_BOX_ROWS) + c) % SUDOKU_SIZE;
     const solution = rows.flatMap((row) => cols.map((col) => digits[pattern(row, col)]));
     const working = solution.slice();
-    let clueCount = SUDOKU_CELL_COUNT;
+    let clueCount = SUDOKU_CELLS;
 
-    // Hücreleri yalnız tek çözüm korunuyorsa kaldır; hedef tam 14 başlangıç hücresidir.
-    for (const index of shuffled(Array.from({ length: SUDOKU_CELL_COUNT }, (_, cell) => cell))) {
-      if (clueCount <= SUDOKU_INITIAL_CLUE_COUNT) break;
+    // Tam 14 başlangıç hücresine inerken tek çözümü koru.
+    for (const index of shuffled(Array.from({ length: SUDOKU_CELLS }, (_, cell) => cell))) {
+      if (clueCount <= SUDOKU_GIVEN_COUNT) break;
       const previous = working[index];
       working[index] = 0;
       if (sudokuSolutionCount(working, 2) === 1) {
@@ -5668,233 +5684,104 @@ function generateSudokuPuzzle() {
       }
     }
 
-    if (clueCount === SUDOKU_INITIAL_CLUE_COUNT) {
+    if (clueCount === SUDOKU_GIVEN_COUNT) {
       const initialGrid = working.map((value) => value === 0 ? null : value);
-      return {
-        difficulty: "Standard",
-        target: SUDOKU_CELL_COUNT,
-        numbers: solution,
-        gameKey: "sudoku",
-        initialGrid,
-      };
+      const puzzle = { difficulty: "Standard", target: SUDOKU_CELLS, numbers: solution, gameKey: "sudoku", initialGrid };
+      if (sudokuPuzzleEncodingValid(puzzle)) return puzzle;
     }
   }
-  throw new Error("14 ipuçlu tek çözümlü 6×6 Sudoku üretilemedi.");
+  throw new Error("14 ipuçlu tek çözümlü 6x6 Sudoku üretilemedi.");
 }
 
 function validateSudokuAnswer(puzzle, answer = {}) {
-  const grid = Array.isArray(answer?.grid) ? answer.grid : [];
-  return Array.isArray(puzzle?.numbers) &&
-    puzzle.numbers.length === SUDOKU_CELL_COUNT &&
-    grid.length === SUDOKU_CELL_COUNT &&
-    puzzle.numbers.every((value, index) => Number(grid[index]) === Number(value));
+  if (!sudokuPuzzleEncodingValid(puzzle)) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (grid.length !== SUDOKU_CELLS || !sudokuSolutionIsValid(grid)) return false;
+  for (let index = 0; index < SUDOKU_CELLS; index += 1) {
+    const fixed = puzzle.initialGrid[index];
+    if (fixed !== null && fixed !== undefined && grid[index] !== Number(fixed)) return false;
+  }
+  // Üretilen puzzle tek çözümlüdür; yine de authoritative çözümle birebir eşleşmeyi koruyoruz.
+  return puzzle.numbers.every((value, index) => grid[index] === Number(value));
 }
 
 const NONOGRAM_SIZE = 5;
-const NONOGRAM_CELL_COUNT = NONOGRAM_SIZE * NONOGRAM_SIZE;
-const NONOGRAM_CLUE_PAYLOAD_COUNT = NONOGRAM_SIZE * 2;
+const NONOGRAM_CELLS = NONOGRAM_SIZE * NONOGRAM_SIZE;
+const NONOGRAM_MAX_CLUES_PER_LINE = 2;
 
-function nonogramSingleRunLength(line) {
-  if (!Array.isArray(line) || line.length !== NONOGRAM_SIZE) return null;
-  let runCount = 0;
-  let current = 0;
-  let runLength = 0;
-  for (const raw of line) {
-    const value = Number(raw);
-    if (value === 1) {
-      current += 1;
-    } else if (value === 0) {
-      if (current > 0) {
-        runCount += 1;
-        runLength = current;
-        current = 0;
-      }
-    } else {
-      return null;
-    }
+// Her şablon 5x5'tir, satır ve sütun başına en fazla iki ipucu grubu üretir ve clue seti tek çözümlüdür.
+const NONOGRAM_PATTERNS = [
+  "0101010100100100101111000",
+  "1100001011001010011001001",
+  "0010010010101000110101100",
+  "1000111111100111001110001",
+  "0001101010011110011011000",
+  "1110011111111011111001010",
+  "1111110100100010011010000",
+  "1110010111001101001110111",
+  "1011110100101001100001000",
+  "1111010111101000010100010",
+  "1111011001101000111101011",
+  "0111111111011011110011100",
+  "0001110010001101011111010",
+  "0001101100100100000101101",
+  "0001111111011111101010110",
+  "0100101111111111101101111"
+];
+
+function nonogramLineClues(line) {
+  const result = [];
+  let run = 0;
+  for (const value of line) {
+    if (Number(value) === 1) run += 1;
+    else if (run > 0) { result.push(run); run = 0; }
   }
-  if (current > 0) {
-    runCount += 1;
-    runLength = current;
-  }
-  return runCount === 1 && runLength >= 1 && runLength <= NONOGRAM_SIZE ? runLength : null;
+  if (run > 0) result.push(run);
+  return result;
 }
 
-function nonogramCluesFromSolution(solution) {
-  if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELL_COUNT) return null;
-  const normalized = solution.map(Number);
-  if (normalized.some((value) => value !== 0 && value !== 1)) return null;
-
-  const rowClues = [];
-  const colClues = [];
+function nonogramPatternRespectsClueLimit(solution) {
+  if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELLS) return false;
+  if (!solution.every((v) => Number(v) === 0 || Number(v) === 1)) return false;
   for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
-    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => normalized[row * NONOGRAM_SIZE + col]);
-    const clue = nonogramSingleRunLength(line);
-    if (clue == null) return null;
-    rowClues.push(clue);
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => solution[row * NONOGRAM_SIZE + col]);
+    if (nonogramLineClues(line).length > NONOGRAM_MAX_CLUES_PER_LINE) return false;
   }
   for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
-    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => normalized[row * NONOGRAM_SIZE + col]);
-    const clue = nonogramSingleRunLength(line);
-    if (clue == null) return null;
-    colClues.push(clue);
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => solution[row * NONOGRAM_SIZE + col]);
+    if (nonogramLineClues(line).length > NONOGRAM_MAX_CLUES_PER_LINE) return false;
   }
-
-  const filledCellCount = normalized.reduce((sum, value) => sum + value, 0);
-  if (
-    filledCellCount <= 0 ||
-    rowClues.reduce((sum, value) => sum + value, 0) !== filledCellCount ||
-    colClues.reduce((sum, value) => sum + value, 0) !== filledCellCount
-  ) return null;
-
-  return { rowClues, colClues, filledCellCount };
+  return true;
 }
 
-function nonogramCluesFromPayload(initialGrid) {
-  if (!Array.isArray(initialGrid) || initialGrid.length !== NONOGRAM_CLUE_PAYLOAD_COUNT) return null;
-  const clues = initialGrid.map(Number);
-  if (clues.some((value) => !Number.isInteger(value) || value < 1 || value > NONOGRAM_SIZE)) return null;
-  const rowClues = clues.slice(0, NONOGRAM_SIZE);
-  const colClues = clues.slice(NONOGRAM_SIZE);
-  const rowTotal = rowClues.reduce((sum, value) => sum + value, 0);
-  const colTotal = colClues.reduce((sum, value) => sum + value, 0);
-  if (rowTotal !== colTotal) return null;
-  return { rowClues, colClues, filledCellCount: rowTotal };
-}
-
-function nonogramCluePayload(clues) {
-  return [...clues.rowClues, ...clues.colClues];
-}
-
-function nonogramRowOptions(clue) {
-  const length = Number(clue);
-  if (!Number.isInteger(length) || length < 1 || length > NONOGRAM_SIZE) return [];
-  return Array.from({ length: NONOGRAM_SIZE - length + 1 }, (_, start) =>
-    Array.from({ length: NONOGRAM_SIZE }, (_, col) => (col >= start && col < start + length ? 1 : 0))
+function transformNonogramPattern(bits, variant) {
+  const source = Array.from({ length: NONOGRAM_SIZE }, (_, r) =>
+    Array.from({ length: NONOGRAM_SIZE }, (_, c) => Number(bits[r * NONOGRAM_SIZE + c]))
   );
-}
-
-// Verilen satır/sütun ipuçlarını sağlayan 5x5 ızgaraların sayısını bulur. Kullanıcı isteği
-// gereği her çizgide tek sayı vardır; bu sayı o çizgideki tek kesintisiz dolu bloğun uzunluğudur.
-function nonogramSolutionCount(clues, limit = 2) {
-  if (!clues || limit <= 0) return 0;
-  const rowOptions = clues.rowClues.map(nonogramRowOptions);
-  if (rowOptions.some((options) => options.length === 0)) return 0;
-
-  const chosenRows = Array.from({ length: NONOGRAM_SIZE }, () => Array(NONOGRAM_SIZE).fill(0));
-  let count = 0;
-
-  function search(row) {
-    if (count >= limit) return;
-    if (row === NONOGRAM_SIZE) {
-      for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
-        const line = Array.from({ length: NONOGRAM_SIZE }, (_, r) => chosenRows[r][col]);
-        if (nonogramSingleRunLength(line) !== clues.colClues[col]) return;
-      }
-      count += 1;
-      return;
-    }
-
-    for (const candidate of rowOptions[row]) {
-      if (count >= limit) break;
-      chosenRows[row] = candidate.slice();
-
-      let possible = true;
-      for (let col = 0; col < NONOGRAM_SIZE && possible; col += 1) {
-        const target = clues.colClues[col];
-        let current = 0;
-        let completedRuns = 0;
-        let completedLength = 0;
-        for (let r = 0; r <= row; r += 1) {
-          if (chosenRows[r][col] === 1) {
-            current += 1;
-          } else if (current > 0) {
-            completedRuns += 1;
-            completedLength = current;
-            current = 0;
-          }
-        }
-        if (completedRuns > 1 || current > target || completedLength > target) {
-          possible = false;
-          break;
-        }
-        if (completedRuns === 1 && current > 0) {
-          possible = false;
-          break;
-        }
-        const usedLength = current > 0 ? current : completedLength;
-        const remainingRows = NONOGRAM_SIZE - 1 - row;
-        if (usedLength + remainingRows < target) possible = false;
-      }
-
-      if (possible) search(row + 1);
-    }
+  const out = Array.from({ length: NONOGRAM_SIZE }, () => Array(NONOGRAM_SIZE).fill(0));
+  for (let r = 0; r < NONOGRAM_SIZE; r += 1) for (let c = 0; c < NONOGRAM_SIZE; c += 1) {
+    let rr = r, cc = c;
+    if (variant & 1) cc = NONOGRAM_SIZE - 1 - cc;
+    if (variant & 2) rr = NONOGRAM_SIZE - 1 - rr;
+    if (variant & 4) { const t = rr; rr = cc; cc = t; }
+    out[r][c] = source[rr][cc];
   }
-
-  search(0);
-  return count;
-}
-
-function nonogramPuzzleEncodingValid(puzzle) {
-  const solution = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  if (Number(puzzle?.target) !== NONOGRAM_CELL_COUNT || solution.length !== NONOGRAM_CELL_COUNT) return false;
-
-  const payloadClues = nonogramCluesFromPayload(puzzle?.initialGrid);
-  const solutionClues = nonogramCluesFromSolution(solution);
-  if (!payloadClues || !solutionClues) return false;
-  if (JSON.stringify(nonogramCluePayload(payloadClues)) !== JSON.stringify(nonogramCluePayload(solutionClues))) return false;
-
-  // Gösterilen ipuçları en az bir rastgele şekle değil, tam olarak tek bir 5x5 çözüme karşılık gelmelidir.
-  return nonogramSolutionCount(payloadClues, 2) === 1;
-}
-
-function nonogramAnswerMatchesClues(cluePayload, cells) {
-  const clues = nonogramCluesFromPayload(cluePayload);
-  if (!clues || !Array.isArray(cells) || cells.length !== NONOGRAM_CELL_COUNT) return false;
-
-  // X (2), null ve diğer boş durumları dolu saymayız. Siyah hücrelerin oluşturduğu satır/sütun
-  // blokları ekranda gösterilen 10 ipucuyla birebir aynı olmalıdır.
-  const filled = cells.map((value) => Number(value) === 1 ? 1 : 0);
-  const answerClues = nonogramCluesFromSolution(filled);
-  if (!answerClues) return false;
-  return JSON.stringify(nonogramCluePayload(answerClues)) === JSON.stringify(nonogramCluePayload(clues));
-}
-
-function randomNonogramRow() {
-  const clue = secureRandomInt(1, NONOGRAM_SIZE + 1);
-  const start = secureRandomInt(0, NONOGRAM_SIZE - clue + 1);
-  return Array.from({ length: NONOGRAM_SIZE }, (_, col) => (col >= start && col < start + clue ? 1 : 0));
+  return out.flat();
 }
 
 function generateNonogramPuzzle() {
-  // Önce tek bir gerçek 5x5 çözüm ızgarası oluşturulur. İpuçları ASLA birbirinden bağımsız
-  // üretilmez; çözümün satır ve sütunlarındaki ardışık bloklardan türetilir. Son olarak clue setinin
-  // tek çözümü olduğu solver ile doğrulanır. Böylece satır ve sütun sayıları geometrik olarak da uyumludur.
-  for (let attempt = 0; attempt < 512; attempt += 1) {
-    const rows = Array.from({ length: NONOGRAM_SIZE }, () => randomNonogramRow());
-    const solution = rows.flat();
-    const clues = nonogramCluesFromSolution(solution);
-    if (!clues) continue; // boş veya birden fazla bloklu sütun varsa gerçek tek-ipucu Nonogram değildir.
-    if (clues.filledCellCount < 7 || clues.filledCellCount > 18) continue;
-    if (nonogramSolutionCount(clues, 2) !== 1) continue;
-
-    const puzzle = {
-      difficulty: "Standard",
-      target: NONOGRAM_CELL_COUNT,
-      numbers: solution,
-      gameKey: "nonogram",
-      // İlk 5 değer satır ipuçları, sonraki 5 değer sütun ipuçlarıdır.
-      initialGrid: nonogramCluePayload(clues),
-    };
-    if (nonogramPuzzleEncodingValid(puzzle)) return puzzle;
-  }
-  throw new Error("Tek çözümlü ve satır/sütun ipuçları tam uyumlu 5×5 Nonogram üretilemedi.");
+  const pattern = NONOGRAM_PATTERNS[secureRandomInt(0, NONOGRAM_PATTERNS.length)];
+  const solution = transformNonogramPattern(pattern, secureRandomInt(0, 8));
+  if (!nonogramPatternRespectsClueLimit(solution)) throw new Error("5x5 Nonogram ipucu sınırı bozuldu.");
+  return { difficulty: "Standard", target: NONOGRAM_CELLS, numbers: solution, gameKey: "nonogram", initialGrid: [] };
 }
 
 function validateNonogramAnswer(puzzle, answer = {}) {
   const cells = Array.isArray(answer?.cells) ? answer.cells : [];
-  if (!nonogramPuzzleEncodingValid(puzzle) || cells.length !== NONOGRAM_CELL_COUNT) return false;
-  return nonogramAnswerMatchesClues(puzzle.initialGrid, cells);
+  const solution = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (Number(puzzle?.target) !== NONOGRAM_CELLS || cells.length !== NONOGRAM_CELLS) return false;
+  if (!nonogramPatternRespectsClueLimit(solution)) return false;
+  return solution.every((expected, index) => expected === 1 ? Number(cells[index]) === 1 : Number(cells[index]) !== 1);
 }
 
 function resultFindApply(a, op, b) {
