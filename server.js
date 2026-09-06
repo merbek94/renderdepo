@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "arithmetic-grid-shortest-v7-20260902";
+const SERVER_BUILD_ID = "score-tier-bot-timing-v8-20260906";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2003,55 +2003,45 @@ const GAME_DEFINITIONS = Object.freeze({
   target_number: Object.freeze({
     key: "target_number",
     displayName: "HEDEF SAYIYI BUL",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Bot algoritması ortaktır; yalnız bu değerler oyuna özeldir.
-    botFinishMinMs: 24 * 1000,
-    botFinishMaxMs: 105 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [4, 24], million30: [4, 40],
+      hundredThousand: [6, 36], tenThousand: [8, 48], thousand: [16, 120],
+    }),
     infiniteDifficultyForStage: (stage) => Number(stage || 1) <= 5 ? "Medium" : "Hard",
   }),
   equal_sum: Object.freeze({
     key: "equal_sum",
     displayName: "EŞİT TOPLAM",
-    // Normal / sonsuz / ikili / turnuva tur süresi 5 dakika.
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // İlk 5 kalibrasyon: Hedef Sayıyı Bul'un 90-119 sn temel aralığının tam 2.5 katı.
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 225 * 1000,
-    botCalibrationMaxMs: 297_500,
-    // 6. oyundan itibaren oyuncunun o oyundaki ortalaması ±7 sn.
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [12, 40], million30: [12, 60],
+      hundredThousand: [15, 60], tenThousand: [30, 90], thousand: [48, 180],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   total_equals: Object.freeze({
     key: "total_equals",
     displayName: "ARİTMETİK",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 119 * 1000,
-    // ARİTMETİK ilk 5 bot kalibrasyonu 90-119 sn; sonrasında oyuncu ortalamasının ±4 sn çevresi.
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [12, 40], million30: [12, 60],
+      hundredThousand: [15, 50], tenThousand: [30, 90], thousand: [60, 120],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   ratio_proportion: Object.freeze({
     key: "ratio_proportion",
     displayName: "ORAN ORANTI",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // İlk 5 bot maçı 1,5-2 dakika; sonrasında oyuncunun bu oyundaki ortalaması ±4 sn.
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 119 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [7, 30], million30: [9, 40],
+      hundredThousand: [9, 60], tenThousand: [30, 90], thousand: [60, 120],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   total_match: Object.freeze({
@@ -2059,11 +2049,10 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "TOPLAM EŞLEŞTİR",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [40, 90], million30: [50, 100],
+      hundredThousand: [60, 110], tenThousand: [80, 150], thousand: [100, 200],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   triple_balance: Object.freeze({
@@ -2071,11 +2060,10 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "DÖRTLÜ DENGE",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [12, 60], million30: [20, 60],
+      hundredThousand: [24, 80], tenThousand: [30, 120], thousand: [60, 120],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   sort_order: Object.freeze({
@@ -2083,11 +2071,10 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "SIRALA",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [12, 60], million30: [12, 80],
+      hundredThousand: [18, 90], tenThousand: [24, 120], thousand: [60, 150],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   dual_pyramid: Object.freeze({
@@ -2095,91 +2082,74 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "İKİLİ PİRAMİT",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [30, 120], million30: [50, 150],
+      hundredThousand: [40, 150], tenThousand: [40, 180], thousand: [60, 200],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   wrong_numbers: Object.freeze({
     key: "wrong_numbers",
     displayName: "YANLIŞ SAYILARI BUL",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 119 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [6, 30], million30: [10, 36],
+      hundredThousand: [8, 45], tenThousand: [10, 80], thousand: [20, 90],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   digit_hunt: Object.freeze({
     key: "digit_hunt",
     displayName: "RAKAM AVI",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 2 * 60 * 1000,
-    // Skor bazlı oyunda süre profili kullanılmaz; alanlar ortak sözleşme uyumluluğu içindir.
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 119 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 0,
+    // Rakam Avı süreli bot profilinden muaftır; authoritative skor bazlı yarış korunur.
+    scoreBasedCompetition: true,
     infiniteDifficultyForStage: () => "Standard",
   }),
   next_number: Object.freeze({
     key: "next_number",
     displayName: "SONRAKİ SAYI",
-    // Normal / sonsuz / ikili / turnuva tur süresi 2 dakika.
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Bot profili Hedef Sayıyı Bul ile birebir aynıdır: ilk 5 tur 90-119 sn, sonrasında oyuncu ortalamasının ±4 sn çevresi.
-    botFinishMinMs: 24 * 1000,
-    botFinishMaxMs: 105 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [3, 15], million30: [5, 15],
+      hundredThousand: [5, 20], tenThousand: [10, 50], thousand: [16, 80],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   equation_hunt: Object.freeze({
     key: "equation_hunt",
     displayName: "DENKLEM AVI",
-    // Denklem Avı da ortak 2 dakikalık rekabet temposunu kullanır.
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Ortak bot motorunda Hedef Sayıyı Bul / Sonraki Sayı profili kullanılır.
-    botFinishMinMs: 24 * 1000,
-    botFinishMaxMs: 105 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [12, 40], million30: [12, 50],
+      hundredThousand: [16, 50], tenThousand: [20, 70], thousand: [30, 90],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   shortest_path: Object.freeze({
     key: "shortest_path",
     displayName: "EN KISA YOL",
-    // En Kısa Yol bütün normal/sonsuz/rekabetçi modlarda 5 dakikadır.
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Botun bitirme zamanı ortak Hedef Sayıyı Bul / Sonraki Sayı profiliyle aynıdır.
-    // Yalnızca bu oyuna özel %21 yanlış rota davranışı aşağıdaki ortak bot planına eklenir.
-    botFinishMinMs: 24 * 1000,
-    botFinishMaxMs: 105 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [5, 30], million30: [10, 40],
+      hundredThousand: [10, 40], tenThousand: [15, 60], thousand: [20, 90],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   digit_attack: Object.freeze({
     key: "digit_attack",
     displayName: "RAKAM SALDIRISI",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 2 * 60 * 1000,
-    botFinishMinMs: 80 * 1000,
-    botFinishMaxMs: 119 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [30, 60], million30: [40, 70],
+      hundredThousand: [40, 80], tenThousand: [50, 100], thousand: [60, 150],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   consecutive: Object.freeze({
@@ -2187,25 +2157,19 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "ARDIŞIK",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [20, 70], million30: [30, 80],
+      hundredThousand: [30, 90], tenThousand: [40, 120], thousand: [60, 150],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   merge_5120: Object.freeze({
     key: "merge_5120",
     displayName: "5120",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // Bu oyunda bot süreyle değil authoritative oyun-içi skorla yarışır.
+    // 5120 süreli bot profilinden muaftır; authoritative skor bazlı yarış korunur.
     scoreBasedCompetition: true,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 119 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 0,
     infiniteDifficultyForStage: () => "Standard",
   }),
   number_puzzle: Object.freeze({
@@ -2213,47 +2177,43 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "SAYI BULMACASI",
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 299 * 1000,
-    botCalibrationMinMs: 4 * 60 * 1000,
-    botCalibrationMaxMs: 5 * 60 * 1000,
-    botAverageVarianceMs: 7 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [25, 70], million30: [35, 80],
+      hundredThousand: [30, 80], tenThousand: [40, 90], thousand: [60, 120],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   sudoku: Object.freeze({
     key: "sudoku",
     displayName: "SUDOKU",
-    roundDurationMs: 15 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 899 * 1000,
-    botCalibrationMinMs: 12 * 60 * 1000,
-    botCalibrationMaxMs: 15 * 60 * 1000,
-    botAverageVarianceMs: 15 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [16, 80], million30: [24, 90],
+      hundredThousand: [30, 100], tenThousand: [40, 130], thousand: [50, 150],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   nonogram: Object.freeze({
     key: "nonogram",
     displayName: "NONOGRAM",
-    roundDurationMs: 15 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 1 * 1000,
-    botFinishMaxMs: 899 * 1000,
-    botCalibrationMinMs: 12 * 60 * 1000,
-    botCalibrationMaxMs: 15 * 60 * 1000,
-    botAverageVarianceMs: 15 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [13, 60], million30: [24, 70],
+      hundredThousand: [30, 70], tenThousand: [40, 110], thousand: [50, 130],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   result_find: Object.freeze({
     key: "result_find",
     displayName: "SONUCU BUL",
-    roundDurationMs: 2 * 60 * 1000,
+    roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    botFinishMinMs: 24 * 1000,
-    botFinishMaxMs: 105 * 1000,
-    botCalibrationMinMs: 90 * 1000,
-    botCalibrationMaxMs: 119 * 1000,
-    botAverageVarianceMs: 4 * 1000,
+    botScoreTimingSeconds: Object.freeze({
+      million70: [4, 24], million30: [4, 40],
+      hundredThousand: [6, 36], tenThousand: [8, 48], thousand: [16, 96],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
 });
@@ -3357,6 +3317,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
     finishTotalMs: lockedRow.two_player_finish_total_ms,
     scoreCount: lockedRow.two_player_score_count,
     scoreTotal: lockedRow.two_player_score_total,
+    generalScore: lockedRow.general_score,
   });
   state.tournamentResponse = {
     currentStage: Math.max(1, Math.min(Number(lockedRow.tournament_stage || 1), 8)),
@@ -4325,8 +4286,12 @@ function secureRandomInt(minInclusive, maxExclusive) {
   return crypto.randomInt(minInclusive, maxExclusive);
 }
 
-const BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES = 5;
+const BOT_SCORE_TIMING_REQUIRED_FINISHES = 5;
 const BOT_MIN_FINISH_MS = 1_000;
+const BOT_FIRST_FIVE_MIN_MS = 240_000;
+const BOT_FIRST_FIVE_MAX_MS = 300_000;
+const BOT_UNDER_1000_MIN_MS = 200_000;
+const BOT_UNDER_1000_MAX_MS = 300_000;
 
 function normalizeTwoPlayerFinishProfile(profile = {}) {
   const parsedFinishCount = Number(profile.finishCount || 0);
@@ -4343,17 +4308,24 @@ function normalizeTwoPlayerFinishProfile(profile = {}) {
   const scoreTotal = Number.isFinite(parsedScoreTotal) ? Math.max(0, Math.floor(parsedScoreTotal)) : 0;
   const averageFinishMs = finishCount > 0 ? Math.round(finishTotalMs / finishCount) : null;
   const averageScore = scoreCount > 0 ? Math.round(scoreTotal / scoreCount) : null;
-  return { finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore };
+  const parsedGeneralScore = Number(profile.generalScore || 0);
+  const generalScore = Number.isFinite(parsedGeneralScore)
+    ? Math.max(0, Math.min(2_000_000_000, Math.floor(parsedGeneralScore)))
+    : 0;
+  // averageFinishMs istatistik/geriye dönük uyumluluk için kalır; bot hızı artık bunu kullanmaz.
+  return { finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore, generalScore };
 }
 
 async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey = "target_number") {
   const normalizedGameKey = normalizeBaseGameKey(gameKey);
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
-    `SELECT two_player_finish_count, two_player_finish_total_ms, two_player_score_count, two_player_score_total
-     FROM player_game_progress
-     WHERE player_id = $1 AND game_key = $2
-     FOR UPDATE`,
+    `SELECT gp.two_player_finish_count, gp.two_player_finish_total_ms,
+            gp.two_player_score_count, gp.two_player_score_total, s.general_score
+     FROM player_game_progress gp
+     JOIN player_scores s ON s.player_id = gp.player_id
+     WHERE gp.player_id = $1 AND gp.game_key = $2
+     FOR UPDATE OF gp, s`,
     [playerId, normalizedGameKey]
   );
   const row = result.rows[0] || {};
@@ -4362,6 +4334,7 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey
     finishTotalMs: row.two_player_finish_total_ms,
     scoreCount: row.two_player_score_count,
     scoreTotal: row.two_player_score_total,
+    generalScore: row.general_score,
   });
 }
 
@@ -4427,48 +4400,58 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs, roundCountValue = 
 }
 
 /**
- * Bot bitirme algoritması bütün oyunlarda aynıdır.
- * Değişen tek şey GAME_DEFINITIONS içindeki kalibrasyon aralığı, alt/üst sınır ve varyanstır.
+ * Süreli botlarda oyuncunun ortalama bitirme süresi artık KULLANILMAZ.
+ * İlk 5 bitiriş kaydı 240-300 sn kalibrasyondur; sonrasında authoritative genel puan
+ * GAME_DEFINITIONS içindeki oyun-bazlı puan aralıklarından bot süresini seçer.
+ * 5120 ve Rakam Avı bu fonksiyona girmez; skor bazlı bot sistemlerini korurlar.
  */
+function secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs) {
+  const minSeconds = Math.max(1, Math.floor(Number(rangeSeconds?.[0] || 1)));
+  const maxSeconds = Math.max(minSeconds, Math.floor(Number(rangeSeconds?.[1] || minSeconds)));
+  const selectedSeconds = secureRandomInt(minSeconds, maxSeconds + 1);
+  // 300 sn seçilebilsin; timeout ile aynı milisaniyeye düşmemesi için yalnızca 1 ms güvenlik payı bırakılır.
+  return Math.max(BOT_MIN_FINISH_MS, Math.min(selectedSeconds * 1000, absoluteMaxMs));
+}
+
+function botScoreTimingRangeSeconds(config, generalScore) {
+  const score = Math.max(0, Math.min(2_000_000_000, Math.floor(Number(generalScore) || 0)));
+  const timing = config?.botScoreTimingSeconds;
+
+  if (score >= 1_000_000) {
+    // Kullanıcının istediği 1 milyon+ profili: %70 ana aralık, %30 ikinci aralık.
+    return secureRandomInt(0, 10_000) < 7_000
+      ? timing?.million70
+      : timing?.million30;
+  }
+  if (score >= 100_000) return timing?.hundredThousand;
+  if (score >= 10_000) return timing?.tenThousand;
+  if (score >= 1_000) return timing?.thousand;
+  return [BOT_UNDER_1000_MIN_MS / 1000, BOT_UNDER_1000_MAX_MS / 1000];
+}
+
 function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number") {
   const profile = normalizeTwoPlayerFinishProfile(finishProfile);
   const config = gameDefinition(gameKey);
-  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 1) - 1_000);
+  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 300_000) - 1);
 
-  // İlk 5 normal ikili oyun kalibrasyondur. Burada temel kalibrasyon aralığı kullanılır;
-  // createGameAwareBotPlan en sonda oyunun kendi min/max sınırını uygular. Bu iki aşamalı
-  // yapı Hedef Sayıyı Bul'un eski davranışını aynen korur.
-  if (
-    profile.finishCount < BOT_AVERAGE_REQUIRED_TWO_PLAYER_FINISHES ||
-    profile.averageFinishMs === null
-  ) {
-    const calibrationMinMs = Math.max(
-      BOT_MIN_FINISH_MS,
-      Math.min(Number(config.botCalibrationMinMs || BOT_MIN_FINISH_MS), absoluteMaxMs)
+  // Mevcut oyun-bazlı finishCount yalnız ilk 5 kalibrasyon karşılaşmasını saymak için kullanılır.
+  // Oyuncunun averageFinishMs değeri hiçbir koşulda bot süresine etki etmez.
+  if (profile.finishCount < BOT_SCORE_TIMING_REQUIRED_FINISHES) {
+    return secureRandomInt(
+      Math.min(BOT_FIRST_FIVE_MIN_MS, absoluteMaxMs),
+      Math.min(BOT_FIRST_FIVE_MAX_MS, absoluteMaxMs) + 1
     );
-    const calibrationMaxMs = Math.max(
-      calibrationMinMs,
-      Math.min(Number(config.botCalibrationMaxMs || absoluteMaxMs), absoluteMaxMs)
-    );
-    return secureRandomInt(calibrationMinMs, calibrationMaxMs + 1);
   }
 
-  const averageFinishMs = Math.max(
-    BOT_MIN_FINISH_MS,
-    Math.min(profile.averageFinishMs, absoluteMaxMs)
-  );
-  // Varyans da diğer bot süreleri gibi yalnız oyun tanımından gelir.
-  const varianceMs = Math.max(0, Number(config.botAverageVarianceMs ?? 7_000));
-  const minimumFinishMs = Math.max(
-    BOT_MIN_FINISH_MS,
-    averageFinishMs - varianceMs
-  );
-  const maximumFinishMs = Math.min(
-    absoluteMaxMs,
-    averageFinishMs + varianceMs
-  );
-
-  return secureRandomInt(minimumFinishMs, maximumFinishMs + 1);
+  const rangeSeconds = botScoreTimingRangeSeconds(config, profile.generalScore);
+  if (!Array.isArray(rangeSeconds) || rangeSeconds.length < 2) {
+    // Tanımsız bir süre profili yalnız güvenli yavaş profile düşer; sessizce eski ortalama sisteme dönmez.
+    return secureRandomInt(
+      Math.min(BOT_UNDER_1000_MIN_MS, absoluteMaxMs),
+      Math.min(BOT_UNDER_1000_MAX_MS, absoluteMaxMs) + 1
+    );
+  }
+  return secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs);
 }
 
 function createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile = {}) {
@@ -4512,15 +4495,14 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
       leaveMs: null,
       scoreBased: true,
       score: botScore,
-      roundDurationMs: Number(config.roundDurationMs || 120_000),
+      roundDurationMs: Number(config.roundDurationMs || 300_000),
     };
   }
 
-  // Oyun-bazlı %21 özel yenilgi davranışları diğer bot kurallarından tamamen izoledir.
-  // Kalan %79'da ayrılma / çözememe / kalibrasyon dahil ortak bot motoru aynen çalışır.
+  // Oyuna özel yanlış/başarısız bot davranışları korunur; yalnız normal bot bitirme süresi puan bazlıdır.
   const wrongShortestPathRoute = baseGameKey === "shortest_path" && secureRandomInt(0, 10000) < 2100;
   const digitAttackForcedLoss = baseGameKey === "digit_attack" && secureRandomInt(0, 10000) < 2100;
-  const digitAttackLossMaxMs = Math.max(28_000, Math.min(70_000, Number(config.roundDurationMs || 120_000) - 1_000));
+  const digitAttackLossMaxMs = Math.max(28_000, Math.min(70_000, Number(config.roundDurationMs || 300_000) - 1));
   const plan = wrongShortestPathRoute
     ? {
         finishMs: createTwoPlayerBotFinishMs(finishProfile, gameKey),
@@ -4529,7 +4511,6 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
       }
     : digitAttackForcedLoss
       ? {
-          // Rakam Saldırısı özel yenilgisi hiçbir zaman 28. saniyeden önce gerçekleşmez.
           finishMs: secureRandomInt(28_000, digitAttackLossMaxMs + 1),
           leaveMs: null,
           forcedLoss: true,
@@ -4538,20 +4519,16 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
       : createSecureTwoPlayerBotPlan(gameKey, difficulty, finishProfile);
 
   if (plan.finishMs === null || plan.finishMs === undefined) return plan;
-  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 1) - 1_000);
+  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 300_000) - 1);
   if (plan.forcedLoss === true) {
-    // Özel Rakam Saldırısı yenilgisi normal bitirme alt sınırına sıkıştırılmaz;
-    // yalnız 28. saniye ve tur sonu güvenlik sınırları uygulanır.
     return {
       ...plan,
       finishMs: Math.max(28_000, Math.min(Number(plan.finishMs), absoluteMaxMs)),
     };
   }
-  const gameMinMs = Math.max(BOT_MIN_FINISH_MS, Math.min(Number(config.botFinishMinMs || BOT_MIN_FINISH_MS), absoluteMaxMs));
-  const gameMaxMs = Math.max(gameMinMs, Math.min(Number(config.botFinishMaxMs || absoluteMaxMs), absoluteMaxMs));
   return {
     ...plan,
-    finishMs: Math.max(gameMinMs, Math.min(Number(plan.finishMs), gameMaxMs)),
+    finishMs: Math.max(BOT_MIN_FINISH_MS, Math.min(Number(plan.finishMs), absoluteMaxMs)),
   };
 }
 
@@ -4563,7 +4540,7 @@ function botPlanTimeMs(value) {
 
 function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
   if (plan?.scoreBased === true) {
-    const roundDurationMs = Math.max(1_000, Number(plan?.roundDurationMs || 120_000));
+    const roundDurationMs = Math.max(1_000, Number(plan?.roundDurationMs || 300_000));
     if (elapsedMs >= roundDurationMs) {
       // Skor tabanlı 5120 botunda oyuncu süre sonuna kadar sonuç göndermediyse botun
       // pozitif skoru karşısında hükmen kaybeder; bağlantıyı keserek beraberlik kazanılamaz.
@@ -7867,12 +7844,14 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       const progressResult = await client.query(
         `SELECT gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
                 gp.tournament_completed, gp.tournament_entry_active,
-                p.tournament_tickets, gp.two_player_finish_count, gp.two_player_finish_total_ms,
+                p.tournament_tickets, s.general_score,
+                gp.two_player_finish_count, gp.two_player_finish_total_ms,
                 gp.two_player_score_count, gp.two_player_score_total
          FROM player_game_progress gp
          JOIN player_progress p ON p.player_id = gp.player_id
+         JOIN player_scores s ON s.player_id = gp.player_id
          WHERE gp.player_id = $1 AND gp.game_key = $2
-         FOR UPDATE OF gp, p`,
+         FOR UPDATE OF gp, p, s`,
         [req.auth.sub, gameKey]
       );
       const progress = progressResult.rows[0] || {};
@@ -7892,6 +7871,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         finishTotalMs: progress.two_player_finish_total_ms,
         scoreCount: progress.two_player_score_count,
         scoreTotal: progress.two_player_score_total,
+        generalScore: progress.general_score,
       });
       tournamentResponse = {
         currentStage: stage,
@@ -9896,8 +9876,8 @@ function createRealtimeRoom(
     awardedAt: null,
     deadlineHandle: null,
     botFinishHandle: null,
-    // Hazır oda botlarında ilk 5 oyun sonrası ±4 saniye kuralı için
-    // oyuncunun sunucuda tutulan ikili oyun bitirme profili odaya taşınır.
+    // Hazır oda botlarında ilk 5 kalibrasyon sayacı + authoritative genel puan bu profile taşınır.
+    // Ortalama bitirme süresi artık bot hızında kullanılmaz; skor-bazlı oyunların averageScore alanı korunur.
     botFinishProfile: opponentPlayer.isBot === true
       ? normalizeTwoPlayerFinishProfile(botFinishProfile || {})
       : null,
@@ -10443,6 +10423,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
         finishTotalMs: row.two_player_finish_total_ms,
         scoreCount: row.two_player_score_count,
         scoreTotal: row.two_player_score_total,
+        generalScore: row.general_score,
       }),
     };
   } catch (error) {
