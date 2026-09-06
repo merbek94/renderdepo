@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "sudoku6-nonogram5-v9-20260906";
+const SERVER_BUILD_ID = "sudoku6-nonogram5-specialclue-v10-20260906";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5709,24 +5709,27 @@ const NONOGRAM_SIZE = 5;
 const NONOGRAM_CELLS = NONOGRAM_SIZE * NONOGRAM_SIZE;
 const NONOGRAM_MAX_CLUES_PER_LINE = 2;
 
-// Her şablon 5x5'tir, satır ve sütun başına en fazla iki ipucu grubu üretir ve clue seti tek çözümlüdür.
+// Her şablon 5x5'tir, satır/sütun başına en fazla iki ipucu grubu üretir ve clue seti tek çözümlüdür.
+// Ayrıca bütün 10 satır+sütun ipucunun içinde TAM 1 özel ipucu vardır:
+// ya yalnız bir kez [5] ya da yalnız bir kez [2,2]. İkisi aynı bulmacada birlikte bulunmaz.
+// İlk 8 şablon [5], son 8 şablon [2,2] türündedir; dönüşümler bu özelliği korur.
 const NONOGRAM_PATTERNS = [
-  "0101010100100100101111000",
-  "1100001011001010011001001",
-  "0010010010101000110101100",
-  "1000111111100111001110001",
-  "0001101010011110011011000",
-  "1110011111111011111001010",
-  "1111110100100010011010000",
-  "1110010111001101001110111",
-  "1011110100101001100001000",
-  "1111010111101000010100010",
-  "1111011001101000111101011",
-  "0111111111011011110011100",
-  "0001110010001101011111010",
-  "0001101100100100000101101",
-  "0001111111011111101010110",
-  "0100101111111111101101111"
+  "1101001011100101011101011",
+  "1001111000110011011010110",
+  "1111100111001111100110110",
+  "0001001110100111000011111",
+  "0011000110011100011111101",
+  "0110100010111110110110111",
+  "1011101111111101111010011",
+  "1110011101101001001010111",
+  "0000001110010001101011011",
+  "1000101001111101001101001",
+  "1011001100100001001011011",
+  "0111011100111011101100010",
+  "1011101010100011101010010",
+  "1101100111100001000100000",
+  "0101111010000111100101110",
+  "0001110100110110000110000"
 ];
 
 function nonogramLineClues(line) {
@@ -5743,15 +5746,29 @@ function nonogramLineClues(line) {
 function nonogramPatternRespectsClueLimit(solution) {
   if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELLS) return false;
   if (!solution.every((v) => Number(v) === 0 || Number(v) === 1)) return false;
+
+  const allClues = [];
   for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
     const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => solution[row * NONOGRAM_SIZE + col]);
-    if (nonogramLineClues(line).length > NONOGRAM_MAX_CLUES_PER_LINE) return false;
+    const clues = nonogramLineClues(line);
+    if (clues.length > NONOGRAM_MAX_CLUES_PER_LINE) return false;
+    allClues.push(clues);
   }
   for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
     const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => solution[row * NONOGRAM_SIZE + col]);
-    if (nonogramLineClues(line).length > NONOGRAM_MAX_CLUES_PER_LINE) return false;
+    const clues = nonogramLineClues(line);
+    if (clues.length > NONOGRAM_MAX_CLUES_PER_LINE) return false;
+    allClues.push(clues);
   }
-  return true;
+
+  // Bulmacada özel ipucu TAM 1 kez bulunur: ya [5] ya da [2,2].
+  // Bu sayım satır ve sütunların tamamı üzerinde yapılır; dolayısıyla aynı özel ipucu
+  // ikinci bir satır/sütunda tekrarlanamaz ve iki özel tür aynı bulmacada birlikte olamaz.
+  const specialCount = allClues.filter((clues) =>
+    (clues.length === 1 && clues[0] === 5) ||
+    (clues.length === 2 && clues[0] === 2 && clues[1] === 2)
+  ).length;
+  return specialCount === 1;
 }
 
 function transformNonogramPattern(bits, variant) {
@@ -5772,7 +5789,7 @@ function transformNonogramPattern(bits, variant) {
 function generateNonogramPuzzle() {
   const pattern = NONOGRAM_PATTERNS[secureRandomInt(0, NONOGRAM_PATTERNS.length)];
   const solution = transformNonogramPattern(pattern, secureRandomInt(0, 8));
-  if (!nonogramPatternRespectsClueLimit(solution)) throw new Error("5x5 Nonogram ipucu sınırı bozuldu.");
+  if (!nonogramPatternRespectsClueLimit(solution)) throw new Error("5x5 Nonogram ipucu/özel ipucu kuralı bozuldu.");
   return { difficulty: "Standard", target: NONOGRAM_CELLS, numbers: solution, gameKey: "nonogram", initialGrid: [] };
 }
 
