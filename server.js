@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "sudoku6-nonogram5-v9-20260906";
+const SERVER_BUILD_ID = "sudoku6-nonogram5-adjacent-v10-20260906";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5757,15 +5757,43 @@ function nonogramSingleRunLength(line) {
   return runCount === 1 && runLength > 0 ? runLength : null;
 }
 
-function nonogramHasSingleCluePerLine(solution) {
-  if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELL_COUNT) return false;
+function nonogramSingleClues(solution) {
+  if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELL_COUNT) return null;
+  const rowClues = [];
+  const colClues = [];
   for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
-    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => solution[row * NONOGRAM_SIZE + col]);
-    if (nonogramSingleRunLength(line) == null) return false;
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => Number(solution[row * NONOGRAM_SIZE + col]));
+    const clue = nonogramSingleRunLength(line);
+    if (clue == null) return null;
+    rowClues.push(clue);
   }
   for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
-    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => solution[row * NONOGRAM_SIZE + col]);
-    if (nonogramSingleRunLength(line) == null) return false;
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => Number(solution[row * NONOGRAM_SIZE + col]));
+    const clue = nonogramSingleRunLength(line);
+    if (clue == null) return null;
+    colClues.push(clue);
+  }
+  return { rowClues, colClues };
+}
+
+function nonogramHasSingleCluePerLine(solution) {
+  return nonogramSingleClues(solution) != null;
+}
+
+function nonogramAnswerMatchesClues(solution, cells) {
+  const clues = nonogramSingleClues(solution);
+  if (!clues || !Array.isArray(cells) || cells.length !== NONOGRAM_CELL_COUNT) return false;
+
+  // İstemcideki X işareti (2) ve boş hücreler dolu sayılmaz. Her ipucu yalnız toplam sayıyı değil,
+  // o kadar siyah karenin kesintisiz tek bir blok halinde YAN YANA olmasını da zorunlu kılar.
+  const filled = cells.map((value) => Number(value) === 1 ? 1 : 0);
+  for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => filled[row * NONOGRAM_SIZE + col]);
+    if (nonogramSingleRunLength(line) !== clues.rowClues[row]) return false;
+  }
+  for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => filled[row * NONOGRAM_SIZE + col]);
+    if (nonogramSingleRunLength(line) !== clues.colClues[col]) return false;
   }
   return true;
 }
@@ -5793,9 +5821,7 @@ function validateNonogramAnswer(puzzle, answer = {}) {
     cells.length !== NONOGRAM_CELL_COUNT ||
     !nonogramHasSingleCluePerLine(puzzle.numbers)
   ) return false;
-  return puzzle.numbers.every((expected, index) =>
-    expected === 1 ? Number(cells[index]) === 1 : Number(cells[index]) !== 1
-  );
+  return nonogramAnswerMatchesClues(puzzle.numbers, cells);
 }
 
 function resultFindApply(a, op, b) {
