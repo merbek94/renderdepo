@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "score-tier-bot-timing-v8-20260906";
+const SERVER_BUILD_ID = "sudoku6-nonogram5-v9-20260906";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5548,21 +5548,37 @@ function validateNumberPuzzleAnswer(puzzle, answer = {}) {
   return true;
 }
 
+const SUDOKU_SIZE = 6;
+const SUDOKU_BOX_ROWS = 2;
+const SUDOKU_BOX_COLUMNS = 3;
+const SUDOKU_CELL_COUNT = SUDOKU_SIZE * SUDOKU_SIZE;
+const SUDOKU_INITIAL_CLUE_COUNT = 14;
+
+function sudokuBoxIndex(row, col) {
+  const boxesPerRow = SUDOKU_SIZE / SUDOKU_BOX_COLUMNS;
+  return Math.floor(row / SUDOKU_BOX_ROWS) * boxesPerRow + Math.floor(col / SUDOKU_BOX_COLUMNS);
+}
+
 function sudokuSolutionCount(gridInput, limit = 2) {
   const grid = gridInput.map((value) => Number(value) || 0);
-  const rowMask = Array(9).fill(0);
-  const colMask = Array(9).fill(0);
-  const boxMask = Array(9).fill(0);
-  for (let index = 0; index < 81; index += 1) {
+  if (grid.length !== SUDOKU_CELL_COUNT) return 0;
+
+  const rowMask = Array(SUDOKU_SIZE).fill(0);
+  const colMask = Array(SUDOKU_SIZE).fill(0);
+  const boxMask = Array(SUDOKU_SIZE).fill(0);
+
+  for (let index = 0; index < SUDOKU_CELL_COUNT; index += 1) {
     const value = grid[index];
     if (value === 0) continue;
-    if (value < 1 || value > 9) return 0;
-    const row = Math.floor(index / 9);
-    const col = index % 9;
-    const box = Math.floor(row / 3) * 3 + Math.floor(col / 3);
+    if (!Number.isInteger(value) || value < 1 || value > SUDOKU_SIZE) return 0;
+    const row = Math.floor(index / SUDOKU_SIZE);
+    const col = index % SUDOKU_SIZE;
+    const box = sudokuBoxIndex(row, col);
     const bit = 1 << value;
     if ((rowMask[row] & bit) || (colMask[col] & bit) || (boxMask[box] & bit)) return 0;
-    rowMask[row] |= bit; colMask[col] |= bit; boxMask[box] |= bit;
+    rowMask[row] |= bit;
+    colMask[col] |= bit;
+    boxMask[box] |= bit;
   }
 
   let count = 0;
@@ -5570,18 +5586,22 @@ function sudokuSolutionCount(gridInput, limit = 2) {
     if (count >= limit) return;
     let bestIndex = -1;
     let bestCandidates = 0;
-    let bestCount = 10;
-    for (let index = 0; index < 81; index += 1) {
+    let bestCount = SUDOKU_SIZE + 1;
+
+    for (let index = 0; index < SUDOKU_CELL_COUNT; index += 1) {
       if (grid[index] !== 0) continue;
-      const row = Math.floor(index / 9);
-      const col = index % 9;
-      const box = Math.floor(row / 3) * 3 + Math.floor(col / 3);
+      const row = Math.floor(index / SUDOKU_SIZE);
+      const col = index % SUDOKU_SIZE;
+      const box = sudokuBoxIndex(row, col);
       const used = rowMask[row] | colMask[col] | boxMask[box];
       let candidates = 0;
       let candidateCount = 0;
-      for (let value = 1; value <= 9; value += 1) {
+      for (let value = 1; value <= SUDOKU_SIZE; value += 1) {
         const bit = 1 << value;
-        if ((used & bit) === 0) { candidates |= bit; candidateCount += 1; }
+        if ((used & bit) === 0) {
+          candidates |= bit;
+          candidateCount += 1;
+        }
       }
       if (candidateCount === 0) return;
       if (candidateCount < bestCount) {
@@ -5591,41 +5611,54 @@ function sudokuSolutionCount(gridInput, limit = 2) {
         if (candidateCount === 1) break;
       }
     }
-    if (bestIndex < 0) { count += 1; return; }
 
-    const row = Math.floor(bestIndex / 9);
-    const col = bestIndex % 9;
-    const box = Math.floor(row / 3) * 3 + Math.floor(col / 3);
-    for (let value = 1; value <= 9 && count < limit; value += 1) {
+    if (bestIndex < 0) {
+      count += 1;
+      return;
+    }
+
+    const row = Math.floor(bestIndex / SUDOKU_SIZE);
+    const col = bestIndex % SUDOKU_SIZE;
+    const box = sudokuBoxIndex(row, col);
+    for (let value = 1; value <= SUDOKU_SIZE && count < limit; value += 1) {
       const bit = 1 << value;
       if ((bestCandidates & bit) === 0) continue;
       grid[bestIndex] = value;
-      rowMask[row] |= bit; colMask[col] |= bit; boxMask[box] |= bit;
+      rowMask[row] |= bit;
+      colMask[col] |= bit;
+      boxMask[box] |= bit;
       search();
-      rowMask[row] &= ~bit; colMask[col] &= ~bit; boxMask[box] &= ~bit;
+      rowMask[row] &= ~bit;
+      colMask[col] &= ~bit;
+      boxMask[box] &= ~bit;
       grid[bestIndex] = 0;
     }
   }
+
   search();
   return count;
 }
 
 function generateSudokuPuzzle() {
-  for (let generationAttempt = 0; generationAttempt < 12; generationAttempt += 1) {
-    const shuffledGroups = () => shuffled([0, 1, 2]).flatMap((group) =>
-      shuffled([0, 1, 2]).map((inner) => group * 3 + inner)
+  for (let generationAttempt = 0; generationAttempt < 24; generationAttempt += 1) {
+    // 6×6 Sudoku 2×3 alt bölgelerden oluşur: 3 adet 2-satırlık bant ve
+    // 2 adet 3-sütunluk sütun grubu ayrı ayrı karıştırılır.
+    const rows = shuffled([0, 1, 2]).flatMap((band) =>
+      shuffled([0, 1]).map((inner) => band * SUDOKU_BOX_ROWS + inner)
     );
-    const rows = shuffledGroups();
-    const cols = shuffledGroups();
-    const digits = shuffled([1,2,3,4,5,6,7,8,9]);
-    const pattern = (r, c) => (r * 3 + Math.floor(r / 3) + c) % 9;
+    const cols = shuffled([0, 1]).flatMap((stack) =>
+      shuffled([0, 1, 2]).map((inner) => stack * SUDOKU_BOX_COLUMNS + inner)
+    );
+    const digits = shuffled([1, 2, 3, 4, 5, 6]);
+    const pattern = (row, col) =>
+      (SUDOKU_BOX_COLUMNS * (row % SUDOKU_BOX_ROWS) + Math.floor(row / SUDOKU_BOX_ROWS) + col) % SUDOKU_SIZE;
     const solution = rows.flatMap((row) => cols.map((col) => digits[pattern(row, col)]));
     const working = solution.slice();
-    let clueCount = 81;
+    let clueCount = SUDOKU_CELL_COUNT;
 
-    // Hücreleri yalnız tek çözüm korunuyorsa kaldır. Hedef tam 40 başlangıç hücresidir.
-    for (const index of shuffled(Array.from({ length: 81 }, (_, cell) => cell))) {
-      if (clueCount <= 40) break;
+    // Hücreleri yalnız tek çözüm korunuyorsa kaldır; hedef tam 14 başlangıç hücresidir.
+    for (const index of shuffled(Array.from({ length: SUDOKU_CELL_COUNT }, (_, cell) => cell))) {
+      if (clueCount <= SUDOKU_INITIAL_CLUE_COUNT) break;
       const previous = working[index];
       working[index] = 0;
       if (sudokuSolutionCount(working, 2) === 1) {
@@ -5635,64 +5668,134 @@ function generateSudokuPuzzle() {
       }
     }
 
-    if (clueCount === 40) {
+    if (clueCount === SUDOKU_INITIAL_CLUE_COUNT) {
       const initialGrid = working.map((value) => value === 0 ? null : value);
-      return { difficulty: "Standard", target: 81, numbers: solution, gameKey: "sudoku", initialGrid };
+      return {
+        difficulty: "Standard",
+        target: SUDOKU_CELL_COUNT,
+        numbers: solution,
+        gameKey: "sudoku",
+        initialGrid,
+      };
     }
   }
-  throw new Error("40 ipuçlu tek çözümlü Sudoku üretilemedi.");
+  throw new Error("14 ipuçlu tek çözümlü 6×6 Sudoku üretilemedi.");
 }
 
 function validateSudokuAnswer(puzzle, answer = {}) {
   const grid = Array.isArray(answer?.grid) ? answer.grid : [];
-  return Array.isArray(puzzle?.numbers) && puzzle.numbers.length === 81 && grid.length === 81 &&
+  return Array.isArray(puzzle?.numbers) &&
+    puzzle.numbers.length === SUDOKU_CELL_COUNT &&
+    grid.length === SUDOKU_CELL_COUNT &&
     puzzle.numbers.every((value, index) => Number(grid[index]) === Number(value));
 }
 
-// Satır+sütun toplam 20 çizgide tam dağılım: 10 tek ipucu (%50), 6 çift (%30),
-// 4 üçlü (%20). Aşağıdaki şablonların her biri bu dağılımı taşır ve clue seti tek çözümlüdür.
+const NONOGRAM_SIZE = 5;
+const NONOGRAM_CELL_COUNT = NONOGRAM_SIZE * NONOGRAM_SIZE;
+
+// Her şablonda bütün 5 satırın ve 5 sütunun her birinde tam bir adet kesintisiz siyah blok vardır.
+// Dolayısıyla her satır/sütun yalnız tek ipucu sayısıyla ifade edilir. Şablonların ipuçları tek çözümlüdür.
 const NONOGRAM_PATTERNS = [
-  "1111100001111011000100111100110001111000000111000000111100000000101100000000110000110011010000011100",
-  "0000011110010111001100101110010001111000001111100010001110001101111000000111100000111110100001000000",
-  "0001100000000111000000111100101111110101100000000000000001100000001111000100101000010001000011000010",
-  "0000001100010111111000011111000000111110000011000000100100111110000111001000010110000011001100000000",
-  "0100011011011100010001000000000001100000001110000110001000011110000000111000001111100000001110000000",
-  "0000001000110000100011110110001111000000111000000001100010001110110011000111111010110111000000011100",
-  "0000001010111100111001100000001110000000111000000000101011000010000000000001111000000110100100001001",
-  "1000010000000011001100110000000111111000011111100001111110001111010010111111000010111111001001011110",
-  "1000001100000000011100000001001001000010000100011000010000000001000000001000000011101100000101011100",
-  "1000010100111111010001011101110111111111001111110001111111000011101100000000111011110011000000001000",
-  "1000110110011000011000100101000011111111000011110000011111000000011100000010110000001110001000111000",
-  "0000000001000010000101011111010001111010000011111000011110000010010100111110011011111000000011000000",
-  "0000001100000000110000000011000011111100011111010000101001101100001100011000111100000000010100100011",
-  "0111110001011101000000111110000011111000101101111001111111100000110000000010000000011000110101100001",
-  "1000000000101000010011001101101111111100001111110000000011100000001000000100001100110001100001000111",
-  "0000000010000000000101110000010111010010010001111001111111010111100000101110001111111000001100000000"
+  "1000010000100001110000111",
+  "1000011100111000111001111",
+  "1000011110001110010000100",
+  "1100011110001110011000100",
+  "1100001100001110011100110",
+  "1110011000100000001100001",
+  "1110001110001100001000011",
+  "0100011100011100111100111",
+  "0110011100011110000100001",
+  "0111101110000101000010000",
+  "0011000111001111111011000",
+  "0011100111011110110010000",
 ];
 
 function transformNonogramPattern(bits, variant) {
-  const source = Array.from({ length: 10 }, (_, r) => Array.from({ length: 10 }, (_, c) => Number(bits[r * 10 + c])));
-  const out = Array.from({ length: 10 }, () => Array(10).fill(0));
-  for (let r = 0; r < 10; r += 1) for (let c = 0; c < 10; c += 1) {
-    let rr = r, cc = c;
-    if (variant & 1) cc = 9 - cc;
-    if (variant & 2) rr = 9 - rr;
-    if (variant & 4) { const t = rr; rr = cc; cc = t; }
-    out[r][c] = source[rr][cc];
+  const source = Array.from({ length: NONOGRAM_SIZE }, (_, row) =>
+    Array.from({ length: NONOGRAM_SIZE }, (_, col) => Number(bits[row * NONOGRAM_SIZE + col]))
+  );
+  const out = Array.from({ length: NONOGRAM_SIZE }, () => Array(NONOGRAM_SIZE).fill(0));
+  for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
+    for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
+      let sourceRow = row;
+      let sourceCol = col;
+      if (variant & 1) sourceCol = NONOGRAM_SIZE - 1 - sourceCol;
+      if (variant & 2) sourceRow = NONOGRAM_SIZE - 1 - sourceRow;
+      if (variant & 4) {
+        const temp = sourceRow;
+        sourceRow = sourceCol;
+        sourceCol = temp;
+      }
+      out[row][col] = source[sourceRow][sourceCol];
+    }
   }
   return out.flat();
+}
+
+function nonogramSingleRunLength(line) {
+  let runCount = 0;
+  let current = 0;
+  let runLength = 0;
+  for (const raw of line) {
+    const value = Number(raw);
+    if (value === 1) {
+      current += 1;
+    } else if (value === 0) {
+      if (current > 0) {
+        runCount += 1;
+        runLength = current;
+        current = 0;
+      }
+    } else {
+      return null;
+    }
+  }
+  if (current > 0) {
+    runCount += 1;
+    runLength = current;
+  }
+  return runCount === 1 && runLength > 0 ? runLength : null;
+}
+
+function nonogramHasSingleCluePerLine(solution) {
+  if (!Array.isArray(solution) || solution.length !== NONOGRAM_CELL_COUNT) return false;
+  for (let row = 0; row < NONOGRAM_SIZE; row += 1) {
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, col) => solution[row * NONOGRAM_SIZE + col]);
+    if (nonogramSingleRunLength(line) == null) return false;
+  }
+  for (let col = 0; col < NONOGRAM_SIZE; col += 1) {
+    const line = Array.from({ length: NONOGRAM_SIZE }, (_, row) => solution[row * NONOGRAM_SIZE + col]);
+    if (nonogramSingleRunLength(line) == null) return false;
+  }
+  return true;
 }
 
 function generateNonogramPuzzle() {
   const pattern = NONOGRAM_PATTERNS[secureRandomInt(0, NONOGRAM_PATTERNS.length)];
   const solution = transformNonogramPattern(pattern, secureRandomInt(0, 8));
-  return { difficulty: "Standard", target: 100, numbers: solution, gameKey: "nonogram", initialGrid: [] };
+  if (!nonogramHasSingleCluePerLine(solution)) {
+    throw new Error("5×5 Nonogram tek-ipucu kuralını sağlamadı.");
+  }
+  return {
+    difficulty: "Standard",
+    target: NONOGRAM_CELL_COUNT,
+    numbers: solution,
+    gameKey: "nonogram",
+    initialGrid: [],
+  };
 }
 
 function validateNonogramAnswer(puzzle, answer = {}) {
   const cells = Array.isArray(answer?.cells) ? answer.cells : [];
-  if (!Array.isArray(puzzle?.numbers) || puzzle.numbers.length !== 100 || cells.length !== 100) return false;
-  return puzzle.numbers.every((expected, index) => expected === 1 ? Number(cells[index]) === 1 : Number(cells[index]) !== 1);
+  if (
+    !Array.isArray(puzzle?.numbers) ||
+    puzzle.numbers.length !== NONOGRAM_CELL_COUNT ||
+    cells.length !== NONOGRAM_CELL_COUNT ||
+    !nonogramHasSingleCluePerLine(puzzle.numbers)
+  ) return false;
+  return puzzle.numbers.every((expected, index) =>
+    expected === 1 ? Number(cells[index]) === 1 : Number(cells[index]) !== 1
+  );
 }
 
 function resultFindApply(a, op, b) {
