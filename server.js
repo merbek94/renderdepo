@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "sudoku6-nonogram5-specialclue-v10-20260906";
+const SERVER_BUILD_ID = "sudoku6-nonogram5-timing-v11-20260907";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2186,22 +2186,26 @@ const GAME_DEFINITIONS = Object.freeze({
   sudoku: Object.freeze({
     key: "sudoku",
     displayName: "SUDOKU",
-    roundDurationMs: 5 * 60 * 1000,
+    roundDurationMs: 10 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
+    botFirstFiveTimingSeconds: Object.freeze([480, 600]),
+    botUnder1000TimingSeconds: Object.freeze([360, 600]),
     botScoreTimingSeconds: Object.freeze({
-      million70: [16, 80], million30: [24, 90],
-      hundredThousand: [30, 100], tenThousand: [40, 130], thousand: [50, 150],
+      million: [40, 125],
+      hundredThousand: [60, 180], tenThousand: [80, 300], thousand: [100, 360],
     }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   nonogram: Object.freeze({
     key: "nonogram",
     displayName: "NONOGRAM",
-    roundDurationMs: 5 * 60 * 1000,
+    roundDurationMs: 10 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
+    botFirstFiveTimingSeconds: Object.freeze([480, 600]),
+    botUnder1000TimingSeconds: Object.freeze([360, 600]),
     botScoreTimingSeconds: Object.freeze({
-      million70: [13, 60], million30: [24, 70],
-      hundredThousand: [30, 70], tenThousand: [40, 110], thousand: [50, 130],
+      million: [13, 35],
+      hundredThousand: [16, 45], tenThousand: [20, 60], thousand: [30, 120],
     }),
     infiniteDifficultyForStage: () => "Standard",
   }),
@@ -4401,16 +4405,24 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs, roundCountValue = 
 
 /**
  * Süreli botlarda oyuncunun ortalama bitirme süresi artık KULLANILMAZ.
- * İlk 5 bitiriş kaydı 240-300 sn kalibrasyondur; sonrasında authoritative genel puan
- * GAME_DEFINITIONS içindeki oyun-bazlı puan aralıklarından bot süresini seçer.
+ * İlk 5 bitiriş kaydı ve 1000 puan altı profil varsayılan olarak ortak aralıkları kullanır;
+ * oyun isterse GAME_DEFINITIONS içinde bu iki aralığı kendine özel tanımlayabilir.
+ * Sonrasında authoritative genel puan, oyun-bazlı puan aralıklarından bot süresini seçer.
  * 5120 ve Rakam Avı bu fonksiyona girmez; skor bazlı bot sistemlerini korurlar.
  */
 function secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs) {
   const minSeconds = Math.max(1, Math.floor(Number(rangeSeconds?.[0] || 1)));
   const maxSeconds = Math.max(minSeconds, Math.floor(Number(rangeSeconds?.[1] || minSeconds)));
   const selectedSeconds = secureRandomInt(minSeconds, maxSeconds + 1);
-  // 300 sn seçilebilsin; timeout ile aynı milisaniyeye düşmemesi için yalnızca 1 ms güvenlik payı bırakılır.
+  // Üst sınır seçilebilsin; timeout ile aynı milisaniyeye düşmemesi için yalnızca 1 ms güvenlik payı bırakılır.
   return Math.max(BOT_MIN_FINISH_MS, Math.min(selectedSeconds * 1000, absoluteMaxMs));
+}
+
+function botUnder1000TimingRangeSeconds(config) {
+  const configured = config?.botUnder1000TimingSeconds;
+  return Array.isArray(configured) && configured.length >= 2
+    ? configured
+    : [BOT_UNDER_1000_MIN_MS / 1000, BOT_UNDER_1000_MAX_MS / 1000];
 }
 
 function botScoreTimingRangeSeconds(config, generalScore) {
@@ -4418,7 +4430,8 @@ function botScoreTimingRangeSeconds(config, generalScore) {
   const timing = config?.botScoreTimingSeconds;
 
   if (score >= 1_000_000) {
-    // Kullanıcının istediği 1 milyon+ profili: %70 ana aralık, %30 ikinci aralık.
+    // Yeni oyunlar tek bir 1 milyon+ aralığı tanımlayabilir; eski oyunların %70/%30 profili korunur.
+    if (Array.isArray(timing?.million) && timing.million.length >= 2) return timing.million;
     return secureRandomInt(0, 10_000) < 7_000
       ? timing?.million70
       : timing?.million30;
@@ -4426,7 +4439,7 @@ function botScoreTimingRangeSeconds(config, generalScore) {
   if (score >= 100_000) return timing?.hundredThousand;
   if (score >= 10_000) return timing?.tenThousand;
   if (score >= 1_000) return timing?.thousand;
-  return [BOT_UNDER_1000_MIN_MS / 1000, BOT_UNDER_1000_MAX_MS / 1000];
+  return botUnder1000TimingRangeSeconds(config);
 }
 
 function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number") {
@@ -4437,6 +4450,10 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number
   // Mevcut oyun-bazlı finishCount yalnız ilk 5 kalibrasyon karşılaşmasını saymak için kullanılır.
   // Oyuncunun averageFinishMs değeri hiçbir koşulda bot süresine etki etmez.
   if (profile.finishCount < BOT_SCORE_TIMING_REQUIRED_FINISHES) {
+    const configuredFirstFive = config?.botFirstFiveTimingSeconds;
+    if (Array.isArray(configuredFirstFive) && configuredFirstFive.length >= 2) {
+      return secureBotFinishMsFromSecondRange(configuredFirstFive, absoluteMaxMs);
+    }
     return secureRandomInt(
       Math.min(BOT_FIRST_FIVE_MIN_MS, absoluteMaxMs),
       Math.min(BOT_FIRST_FIVE_MAX_MS, absoluteMaxMs) + 1
@@ -4445,11 +4462,8 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number
 
   const rangeSeconds = botScoreTimingRangeSeconds(config, profile.generalScore);
   if (!Array.isArray(rangeSeconds) || rangeSeconds.length < 2) {
-    // Tanımsız bir süre profili yalnız güvenli yavaş profile düşer; sessizce eski ortalama sisteme dönmez.
-    return secureRandomInt(
-      Math.min(BOT_UNDER_1000_MIN_MS, absoluteMaxMs),
-      Math.min(BOT_UNDER_1000_MAX_MS, absoluteMaxMs) + 1
-    );
+    // Tanımsız bir puan profili oyunun 1000-altı güvenli yavaş profiline düşer.
+    return secureBotFinishMsFromSecondRange(botUnder1000TimingRangeSeconds(config), absoluteMaxMs);
   }
   return secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs);
 }
