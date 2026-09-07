@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "infinite-options-5120-settle-digit-hunt6-v13-20260907";
+const SERVER_BUILD_ID = "digit-hunt-stock300-ordered-sparse-swap-v14-20260907";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -6657,8 +6657,11 @@ const DIGIT_HUNT_ROWS = 9;
 const DIGIT_HUNT_COLS = 9;
 const DIGIT_HUNT_CELLS = 81;
 const DIGIT_HUNT_TARGET_TILE_COUNT = 6;
-const DIGIT_HUNT_FINITE_COPIES_PER_TILE = 27;
-const DIGIT_HUNT_FINITE_SPAWN_LIMIT = DIGIT_HUNT_TARGET_TILE_COUNT * DIGIT_HUNT_FINITE_COPIES_PER_TILE;
+// Normal modun toplam stoğu başlangıçtaki 81 hücre dahil 300 taştır.
+// Ortak rakam iki hedef grupta da yer alıyorsa iki ayrı grup girdisi olarak 50 + 50 sayılır.
+const DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY = 50;
+const DIGIT_HUNT_FINITE_TOTAL_STOCK = DIGIT_HUNT_TARGET_TILE_COUNT * DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY;
+const DIGIT_HUNT_FINITE_SPAWN_LIMIT = DIGIT_HUNT_FINITE_TOTAL_STOCK - DIGIT_HUNT_CELLS;
 const DIGIT_HUNT_CANDIDATE_GROUPS = Object.freeze([
   [1,2,3], [2,3,4], [3,4,5], [4,5,6], [5,6,7], [6,7,8], [7,8,9],
   [2,4,6], [3,6,9], [4,6,8],
@@ -6695,11 +6698,12 @@ function digitHuntHash(seedValue, orderValue) {
   return (x >>> 0) / 4294967296;
 }
 
-function digitHuntSpawnDeck(seed, blockIndex, spawnEntries) {
+function digitHuntFullStockDeck(seed, blockIndex, spawnEntries) {
   if (!Array.isArray(spawnEntries) || spawnEntries.length !== DIGIT_HUNT_TARGET_TILE_COUNT) return [];
   const deck = [];
   for (const value of spawnEntries) {
-    for (let copy = 0; copy < DIGIT_HUNT_FINITE_COPIES_PER_TILE; copy += 1) deck.push(Number(value));
+    // Aynı rakam iki hedef üçlüdeyse iki giriş ayrı ayrı 50 kopya üretir.
+    for (let copy = 0; copy < DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY; copy += 1) deck.push(Number(value));
   }
   const blockSeed = (Number(seed) | 0) ^ Math.imul((Number(blockIndex) + 1) | 0, 0x6D2B79F5 | 0);
   for (let i = deck.length - 1; i > 0; i -= 1) {
@@ -6709,19 +6713,52 @@ function digitHuntSpawnDeck(seed, blockIndex, spawnEntries) {
   return deck;
 }
 
-function digitHuntSpawnDigit(seed, spawnIndex, spawnEntries) {
+function digitHuntFiniteSpawnDeck(seed, spawnEntries, initialGrid) {
+  if (!Array.isArray(spawnEntries) || spawnEntries.length !== DIGIT_HUNT_TARGET_TILE_COUNT || !Array.isArray(initialGrid) || initialGrid.length !== DIGIT_HUNT_CELLS) return [];
+  const remaining = new Map();
+  for (const raw of spawnEntries) {
+    const value = Number(raw);
+    remaining.set(value, (remaining.get(value) || 0) + DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY);
+  }
+  for (const raw of initialGrid) {
+    if (raw == null) return [];
+    const value = Number(raw);
+    const left = (remaining.get(value) ?? -1) - 1;
+    if (left < 0) return [];
+    remaining.set(value, left);
+  }
+  const deck = [];
+  for (const value of [...new Set(spawnEntries.map(Number))]) {
+    const count = remaining.get(value) || 0;
+    for (let copy = 0; copy < count; copy += 1) deck.push(value);
+  }
+  if (deck.length !== DIGIT_HUNT_FINITE_SPAWN_LIMIT) return [];
+  const blockSeed = (Number(seed) | 0) ^ (0x13579BDF | 0);
+  for (let i = deck.length - 1; i > 0; i -= 1) {
+    const j = Math.max(0, Math.min(i, Math.floor(digitHuntHash(blockSeed, i + 1) * (i + 1))));
+    [deck[i], deck[j]] = [deck[j], deck[i]];
+  }
+  return deck;
+}
+
+function digitHuntInfiniteSpawnDigit(seed, spawnIndex, spawnEntries) {
   const safeIndex = Math.max(0, Math.floor(Number(spawnIndex) || 0));
-  const block = Math.floor(safeIndex / DIGIT_HUNT_FINITE_SPAWN_LIMIT);
-  const position = safeIndex % DIGIT_HUNT_FINITE_SPAWN_LIMIT;
-  const deck = digitHuntSpawnDeck(seed, block, spawnEntries);
+  const block = Math.floor(safeIndex / DIGIT_HUNT_FINITE_TOTAL_STOCK);
+  const position = safeIndex % DIGIT_HUNT_FINITE_TOTAL_STOCK;
+  const deck = digitHuntFullStockDeck(seed, block, spawnEntries);
   return deck[position] ?? Number(spawnEntries?.[0] || 1);
 }
 
 function digitHuntIsMatchTriple(values, targetGroups) {
   if (!Array.isArray(values) || values.length !== 3 || values.some((v) => !Number.isInteger(Number(v)))) return false;
   if (!Array.isArray(targetGroups) || targetGroups.length !== 2) return false;
-  const sorted = values.map(Number).sort((a,b) => a-b);
-  return targetGroups.some((group) => group.length === 3 && group.every((v, i) => Number(v) === sorted[i]));
+  const actual = values.map(Number);
+  return targetGroups.some((group) => {
+    if (!Array.isArray(group) || group.length !== 3) return false;
+    const forward = group.every((v, i) => Number(v) === actual[i]);
+    const reverse = group.every((v, i) => Number(v) === actual[2 - i]);
+    return forward || reverse;
+  });
 }
 
 function digitHuntFindFirstRun(board, targetGroups) {
@@ -6743,10 +6780,12 @@ function digitHuntFindFirstRun(board, targetGroups) {
   return candidates[0] || null;
 }
 
-function digitHuntCollapseAndRefill(boardRaw, removedIndices, seed, spawnCounterStart, spawnLimit, spawnEntries) {
+function digitHuntCollapseAndRefill(boardRaw, removedIndices, seed, spawnCounterStart, spawnLimit, spawnEntries, initialGrid) {
   const removed = new Set(removedIndices);
   const board = boardRaw.map((v, i) => removed.has(i) ? null : v);
   let spawnCounter = Math.max(0, Number(spawnCounterStart) || 0);
+  const finiteDeck = spawnLimit > 0 ? digitHuntFiniteSpawnDeck(seed, spawnEntries, initialGrid) : null;
+  if (spawnLimit > 0 && (!finiteDeck || finiteDeck.length !== DIGIT_HUNT_FINITE_SPAWN_LIMIT)) return { board, spawnCounter, invalid: true };
   for (let c = 0; c < DIGIT_HUNT_COLS; c += 1) {
     const kept = [];
     for (let r = DIGIT_HUNT_ROWS - 1; r >= 0; r -= 1) { const v = board[r * DIGIT_HUNT_COLS + c]; if (v != null) kept.push(v); }
@@ -6754,7 +6793,11 @@ function digitHuntCollapseAndRefill(boardRaw, removedIndices, seed, spawnCounter
     let writeRow = DIGIT_HUNT_ROWS - 1;
     for (const v of kept) { board[writeRow * DIGIT_HUNT_COLS + c] = v; writeRow -= 1; }
     while (writeRow >= 0 && (spawnLimit <= 0 || spawnCounter < spawnLimit)) {
-      board[writeRow * DIGIT_HUNT_COLS + c] = digitHuntSpawnDigit(seed, spawnCounter, spawnEntries);
+      const nextValue = spawnLimit > 0
+        ? finiteDeck[spawnCounter]
+        : digitHuntInfiniteSpawnDigit(seed, spawnCounter, spawnEntries);
+      if (!Number.isInteger(Number(nextValue))) break;
+      board[writeRow * DIGIT_HUNT_COLS + c] = Number(nextValue);
       spawnCounter += 1; writeRow -= 1;
     }
   }
@@ -6784,7 +6827,7 @@ function digitHuntSwapCreatesMatch(boardRaw, from, to, targetGroups) {
   return digitHuntFindFirstRun(board, targetGroups) != null;
 }
 
-function digitHuntApplyMoveState(state, fromValue, toValue, seed, spawnLimit, targetGroups, spawnEntries) {
+function digitHuntApplyMoveState(state, fromValue, toValue, seed, spawnLimit, targetGroups, spawnEntries, initialGrid) {
   const from = Number(fromValue), to = Number(toValue);
   if (!Number.isInteger(from) || !Number.isInteger(to) || from === to || from < 0 || to < 0 || from >= 81 || to >= 81) return null;
   if (!Array.isArray(state.board) || state.board.length !== 81 || state.board[from] == null) return null;
@@ -6797,7 +6840,9 @@ function digitHuntApplyMoveState(state, fromValue, toValue, seed, spawnLimit, ta
   } else {
     if (!sparse && !digitHuntAdjacent(from, to)) return null;
     [board[from], board[to]] = [board[to], board[from]];
-    if (!digitHuntFindFirstRun(board, targetGroups)) return null;
+    // En az bir boş hücre varsa dolu iki taşın takası koşulsuzdur.
+    // Tahta tamamen doluyken komşuluk + hedef üçlü oluşturma şartı devam eder.
+    if (!sparse && !digitHuntFindFirstRun(board, targetGroups)) return null;
   }
   let score = Math.max(0, Number(state.score) || 0);
   let spawnCounter = Math.max(0, Number(state.spawnCounter) || 0);
@@ -6805,7 +6850,8 @@ function digitHuntApplyMoveState(state, fromValue, toValue, seed, spawnLimit, ta
   let guard = 0;
   while (run && guard < 200) {
     score = Math.min(2_000_000_000, score + run.length * 2);
-    const collapsed = digitHuntCollapseAndRefill(board, run, seed, spawnCounter, spawnLimit, spawnEntries);
+    const collapsed = digitHuntCollapseAndRefill(board, run, seed, spawnCounter, spawnLimit, spawnEntries, initialGrid);
+    if (collapsed.invalid) return null;
     board = collapsed.board; spawnCounter = collapsed.spawnCounter;
     run = digitHuntFindFirstRun(board, targetGroups); guard += 1;
   }
@@ -6823,12 +6869,8 @@ function digitHuntHasLegalMove(board, targetGroups) {
         if (digitHuntEmptyDestinationAllowed(board, destination)) return true;
       }
     }
-    const filled = [];
-    for (let i = 0; i < 81; i += 1) if (board[i] != null) filled.push(i);
-    for (let a = 0; a < filled.length; a += 1) for (let b = a + 1; b < filled.length; b += 1) {
-      if (digitHuntSwapCreatesMatch(board, filled[a], filled[b], targetGroups)) return true;
-    }
-    return false;
+    // En az bir boş hücre varken herhangi iki dolu taş koşulsuz yer değiştirebilir.
+    return board.filter((value) => value != null).length >= 2;
   }
   for (let i = 0; i < 81; i += 1) {
     const r = Math.floor(i / 9), c = i % 9;
@@ -6852,6 +6894,16 @@ function generateDigitHuntPuzzle() {
     const pair = validPairs[secureRandomInt(0, validPairs.length)];
     const targetGroups = [pair[0].slice(), pair[1].slice()];
     const spawnEntries = [...targetGroups[0], ...targetGroups[1]];
+    // Altı grup girdisinin her biri 50 adetlik ayrı kota taşır. Ortak rakam varsa fiziksel
+    // olarak aynı değer iki kotadan da geldiği için toplamda 100 adet bulunabilir.
+    const stock = [];
+    for (const value of spawnEntries) {
+      for (let copy = 0; copy < DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY; copy += 1) stock.push(value);
+    }
+    for (let i = stock.length - 1; i > 0; i -= 1) {
+      const j = secureRandomInt(0, i + 1);
+      [stock[i], stock[j]] = [stock[j], stock[i]];
+    }
     const board = [];
     function createsMatchAt(index, value) {
       const row = Math.floor(index / 9), col = index % 9;
@@ -6859,13 +6911,21 @@ function generateDigitHuntPuzzle() {
       if (row >= 2 && digitHuntIsMatchTriple([board[index - 18], board[index - 9], value], targetGroups)) return true;
       return false;
     }
-    for (let i = 0; i < 81; i += 1) {
-      let placed = false;
-      for (let t = 0; t < 80 && !placed; t += 1) {
-        const value = spawnEntries[secureRandomInt(0, spawnEntries.length)];
-        if (!createsMatchAt(i, value)) { board.push(value); placed = true; }
+    for (let i = 0; i < DIGIT_HUNT_CELLS; i += 1) {
+      let chosen = -1;
+      // Önce rastgele adaylar, gerekirse kalan stok üzerinde doğrusal arama.
+      for (let t = 0; t < 80 && chosen < 0; t += 1) {
+        const candidateIndex = secureRandomInt(i, stock.length);
+        if (!createsMatchAt(i, stock[candidateIndex])) chosen = candidateIndex;
       }
-      if (!placed) { board.length = 0; break; }
+      if (chosen < 0) {
+        for (let candidateIndex = i; candidateIndex < stock.length; candidateIndex += 1) {
+          if (!createsMatchAt(i, stock[candidateIndex])) { chosen = candidateIndex; break; }
+        }
+      }
+      if (chosen < 0) { board.length = 0; break; }
+      [stock[i], stock[chosen]] = [stock[chosen], stock[i]];
+      board.push(stock[i]);
     }
     if (board.length === 81 && digitHuntFindFirstRun(board, targetGroups) == null && digitHuntHasLegalMove(board, targetGroups)) {
       return {
@@ -6891,6 +6951,7 @@ function digitHuntEncodingValid(puzzle) {
     Number.isInteger(spawnLimit) && (spawnLimit === 0 || spawnLimit === DIGIT_HUNT_FINITE_SPAWN_LIMIT) &&
     Array.isArray(targetGroups) && Array.isArray(spawnEntries) && spawnEntries.length === 6 &&
     board.length === 81 && board.every((v) => Number.isInteger(v) && spawnEntries.includes(v)) &&
+    (spawnLimit === 0 || digitHuntFiniteSpawnDeck(seed, spawnEntries, board).length === DIGIT_HUNT_FINITE_SPAWN_LIMIT) &&
     digitHuntFindFirstRun(board, targetGroups) == null;
 }
 
@@ -6903,10 +6964,11 @@ function replayDigitHunt(puzzle, answer = {}) {
   const spawnLimit = Number(numbers[1]);
   const targetGroups = digitHuntTargetGroupsFromNumbers(numbers);
   const spawnEntries = digitHuntSpawnEntriesFromNumbers(numbers);
-  let state = { board: puzzle.initialGrid.map(Number), score: 0, spawnCounter: 0 };
+  const initialGrid = puzzle.initialGrid.map(Number);
+  let state = { board: initialGrid.slice(), score: 0, spawnCounter: 0 };
   for (const move of moves) {
     if (!Array.isArray(move) || move.length !== 2) return null;
-    const next = digitHuntApplyMoveState(state, Number(move[0]), Number(move[1]), seed, spawnLimit, targetGroups, spawnEntries);
+    const next = digitHuntApplyMoveState(state, Number(move[0]), Number(move[1]), seed, spawnLimit, targetGroups, spawnEntries, initialGrid);
     if (!next) return null;
     state = next;
   }
