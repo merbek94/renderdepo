@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "digit-hunt-stock300-ordered-sparse-swap-v14-20260907";
+const SERVER_BUILD_ID = "merge3-digit5-wrong5-v12-20260908";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -87,13 +87,6 @@ const playGamesAuthRateLimit = createHttpRateLimiter({
   maxRequests: Math.max(5, Math.min(120, Number(process.env.PLAY_GAMES_AUTH_RATE_LIMIT_10M || 40) || 40)),
   windowMs: 10 * 60_000,
 });
-const integrityGateRateLimit = createHttpRateLimiter({
-  scope: "play-integrity-access-gate",
-  // Endpoint girişten önce çağrıldığı için oturum tokenı gerektirmez; genel limiter'a ek
-  // olarak IP bazlı ikinci bir kapı Google decode kotasını kötüye kullanımdan korur.
-  maxRequests: Math.max(20, Math.min(600, Number(process.env.PLAY_INTEGRITY_RATE_LIMIT_PER_MINUTE || 120) || 120)),
-  windowMs: 60_000,
-});
 const gameplayAcquireRateLimit = createHttpRateLimiter({
   scope: "game-session-acquire",
   maxRequests: Math.max(10, Math.min(240, Number(process.env.GAME_SESSION_ACQUIRE_RATE_LIMIT_PER_MINUTE || 60) || 60)),
@@ -152,25 +145,6 @@ const GOOGLE_WEB_CLIENT_SECRET = process.env.GOOGLE_WEB_CLIENT_SECRET || "";
 const PLAY_GAMES_APP_ID = process.env.PLAY_GAMES_APP_ID || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 24 * 60 * 60);
-
-// Play Integrity App Access Risk yapılandırması. Cloud Project Number istemciye verilebilir;
-// service-account JSON ise YALNIZ sunucuda kalır ve hiçbir endpoint tarafından dışarı verilmez.
-const PLAY_INTEGRITY_PACKAGE_NAME = String(
-  process.env.PLAY_INTEGRITY_PACKAGE_NAME || "com.example.myapplication"
-).trim();
-const PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER = String(
-  process.env.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER || ""
-).trim();
-const PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON = String(
-  process.env.PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON || ""
-).trim();
-const PLAY_INTEGRITY_REQUEST_MAX_AGE_MS = Math.max(
-  30_000,
-  Math.min(10 * 60_000, Number(process.env.PLAY_INTEGRITY_REQUEST_MAX_AGE_MS || 2 * 60_000) || 2 * 60_000)
-);
-const PLAY_INTEGRITY_SCOPE = "https://www.googleapis.com/auth/playintegrity";
-const GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
-
 // Gameplay heartbeat yoktur. Aktif oyun kilidi yalnız oyun başlangıcı/bitimi ve zaten var olan
 // authoritative HTTP/Socket trafiğiyle yönetilir. Aynı cihaz yeni sessionId alırsa newest-wins;
 // farklı cihazdaki süresi dolmamış aktif oyun ise yeni acquire isteğini engeller.
@@ -314,167 +288,6 @@ function getJsonWithBearer(urlString, accessToken) {
     request.on("error", reject);
     request.end();
   });
-}
-
-let playIntegrityServiceAccountCache = null;
-let playIntegrityAccessTokenCache = null;
-
-function readPlayIntegrityServiceAccount() {
-  if (playIntegrityServiceAccountCache) return playIntegrityServiceAccountCache;
-  if (!PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON) {
-    const error = new Error("PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON tanımlı değil.");
-    error.statusCode = 503;
-    error.publicCode = "PLAY_INTEGRITY_NOT_CONFIGURED";
-    throw error;
-  }
-
-  let raw = PLAY_INTEGRITY_SERVICE_ACCOUNT_JSON;
-  if (!raw.trim().startsWith("{")) {
-    try {
-      raw = Buffer.from(raw, "base64").toString("utf8");
-    } catch (_) {
-      raw = "";
-    }
-  }
-
-  let credentials;
-  try {
-    credentials = JSON.parse(raw);
-  } catch (_) {
-    const error = new Error("Play Integrity service-account JSON okunamadı.");
-    error.statusCode = 503;
-    error.publicCode = "PLAY_INTEGRITY_BAD_SERVICE_ACCOUNT";
-    throw error;
-  }
-
-  const clientEmail = String(credentials.client_email || "").trim();
-  const privateKey = String(credentials.private_key || "").replace(/\\n/g, "\n").trim();
-  const tokenUri = String(credentials.token_uri || GOOGLE_OAUTH_TOKEN_URL).trim() || GOOGLE_OAUTH_TOKEN_URL;
-  if (!clientEmail || !privateKey.includes("BEGIN PRIVATE KEY")) {
-    const error = new Error("Play Integrity service-account client_email/private_key eksik.");
-    error.statusCode = 503;
-    error.publicCode = "PLAY_INTEGRITY_BAD_SERVICE_ACCOUNT";
-    throw error;
-  }
-
-  playIntegrityServiceAccountCache = { clientEmail, privateKey, tokenUri };
-  return playIntegrityServiceAccountCache;
-}
-
-function signServiceAccountJwt(credentials) {
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const header = base64UrlEncode(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const payload = base64UrlEncode(JSON.stringify({
-    iss: credentials.clientEmail,
-    scope: PLAY_INTEGRITY_SCOPE,
-    aud: credentials.tokenUri,
-    iat: nowSeconds,
-    exp: nowSeconds + 55 * 60,
-  }));
-  const unsigned = `${header}.${payload}`;
-  const signer = crypto.createSign("RSA-SHA256");
-  signer.update(unsigned);
-  signer.end();
-  const signature = signer.sign(credentials.privateKey).toString("base64url");
-  return `${unsigned}.${signature}`;
-}
-
-async function getPlayIntegrityAccessToken() {
-  const now = Date.now();
-  if (
-    playIntegrityAccessTokenCache &&
-    playIntegrityAccessTokenCache.accessToken &&
-    playIntegrityAccessTokenCache.expiresAtMillis > now + 60_000
-  ) {
-    return playIntegrityAccessTokenCache.accessToken;
-  }
-
-  const credentials = readPlayIntegrityServiceAccount();
-  const assertion = signServiceAccountJwt(credentials);
-  const tokenJson = await postFormJson(credentials.tokenUri, {
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    assertion,
-  });
-  const accessToken = String(tokenJson.access_token || "").trim();
-  if (!accessToken) {
-    const error = new Error("Play Integrity için Google erişim jetonu alınamadı.");
-    error.statusCode = 503;
-    error.publicCode = "PLAY_INTEGRITY_OAUTH_FAILED";
-    throw error;
-  }
-
-  const expiresInSeconds = Math.max(60, Number(tokenJson.expires_in || 3600) || 3600);
-  playIntegrityAccessTokenCache = {
-    accessToken,
-    expiresAtMillis: now + expiresInSeconds * 1000,
-  };
-  return accessToken;
-}
-
-function postJsonWithBearer(urlString, accessToken, body, timeoutMs = 20_000) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlString);
-    const payload = Buffer.from(JSON.stringify(body || {}), "utf8");
-    const request = https.request({
-      hostname: url.hostname,
-      port: 443,
-      path: `${url.pathname}${url.search}`,
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/json",
-        "Content-Type": "application/json; charset=utf-8",
-        "Content-Length": payload.length,
-      },
-      timeout: timeoutMs,
-    }, (response) => {
-      let text = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk) => { text += chunk; });
-      response.on("end", () => {
-        let json;
-        try { json = JSON.parse(text || "{}"); } catch (_) { json = {}; }
-        const statusCode = response.statusCode || 500;
-        if (statusCode < 200 || statusCode >= 300) {
-          const error = new Error(
-            json.error?.message || json.message || `Google Play Integrity HTTP ${statusCode}`
-          );
-          error.statusCode = statusCode >= 500 ? 503 : 502;
-          error.publicCode = "PLAY_INTEGRITY_DECODE_FAILED";
-          reject(error);
-          return;
-        }
-        resolve(json);
-      });
-    });
-    request.on("timeout", () => request.destroy(new Error("Play Integrity doğrulaması zaman aşımına uğradı.")));
-    request.on("error", reject);
-    request.end(payload);
-  });
-}
-
-async function decodePlayIntegrityToken(integrityToken) {
-  if (!PLAY_INTEGRITY_PACKAGE_NAME) {
-    const error = new Error("PLAY_INTEGRITY_PACKAGE_NAME tanımlı değil.");
-    error.statusCode = 503;
-    error.publicCode = "PLAY_INTEGRITY_NOT_CONFIGURED";
-    throw error;
-  }
-  const accessToken = await getPlayIntegrityAccessToken();
-  const url = `https://playintegrity.googleapis.com/v1/${encodeURIComponent(PLAY_INTEGRITY_PACKAGE_NAME)}:decodeIntegrityToken`;
-  return postJsonWithBearer(url, accessToken, { integrity_token: integrityToken });
-}
-
-function playIntegrityRequestHash(requestId) {
-  return crypto
-    .createHash("sha256")
-    .update(`play-integrity-access-v1:${requestId}`, "utf8")
-    .digest("base64url");
-}
-
-function parseIntegrityTimestampMillis(value) {
-  const parsed = Number(value || 0);
-  return Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
 }
 
 async function exchangePlayGamesAuthCode(authCode) {
@@ -5421,63 +5234,76 @@ function merge5120Hash(seedValue, orderValue) {
   return (x >>> 0) / 4294967296;
 }
 
-function merge5120Tile(seed, orderValue) {
+function merge5120AllowedValues(minValue, maxValue) {
+  const result = [];
+  for (let value = 3; value <= maxValue && value <= 2_000_000_000; value *= 3) {
+    if (value >= minValue) result.push(value);
+    if (value > Math.floor(2_000_000_000 / 3)) break;
+  }
+  return result;
+}
+
+function merge5120HighestTile(board) {
+  const values = board.filter((v) => v != null).map(Number);
+  return values.length ? Math.max(...values) : 3;
+}
+
+function merge5120SpawnBounds(board) {
+  const highest = merge5120HighestTile(board);
+  if (highest <= 243) return [3, 27];
+  if (highest < 2187) return [3, 81];
+  return [Math.max(3, Math.floor(highest / 243)), Math.max(3, Math.floor(highest / 9))];
+}
+
+function merge5120TopValues(board) {
+  const result = [];
+  for (let col = 0; col < MERGE_5120_COLS; col += 1) {
+    for (let row = 0; row < MERGE_5120_ROWS; row += 1) {
+      const value = board[row * MERGE_5120_COLS + col];
+      if (value != null) { result.push(Number(value)); break; }
+    }
+  }
+  return result;
+}
+
+function merge5120Tile(seed, orderValue, board) {
   const order = Math.max(1, Math.floor(Number(orderValue) || 1));
-  if (order <= 12) {
-    const values = [2, 3, 4, 6];
-    return values[Math.min(values.length - 1, Math.floor(merge5120Hash(seed, order) * values.length))];
-  }
-  let groups;
-  let multiplier = 1;
-  if (order <= 39) {
-    groups = [[[2, 3], 17.5], [[4, 6], 12.5], [[8, 12], 35], [[16, 24], 22.5], [[32, 48], 12.5]];
-  } else if (order <= 97) {
-    groups = [[[2, 3], 20], [[4, 6], 15], [[8, 12], 10], [[16, 24], 15], [[32, 48], 15], [[64, 96], 25]];
-  } else {
-    groups = [[[4, 6], 25], [[8, 12], 40], [[16, 24], 5], [[32, 48], 10], [[64, 96], 5], [[128, 192], 8], [[256, 384], 7]];
-    if (order > 200) {
-      let upper = 400;
-      let shift = 1;
-      while (order > upper && upper < 0x3fffffff) { upper *= 2; shift += 1; }
-      multiplier = 2 ** Math.min(20, shift);
-    }
-  }
-  const r = merge5120Hash(seed, order) * 100;
-  let cursor = 0;
-  let pair = groups[groups.length - 1][0];
-  for (const [candidate, weight] of groups) {
-    cursor += weight;
-    if (r < cursor) { pair = candidate; break; }
-  }
-  const pairPick = merge5120Hash((Number(seed) | 0) ^ (0x5A17C9E3 | 0), order);
-  const base = pairPick < 0.5 ? pair[0] : pair[1];
-  return Math.min(2_000_000_000, base * multiplier);
+  if (order <= 10) return merge5120Hash(seed, order) < 0.60 ? 3 : 9;
+  const [minValue, maxValue] = merge5120SpawnBounds(board);
+  const allowedRaw = merge5120AllowedValues(minValue, maxValue);
+  const allowed = allowedRaw.length ? allowedRaw : [Math.max(3, minValue)];
+  const topValues = merge5120TopValues(board);
+  const topAllowed = topValues.filter((v) => allowed.includes(v));
+  const chooseSame = merge5120Hash((Number(seed) | 0) ^ (0x13579BDF | 0), order) < 0.80;
+  const pick = (values, salt) => values[Math.min(values.length - 1, Math.floor(merge5120Hash((Number(seed) | 0) ^ (salt | 0), order) * values.length))];
+  if (chooseSame && topAllowed.length) return pick(topAllowed, 0x02468ACE);
+  const topSet = new Set(topValues);
+  const different = allowed.filter((v) => !topSet.has(v));
+  if (different.length) return pick(different, 0x5A17C9E3);
+  if (topAllowed.length) return pick(topAllowed, 0x31415926);
+  return pick(allowed, 0x27182818);
 }
 
-function merge5120FamilyLevel(value) {
-  const safe = Math.floor(Number(value) || 0);
-  if (safe <= 0) return null;
-  for (const family of [2, 3, 5]) {
-    let current = family;
-    let level = 0;
-    while (current > 0 && current <= safe && level <= 30) {
-      if (current === safe) return { family, level };
-      current *= 2;
-      level += 1;
+function merge5120ConnectedSame(board, startIndex, value) {
+  if (startIndex < 0 || startIndex >= board.length || Number(board[startIndex]) !== Number(value)) return [];
+  const queue = [startIndex];
+  const seen = new Set([startIndex]);
+  while (queue.length) {
+    const index = queue.shift();
+    const row = Math.floor(index / MERGE_5120_COLS), col = index % MERGE_5120_COLS;
+    const neighbors = [
+      row < MERGE_5120_ROWS - 1 ? index + MERGE_5120_COLS : -1,
+      col > 0 ? index - 1 : -1,
+      col < MERGE_5120_COLS - 1 ? index + 1 : -1,
+      row > 0 ? index - MERGE_5120_COLS : -1,
+    ];
+    for (const next of neighbors) {
+      if (next >= 0 && !seen.has(next) && Number(board[next]) === Number(value)) {
+        seen.add(next); queue.push(next);
+      }
     }
   }
-  return null;
-}
-
-function merge5120CombinedValue(first, second) {
-  const a = merge5120FamilyLevel(first);
-  const b = merge5120FamilyLevel(second);
-  if (!a || !b || a.level !== b.level) return null;
-  if (a.family === b.family) return Math.min(2_000_000_000, Number(first) * 2);
-  if ((a.family === 2 && b.family === 3) || (a.family === 3 && b.family === 2)) {
-    return Math.min(2_000_000_000, 5 * (2 ** Math.min(30, a.level)));
-  }
-  return null;
+  return Array.from(seen);
 }
 
 function merge5120Gravity(board) {
@@ -5505,34 +5331,17 @@ function merge5120DropState(state, seed, columnValue) {
   if (currentRow < 0) return null;
 
   const currentCol = column;
-  let currentValue = merge5120Tile(seed, state.moves.length + 1);
+  let currentValue = merge5120Tile(seed, state.moves.length + 1, board);
   board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
   let score = Math.max(0, Number(state.score || 0));
 
-  // Yeni düşen/birleşmeden doğan taşın koordinatını açıkça takip et. Sütunda aynı değerde
-  // başka taş bulunması zincirin yanlış taş üzerinden devam etmesine yol açmamalı.
   for (let chain = 0; chain < 32; chain += 1) {
     const currentIndex = currentRow * MERGE_5120_COLS + currentCol;
-    const neighbors = [
-      [currentRow + 1, currentCol],
-      [currentRow, currentCol - 1],
-      [currentRow, currentCol + 1],
-      [currentRow - 1, currentCol],
-    ];
-    let match = null;
-    for (const [nr, nc] of neighbors) {
-      if (nr < 0 || nr >= MERGE_5120_ROWS || nc < 0 || nc >= MERGE_5120_COLS) continue;
-      const otherIndex = nr * MERGE_5120_COLS + nc;
-      if (board[otherIndex] == null) continue;
-      const merged = merge5120CombinedValue(currentValue, board[otherIndex]);
-      if (merged != null) { match = { otherIndex, merged }; break; }
-    }
-    if (!match) break;
-
-    board[currentIndex] = null;
-    board[match.otherIndex] = null;
+    const connected = merge5120ConnectedSame(board, currentIndex, currentValue);
+    if (connected.length < 3) break;
+    connected.slice(0, 3).forEach((index) => { board[index] = null; });
     merge5120Gravity(board);
-    currentValue = match.merged;
+    currentValue = Math.min(2_000_000_000, currentValue * 3);
     score = Math.min(2_000_000_000, score + currentValue);
 
     currentRow = -1;
@@ -5547,113 +5356,17 @@ function merge5120DropState(state, seed, columnValue) {
   return { board, moves: state.moves.concat(column), score };
 }
 
-function merge5120SwapAvailable(state, afterMove) {
-  const milestone = Number(afterMove);
-  return state && Number.isInteger(milestone) && milestone > 0 && milestone % 10 === 0 &&
-    state.moves.length === milestone && !state.usedSwapMilestones?.has(milestone);
-}
-
-function merge5120FindFirstMergePair(board) {
-  if (!Array.isArray(board) || board.length !== MERGE_5120_CELLS) return null;
-  for (let index = 0; index < board.length; index += 1) {
-    const value = board[index];
-    if (value == null) continue;
-    const row = Math.floor(index / MERGE_5120_COLS);
-    const col = index % MERGE_5120_COLS;
-    const candidates = [];
-    if (col + 1 < MERGE_5120_COLS) candidates.push(index + 1);
-    if (row + 1 < MERGE_5120_ROWS) candidates.push(index + MERGE_5120_COLS);
-    for (const otherIndex of candidates) {
-      const other = board[otherIndex];
-      if (other == null) continue;
-      const merged = merge5120CombinedValue(value, other);
-      if (merged != null) return [index, otherIndex, merged];
-    }
-  }
-  return null;
-}
-
-function merge5120ResolveAfterSwap(boardRaw, scoreStart) {
-  const board = boardRaw.slice();
-  let score = Math.max(0, Math.floor(Number(scoreStart) || 0));
-  let guard = 0;
-  while (guard < 96) {
-    const pair = merge5120FindFirstMergePair(board);
-    if (!pair) break;
-    const [anchorIndex, otherIndex, mergedValue] = pair;
-    const anchorCol = anchorIndex % MERGE_5120_COLS;
-    board[anchorIndex] = null;
-    board[otherIndex] = null;
-    merge5120Gravity(board);
-    let targetRow = -1;
-    for (let row = MERGE_5120_ROWS - 1; row >= 0; row -= 1) {
-      if (board[row * MERGE_5120_COLS + anchorCol] == null) { targetRow = row; break; }
-    }
-    if (targetRow < 0) break;
-    board[targetRow * MERGE_5120_COLS + anchorCol] = mergedValue;
-    score = Math.min(2_000_000_000, score + mergedValue);
-    guard += 1;
-  }
-  merge5120Gravity(board);
-  return { board, score };
-}
-
-function merge5120ApplySwapState(state, afterMoveValue, fromValue, toValue) {
-  const afterMove = Number(afterMoveValue);
-  const from = Number(fromValue);
-  const to = Number(toValue);
-  if (!merge5120SwapAvailable(state, afterMove)) return null;
-  if (!Number.isInteger(from) || !Number.isInteger(to) || from === to ||
-      from < 0 || to < 0 || from >= MERGE_5120_CELLS || to >= MERGE_5120_CELLS) return null;
-  if (state.board[from] == null || state.board[to] == null) return null;
-  const swapped = state.board.slice();
-  [swapped[from], swapped[to]] = [swapped[to], swapped[from]];
-  const settled = merge5120ResolveAfterSwap(swapped, state.score);
-  const usedSwapMilestones = new Set(state.usedSwapMilestones || []);
-  usedSwapMilestones.add(afterMove);
-  const swaps = Array.isArray(state.swaps) ? state.swaps.concat([[afterMove, from, to]]) : [[afterMove, from, to]];
-  return { ...state, board: settled.board, score: settled.score, swaps, usedSwapMilestones };
-}
-
-function normalizeMerge5120Swaps(answer = {}) {
-  const raw = Array.isArray(answer?.swaps) ? answer.swaps : [];
-  if (raw.length > Math.ceil(MERGE_5120_MOVE_CAP / 10)) return null;
-  const swaps = [];
-  const milestones = new Set();
-  for (const item of raw) {
-    if (!Array.isArray(item) || item.length !== 3) return null;
-    const afterMove = Number(item[0]), from = Number(item[1]), to = Number(item[2]);
-    if (!Number.isInteger(afterMove) || afterMove <= 0 || afterMove % 10 !== 0 || milestones.has(afterMove)) return null;
-    if (!Number.isInteger(from) || !Number.isInteger(to) || from === to || from < 0 || to < 0 || from >= MERGE_5120_CELLS || to >= MERGE_5120_CELLS) return null;
-    milestones.add(afterMove);
-    swaps.push([afterMove, from, to]);
-  }
-  swaps.sort((a, b) => a[0] - b[0]);
-  return swaps;
-}
-
 function replayMerge5120(puzzle, answer = {}) {
   const seed = Number(puzzle?.numbers?.[0]);
   const moves = Array.isArray(answer?.moves) ? answer.moves : [];
-  const swaps = normalizeMerge5120Swaps(answer);
-  if (!Number.isInteger(seed) || moves.length > MERGE_5120_MOVE_CAP || swaps == null) return null;
-  let state = { board: Array(MERGE_5120_CELLS).fill(null), moves: [], score: 0, swaps: [], usedSwapMilestones: new Set() };
-  let swapIndex = 0;
+  if (!Number.isInteger(seed) || moves.length > MERGE_5120_MOVE_CAP) return null;
+  let state = { board: Array(MERGE_5120_CELLS).fill(null), moves: [], score: 0 };
   for (const move of moves) {
     if (!Number.isInteger(Number(move))) return null;
     const next = merge5120DropState(state, seed, Number(move));
     if (!next) return null;
-    state = { ...next, swaps: state.swaps, usedSwapMilestones: state.usedSwapMilestones };
-    while (swapIndex < swaps.length && swaps[swapIndex][0] === state.moves.length) {
-      const swap = swaps[swapIndex];
-      const swapped = merge5120ApplySwapState(state, swap[0], swap[1], swap[2]);
-      if (!swapped) return null;
-      state = swapped;
-      swapIndex += 1;
-    }
-    if (swapIndex < swaps.length && swaps[swapIndex][0] < state.moves.length) return null;
+    state = next;
   }
-  if (swapIndex !== swaps.length) return null;
   return state;
 }
 
@@ -6551,44 +6264,32 @@ const WRONG_NUMBERS_DIVIDE = 3;
 
 function wrongNumbersEvaluateFlat(values, operators) {
   if (!Array.isArray(values) || values.length === 0 || operators.length !== values.length - 1) return null;
-  const nums = values.map(Number);
-  const ops = operators.map(Number);
+  const nums = values.map(Number), ops = operators.map(Number);
   if (nums.some((n) => !Number.isFinite(n))) return null;
-  const workNums = [nums[0]];
-  const workOps = [];
+  const workNums = [nums[0]], workOps = [];
   for (let i = 0; i < ops.length; i += 1) {
-    const op = ops[i];
-    const right = nums[i + 1];
+    const op = ops[i], right = nums[i + 1];
     if (op === WRONG_NUMBERS_MULTIPLY || op === WRONG_NUMBERS_DIVIDE) {
       const left = workNums.pop();
       if (op === WRONG_NUMBERS_DIVIDE && Math.abs(right) < 1e-12) return null;
       workNums.push(op === WRONG_NUMBERS_MULTIPLY ? left * right : left / right);
-    } else {
-      workOps.push(op);
-      workNums.push(right);
-    }
+    } else { workOps.push(op); workNums.push(right); }
   }
   let result = workNums[0];
-  for (let i = 0; i < workOps.length; i += 1) {
-    result = workOps[i] === WRONG_NUMBERS_PLUS ? result + workNums[i + 1] : result - workNums[i + 1];
-  }
+  for (let i = 0; i < workOps.length; i += 1) result = workOps[i] === WRONG_NUMBERS_PLUS ? result + workNums[i + 1] : result - workNums[i + 1];
   return Number.isFinite(result) ? result : null;
 }
 
 function wrongNumbersEvaluate(values, operators, parenStart) {
-  if (!Array.isArray(values) || values.length !== WRONG_NUMBERS_COUNT || !Array.isArray(operators) || operators.length !== WRONG_NUMBERS_COUNT - 1) return null;
-  if (!Number.isInteger(parenStart) || parenStart < 0 || parenStart >= WRONG_NUMBERS_COUNT - 1) return null;
+  if (!Array.isArray(values) || values.length !== WRONG_NUMBERS_COUNT || !Array.isArray(operators) || operators.length !== 4) return null;
+  if (!Number.isInteger(parenStart) || parenStart < 0 || parenStart > 3) return null;
   const innerOp = operators[parenStart];
   if (innerOp !== WRONG_NUMBERS_PLUS && innerOp !== WRONG_NUMBERS_MINUS) return null;
-  const inner = innerOp === WRONG_NUMBERS_PLUS
-    ? values[parenStart] + values[parenStart + 1]
-    : values[parenStart] - values[parenStart + 1];
+  const inner = innerOp === WRONG_NUMBERS_PLUS ? values[parenStart] + values[parenStart + 1] : values[parenStart] - values[parenStart + 1];
   if (!(inner > 0)) return null;
-  const collapsedValues = [];
-  const collapsedOps = [];
+  const collapsedValues = [], collapsedOps = [];
   for (let i = 0; i < values.length; i += 1) {
-    if (i === parenStart) { collapsedValues.push(inner); i += 1; continue; }
-    collapsedValues.push(values[i]);
+    if (i === parenStart) { collapsedValues.push(inner); i += 1; } else collapsedValues.push(values[i]);
   }
   for (let i = 0; i < operators.length; i += 1) if (i !== parenStart) collapsedOps.push(operators[i]);
   return wrongNumbersEvaluateFlat(collapsedValues, collapsedOps);
@@ -6597,26 +6298,19 @@ function wrongNumbersEvaluate(values, operators, parenStart) {
 function wrongNumbersEncodingValid(puzzle) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
-  const operatorCount = WRONG_NUMBERS_COUNT - 1;
-  const expectedEncoding = WRONG_NUMBERS_COUNT + operatorCount + 1;
-  if (numbers.length !== expectedEncoding || initialGrid.length !== WRONG_NUMBERS_COUNT) return false;
+  if (numbers.length !== 10 || initialGrid.length !== WRONG_NUMBERS_COUNT) return false;
   const values = numbers.slice(0, WRONG_NUMBERS_COUNT);
-  const operators = numbers.slice(WRONG_NUMBERS_COUNT, WRONG_NUMBERS_COUNT + operatorCount);
-  const parenStart = numbers[expectedEncoding - 1];
+  const operators = numbers.slice(WRONG_NUMBERS_COUNT, WRONG_NUMBERS_COUNT + 4);
+  const parenStart = numbers[9];
   if (values.some((v) => !Number.isInteger(v) || v < 2 || v > 15) || new Set(values).size !== WRONG_NUMBERS_COUNT) return false;
   if (operators.some((v) => !Number.isInteger(v) || v < 0 || v > 3)) return false;
-  if (!Number.isInteger(parenStart) || ![0, operatorCount - 1].includes(parenStart)) return false;
-  if (![WRONG_NUMBERS_PLUS, WRONG_NUMBERS_MINUS].includes(operators[parenStart])) return false;
-  // Parantez yalnız ifadenin başında/sonunda bulunur; böylece dışarıdaki tek bir sayıyla
-  // doğrudan × veya ÷ bağlantısı kurar ve iki taraftan aynı anda çarpma/bölme alamaz.
+  if (!Number.isInteger(parenStart) || parenStart < 0 || parenStart > 3 || ![0,1].includes(operators[parenStart])) return false;
   const touching = [];
   if (parenStart > 0) touching.push(operators[parenStart - 1]);
   if (parenStart + 1 < operators.length) touching.push(operators[parenStart + 1]);
-  if (touching.length !== 1 || ![WRONG_NUMBERS_MULTIPLY, WRONG_NUMBERS_DIVIDE].includes(touching[0])) return false;
+  if (touching.filter((op) => op === WRONG_NUMBERS_MULTIPLY || op === WRONG_NUMBERS_DIVIDE).length !== 1) return false;
   if (initialGrid.filter((v) => v == null).length !== 1) return false;
-  for (let i = 0; i < WRONG_NUMBERS_COUNT; i += 1) {
-    if (initialGrid[i] != null && Number(initialGrid[i]) !== values[i]) return false;
-  }
+  for (let i = 0; i < WRONG_NUMBERS_COUNT; i += 1) if (initialGrid[i] != null && Number(initialGrid[i]) !== values[i]) return false;
   const result = wrongNumbersEvaluate(values, operators, parenStart);
   return Number.isFinite(result) && Math.abs(result - Math.round(result)) < 1e-8 && Math.round(result) === Number(puzzle.target) && result >= 1 && result <= 100;
 }
@@ -6624,22 +6318,20 @@ function wrongNumbersEncodingValid(puzzle) {
 function generateWrongNumbersPuzzle() {
   for (let attempt = 0; attempt < 8000; attempt += 1) {
     const pool = Array.from({ length: 14 }, (_, i) => i + 2);
-    for (let i = pool.length - 1; i > 0; i -= 1) {
-      const j = secureRandomInt(0, i + 1); [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
+    for (let i = pool.length - 1; i > 0; i -= 1) { const j = secureRandomInt(0, i + 1); [pool[i], pool[j]] = [pool[j], pool[i]]; }
     const values = pool.slice(0, WRONG_NUMBERS_COUNT);
-    // Parantez başta veya sonda olur. Parantezli sonuç yalnız bir dış sayıyla doğrudan bağlantılıdır.
-    const parenStart = secureRandomInt(0, 2) === 0 ? 0 : WRONG_NUMBERS_COUNT - 2;
-    const operators = Array.from({ length: WRONG_NUMBERS_COUNT - 1 }, () => secureRandomInt(0, 4));
+    const parenStart = secureRandomInt(1, 3); // 1 veya 2: parantezin iki yanında da dış işlem var.
+    const operators = Array.from({ length: 4 }, () => secureRandomInt(0, 4));
     operators[parenStart] = secureRandomInt(0, 2);
-    const touchingIndex = parenStart === 0 ? 1 : parenStart - 1;
-    operators[touchingIndex] = secureRandomInt(2, 4);
+    const multSideLeft = secureRandomInt(0, 2) === 0;
+    operators[multSideLeft ? parenStart - 1 : parenStart + 1] = secureRandomInt(2, 4);
+    operators[multSideLeft ? parenStart + 1 : parenStart - 1] = secureRandomInt(0, 2);
     const result = wrongNumbersEvaluate(values, operators, parenStart);
     if (!Number.isFinite(result) || Math.abs(result - Math.round(result)) > 1e-8) continue;
     const target = Math.round(result);
     if (target < 1 || target > 100) continue;
-    const blankIndex = secureRandomInt(0, WRONG_NUMBERS_COUNT);
-    const initialGrid = values.map((value, index) => index === blankIndex ? null : value);
+    const missingIndex = secureRandomInt(0, WRONG_NUMBERS_COUNT);
+    const initialGrid = values.map((value, index) => index === missingIndex ? null : value);
     const puzzle = { difficulty: "Standard", target, numbers: [...values, ...operators, parenStart], gameKey: "wrong_numbers", initialGrid };
     if (wrongNumbersEncodingValid(puzzle)) return puzzle;
   }
@@ -6656,319 +6348,190 @@ function validateWrongNumbersAnswer(puzzle, answer = {}) {
 const DIGIT_HUNT_ROWS = 9;
 const DIGIT_HUNT_COLS = 9;
 const DIGIT_HUNT_CELLS = 81;
-const DIGIT_HUNT_TARGET_TILE_COUNT = 6;
-// Normal modun toplam stoğu başlangıçtaki 81 hücre dahil 300 taştır.
-// Ortak rakam iki hedef grupta da yer alıyorsa iki ayrı grup girdisi olarak 50 + 50 sayılır.
-const DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY = 50;
-const DIGIT_HUNT_FINITE_TOTAL_STOCK = DIGIT_HUNT_TARGET_TILE_COUNT * DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY;
-const DIGIT_HUNT_FINITE_SPAWN_LIMIT = DIGIT_HUNT_FINITE_TOTAL_STOCK - DIGIT_HUNT_CELLS;
-const DIGIT_HUNT_CANDIDATE_GROUPS = Object.freeze([
-  [1,2,3], [2,3,4], [3,4,5], [4,5,6], [5,6,7], [6,7,8], [7,8,9],
-  [2,4,6], [3,6,9], [4,6,8],
-].map((group) => Object.freeze(group)));
+const DIGIT_HUNT_TOTAL_TILES = 250;
+const DIGIT_HUNT_PER_DIGIT = 50;
+const DIGIT_HUNT_FINITE_SPAWNS = DIGIT_HUNT_TOTAL_TILES - DIGIT_HUNT_CELLS;
 
-function digitHuntCandidateTriple(values) {
-  if (!Array.isArray(values) || values.length !== 3) return false;
-  const sorted = values.map(Number).sort((a,b) => a-b);
-  if (sorted.some((v) => !Number.isInteger(v) || v < 1 || v > 9) || new Set(sorted).size !== 3) return false;
-  const consecutive = sorted[1] === sorted[0] + 1 && sorted[2] === sorted[1] + 1;
-  return consecutive ||
-    (sorted[0] === 2 && sorted[1] === 4 && sorted[2] === 6) ||
-    (sorted[0] === 3 && sorted[1] === 6 && sorted[2] === 9) ||
-    (sorted[0] === 4 && sorted[1] === 6 && sorted[2] === 8);
-}
-
-function digitHuntTargetGroupsFromNumbers(numbers) {
-  if (!Array.isArray(numbers) || numbers.length !== 8) return null;
-  const first = numbers.slice(2, 5).map(Number).sort((a,b) => a-b);
-  const second = numbers.slice(5, 8).map(Number).sort((a,b) => a-b);
-  if (!digitHuntCandidateTriple(first) || !digitHuntCandidateTriple(second)) return null;
-  if (first.every((v, i) => v === second[i])) return null;
-  if (!first.some((v) => second.includes(v))) return null;
-  return [first, second];
-}
-
-function digitHuntSpawnEntriesFromNumbers(numbers) {
-  return digitHuntTargetGroupsFromNumbers(numbers) ? numbers.slice(2, 8).map(Number) : null;
-}
-
-function digitHuntHash(seedValue, orderValue) {
-  let x = (Number(seedValue) | 0) ^ Math.imul(Number(orderValue) | 0, 0x9E3779B9 | 0);
+function digitHuntHash(seed, order) {
+  let x = ((Number(seed) | 0) ^ Math.imul((Number(order) + 1) | 0, 0x9E3779B9 | 0)) | 0;
   x ^= x >>> 16; x = Math.imul(x, 0x7FEB352D | 0); x ^= x >>> 15; x = Math.imul(x, 0x846CA68B | 0); x ^= x >>> 16;
   return (x >>> 0) / 4294967296;
 }
 
-function digitHuntFullStockDeck(seed, blockIndex, spawnEntries) {
-  if (!Array.isArray(spawnEntries) || spawnEntries.length !== DIGIT_HUNT_TARGET_TILE_COUNT) return [];
-  const deck = [];
-  for (const value of spawnEntries) {
-    // Aynı rakam iki hedef üçlüdeyse iki giriş ayrı ayrı 50 kopya üretir.
-    for (let copy = 0; copy < DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY; copy += 1) deck.push(Number(value));
+function digitHuntFiniteSpawnBag(seed, initialBoard) {
+  const used = [0,0,0,0,0,0];
+  initialBoard.forEach((v) => { if (v != null && Number(v) >= 1 && Number(v) <= 5) used[Number(v)] += 1; });
+  const bag = [];
+  for (let value = 1; value <= 5; value += 1) for (let i = 0; i < Math.max(0, DIGIT_HUNT_PER_DIGIT - used[value]); i += 1) bag.push(value);
+  for (let index = bag.length - 1; index >= 1; index -= 1) {
+    const order = bag.length - 1 - index;
+    const pick = Math.min(index, Math.floor(digitHuntHash((Number(seed) | 0) ^ (0x51A7C3E1 | 0), order) * (index + 1)));
+    [bag[index], bag[pick]] = [bag[pick], bag[index]];
   }
-  const blockSeed = (Number(seed) | 0) ^ Math.imul((Number(blockIndex) + 1) | 0, 0x6D2B79F5 | 0);
-  for (let i = deck.length - 1; i > 0; i -= 1) {
-    const j = Math.max(0, Math.min(i, Math.floor(digitHuntHash(blockSeed, i + 1) * (i + 1))));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-  return deck;
+  return bag;
 }
 
-function digitHuntFiniteSpawnDeck(seed, spawnEntries, initialGrid) {
-  if (!Array.isArray(spawnEntries) || spawnEntries.length !== DIGIT_HUNT_TARGET_TILE_COUNT || !Array.isArray(initialGrid) || initialGrid.length !== DIGIT_HUNT_CELLS) return [];
-  const remaining = new Map();
-  for (const raw of spawnEntries) {
-    const value = Number(raw);
-    remaining.set(value, (remaining.get(value) || 0) + DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY);
-  }
-  for (const raw of initialGrid) {
-    if (raw == null) return [];
-    const value = Number(raw);
-    const left = (remaining.get(value) ?? -1) - 1;
-    if (left < 0) return [];
-    remaining.set(value, left);
-  }
-  const deck = [];
-  for (const value of [...new Set(spawnEntries.map(Number))]) {
-    const count = remaining.get(value) || 0;
-    for (let copy = 0; copy < count; copy += 1) deck.push(value);
-  }
-  if (deck.length !== DIGIT_HUNT_FINITE_SPAWN_LIMIT) return [];
-  const blockSeed = (Number(seed) | 0) ^ (0x13579BDF | 0);
-  for (let i = deck.length - 1; i > 0; i -= 1) {
-    const j = Math.max(0, Math.min(i, Math.floor(digitHuntHash(blockSeed, i + 1) * (i + 1))));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-  return deck;
+function digitHuntSpawnDigit(seed, spawnIndex, initialBoard, unlimitedSpawns) {
+  if (unlimitedSpawns) return Math.min(5, Math.floor(digitHuntHash(seed, spawnIndex) * 5) + 1);
+  return digitHuntFiniteSpawnBag(seed, initialBoard)[spawnIndex] ?? null;
 }
 
-function digitHuntInfiniteSpawnDigit(seed, spawnIndex, spawnEntries) {
-  const safeIndex = Math.max(0, Math.floor(Number(spawnIndex) || 0));
-  const block = Math.floor(safeIndex / DIGIT_HUNT_FINITE_TOTAL_STOCK);
-  const position = safeIndex % DIGIT_HUNT_FINITE_TOTAL_STOCK;
-  const deck = digitHuntFullStockDeck(seed, block, spawnEntries);
-  return deck[position] ?? Number(spawnEntries?.[0] || 1);
+function digitHuntLineCandidates(board, indices, orientationOrder) {
+  const result = [], values = indices.map((idx) => board[idx]);
+  let start = 0;
+  while (start < values.length) {
+    if (values[start] == null) { start += 1; continue; }
+    let end = start + 1;
+    while (end < values.length && values[end] === values[start]) end += 1;
+    if (end - start >= 3) result.push({ indices: indices.slice(start, end), order: orientationOrder });
+    start = end;
+  }
+  for (let i = 0; i <= values.length - 3; i += 1) {
+    if (values[i] == null || values[i + 1] == null) continue;
+    const d = values[i + 1] - values[i];
+    if (Math.abs(d) !== 1) continue;
+    if (i > 0 && values[i - 1] != null && values[i] - values[i - 1] === d) continue;
+    let end = i + 2;
+    while (end < values.length && values[end] != null && values[end - 1] != null && values[end] - values[end - 1] === d) end += 1;
+    if (end - i >= 3) result.push({ indices: indices.slice(i, end), order: orientationOrder + 1 });
+  }
+  return result;
 }
 
-function digitHuntIsMatchTriple(values, targetGroups) {
-  if (!Array.isArray(values) || values.length !== 3 || values.some((v) => !Number.isInteger(Number(v)))) return false;
-  if (!Array.isArray(targetGroups) || targetGroups.length !== 2) return false;
-  const actual = values.map(Number);
-  return targetGroups.some((group) => {
-    if (!Array.isArray(group) || group.length !== 3) return false;
-    const forward = group.every((v, i) => Number(v) === actual[i]);
-    const reverse = group.every((v, i) => Number(v) === actual[2 - i]);
-    return forward || reverse;
-  });
-}
-
-function digitHuntFindFirstRun(board, targetGroups) {
+function digitHuntFindFirstRun(board) {
   if (!Array.isArray(board) || board.length !== DIGIT_HUNT_CELLS) return null;
   const candidates = [];
-  for (let r = 0; r < DIGIT_HUNT_ROWS; r += 1) {
-    for (let c = 0; c <= DIGIT_HUNT_COLS - 3; c += 1) {
-      const indices = [r * 9 + c, r * 9 + c + 1, r * 9 + c + 2];
-      if (digitHuntIsMatchTriple(indices.map((idx) => board[idx]), targetGroups)) candidates.push(indices);
-    }
-  }
-  for (let c = 0; c < DIGIT_HUNT_COLS; c += 1) {
-    for (let r = 0; r <= DIGIT_HUNT_ROWS - 3; r += 1) {
-      const indices = [r * 9 + c, (r + 1) * 9 + c, (r + 2) * 9 + c];
-      if (digitHuntIsMatchTriple(indices.map((idx) => board[idx]), targetGroups)) candidates.push(indices);
-    }
-  }
-  candidates.sort((a,b) => Math.min(...a) - Math.min(...b) || a[0] - b[0]);
-  return candidates[0] || null;
+  for (let r = 0; r < DIGIT_HUNT_ROWS; r += 1) candidates.push(...digitHuntLineCandidates(board, Array.from({ length: 9 }, (_, c) => r * 9 + c), 0));
+  for (let c = 0; c < DIGIT_HUNT_COLS; c += 1) candidates.push(...digitHuntLineCandidates(board, Array.from({ length: 9 }, (_, r) => r * 9 + c), 2));
+  if (!candidates.length) return null;
+  candidates.sort((a,b) => Math.min(...a.indices) - Math.min(...b.indices) || a.order - b.order || b.indices.length - a.indices.length);
+  return candidates[0].indices;
 }
 
-function digitHuntCollapseAndRefill(boardRaw, removedIndices, seed, spawnCounterStart, spawnLimit, spawnEntries, initialGrid) {
+function digitHuntAdjacent(a, b) {
+  if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < 0 || a >= 81 || b >= 81) return false;
+  return Math.abs(Math.floor(a/9)-Math.floor(b/9)) + Math.abs((a%9)-(b%9)) === 1;
+}
+
+function digitHuntHoleIsReachable(board, target) {
+  if (!Number.isInteger(target) || target < 0 || target >= 81 || board[target] != null) return false;
+  const row = Math.floor(target / 9), col = target % 9;
+  return (row < 8 && board[target + 9] != null) || (col > 0 && board[target - 1] != null) || (col < 8 && board[target + 1] != null);
+}
+
+function digitHuntMoveAllowed(board, from, to, requireMatchMode) {
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0 || from >= 81 || to >= 81 || from === to || board[from] == null) return false;
+  if (requireMatchMode) return board[to] != null && digitHuntAdjacent(from, to);
+  const hasHole = board.some((v) => v == null);
+  if (!hasHole) return board[to] != null && digitHuntAdjacent(from, to);
+  return board[to] != null || digitHuntHoleIsReachable(board, to);
+}
+
+function digitHuntCollapseAndRefill(boardRaw, removedIndices, seed, spawnCounterStart, initialBoard, unlimitedSpawns) {
   const removed = new Set(removedIndices);
-  const board = boardRaw.map((v, i) => removed.has(i) ? null : v);
-  let spawnCounter = Math.max(0, Number(spawnCounterStart) || 0);
-  const finiteDeck = spawnLimit > 0 ? digitHuntFiniteSpawnDeck(seed, spawnEntries, initialGrid) : null;
-  if (spawnLimit > 0 && (!finiteDeck || finiteDeck.length !== DIGIT_HUNT_FINITE_SPAWN_LIMIT)) return { board, spawnCounter, invalid: true };
-  for (let c = 0; c < DIGIT_HUNT_COLS; c += 1) {
+  const afterRemoval = boardRaw.map((v, i) => removed.has(i) ? null : v);
+  const board = Array(81).fill(null);
+  let spawnCounter = spawnCounterStart;
+  for (let c = 0; c < 9; c += 1) {
     const kept = [];
-    for (let r = DIGIT_HUNT_ROWS - 1; r >= 0; r -= 1) { const v = board[r * DIGIT_HUNT_COLS + c]; if (v != null) kept.push(v); }
-    for (let r = 0; r < DIGIT_HUNT_ROWS; r += 1) board[r * DIGIT_HUNT_COLS + c] = null;
-    let writeRow = DIGIT_HUNT_ROWS - 1;
-    for (const v of kept) { board[writeRow * DIGIT_HUNT_COLS + c] = v; writeRow -= 1; }
-    while (writeRow >= 0 && (spawnLimit <= 0 || spawnCounter < spawnLimit)) {
-      const nextValue = spawnLimit > 0
-        ? finiteDeck[spawnCounter]
-        : digitHuntInfiniteSpawnDigit(seed, spawnCounter, spawnEntries);
-      if (!Number.isInteger(Number(nextValue))) break;
-      board[writeRow * DIGIT_HUNT_COLS + c] = Number(nextValue);
-      spawnCounter += 1; writeRow -= 1;
+    for (let r = 8; r >= 0; r -= 1) { const v = afterRemoval[r*9+c]; if (v != null) kept.push(v); }
+    let writeRow = 8;
+    for (const v of kept) { board[writeRow*9+c] = v; writeRow -= 1; }
+    while (writeRow >= 0) {
+      const spawned = digitHuntSpawnDigit(seed, spawnCounter, initialBoard, unlimitedSpawns);
+      if (spawned == null) break;
+      board[writeRow*9+c] = spawned; spawnCounter += 1; writeRow -= 1;
     }
   }
   return { board, spawnCounter };
 }
 
-function digitHuntAdjacent(a, b) {
-  if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b < 0 || a >= 81 || b >= 81) return false;
-  const ar = Math.floor(a / 9), ac = a % 9, br = Math.floor(b / 9), bc = b % 9;
-  return Math.abs(ar - br) + Math.abs(ac - bc) === 1;
-}
-
-// Hedef boş hücre, herhangi bir dolu sayının bir üstü / bir sağı / bir soluysa boşluğa taşıma serbesttir.
-function digitHuntEmptyDestinationAllowed(board, destination) {
-  if (!Array.isArray(board) || board[destination] != null) return false;
-  const row = Math.floor(destination / 9), col = destination % 9;
-  if (row < 8 && board[(row + 1) * 9 + col] != null) return true;
-  if (col > 0 && board[row * 9 + col - 1] != null) return true;
-  if (col < 8 && board[row * 9 + col + 1] != null) return true;
-  return false;
-}
-
-function digitHuntSwapCreatesMatch(boardRaw, from, to, targetGroups) {
-  if (boardRaw[from] == null || boardRaw[to] == null || from === to) return false;
-  const board = boardRaw.slice();
-  [board[from], board[to]] = [board[to], board[from]];
-  return digitHuntFindFirstRun(board, targetGroups) != null;
-}
-
-function digitHuntApplyMoveState(state, fromValue, toValue, seed, spawnLimit, targetGroups, spawnEntries, initialGrid) {
-  const from = Number(fromValue), to = Number(toValue);
-  if (!Number.isInteger(from) || !Number.isInteger(to) || from === to || from < 0 || to < 0 || from >= 81 || to >= 81) return null;
-  if (!Array.isArray(state.board) || state.board.length !== 81 || state.board[from] == null) return null;
-  if (!Array.isArray(targetGroups) || targetGroups.length !== 2 || !Array.isArray(spawnEntries) || spawnEntries.length !== 6) return null;
-  const sparse = state.board.some((value) => value == null);
+function digitHuntApplyMoveState(state, from, to, seed, initialBoard, unlimitedSpawns, requireMatchMode) {
+  if (!digitHuntMoveAllowed(state.board, from, to, requireMatchMode)) return null;
   let board = state.board.slice();
-  if (board[to] == null) {
-    if (!sparse || !digitHuntEmptyDestinationAllowed(board, to)) return null;
-    board[to] = board[from]; board[from] = null;
-  } else {
-    if (!sparse && !digitHuntAdjacent(from, to)) return null;
-    [board[from], board[to]] = [board[to], board[from]];
-    // En az bir boş hücre varsa dolu iki taşın takası koşulsuzdur.
-    // Tahta tamamen doluyken komşuluk + hedef üçlü oluşturma şartı devam eder.
-    if (!sparse && !digitHuntFindFirstRun(board, targetGroups)) return null;
-  }
-  let score = Math.max(0, Number(state.score) || 0);
-  let spawnCounter = Math.max(0, Number(state.spawnCounter) || 0);
-  let run = digitHuntFindFirstRun(board, targetGroups);
-  let guard = 0;
+  if (board[to] == null) { board[to] = board[from]; board[from] = null; }
+  else [board[from], board[to]] = [board[to], board[from]];
+  let run = digitHuntFindFirstRun(board);
+  if (requireMatchMode && !run) return null;
+  let score = Number(state.score || 0), spawnCounter = Number(state.spawnCounter || 0), guard = 0;
   while (run && guard < 200) {
     score = Math.min(2_000_000_000, score + run.length * 2);
-    const collapsed = digitHuntCollapseAndRefill(board, run, seed, spawnCounter, spawnLimit, spawnEntries, initialGrid);
-    if (collapsed.invalid) return null;
+    const collapsed = digitHuntCollapseAndRefill(board, run, seed, spawnCounter, initialBoard, unlimitedSpawns);
     board = collapsed.board; spawnCounter = collapsed.spawnCounter;
-    run = digitHuntFindFirstRun(board, targetGroups); guard += 1;
+    run = digitHuntFindFirstRun(board); guard += 1;
   }
   if (guard >= 200) return null;
   return { board, score, spawnCounter };
 }
 
-function digitHuntHasLegalMove(board, targetGroups) {
-  if (!Array.isArray(board) || board.length !== 81 || !Array.isArray(targetGroups) || targetGroups.length !== 2) return false;
-  const sparse = board.some((value) => value == null);
-  if (sparse) {
-    const hasFilledSource = board.some((value) => value != null);
-    if (hasFilledSource) {
-      for (let destination = 0; destination < 81; destination += 1) {
-        if (digitHuntEmptyDestinationAllowed(board, destination)) return true;
-      }
+function digitHuntHasLegalMove(board, seed = 1, spawnCounter = 0, initialBoard = board, isInfiniteMode = true) {
+  if (!Array.isArray(board) || board.length !== 81) return false;
+  if (!isInfiniteMode) {
+    if (!board.some((v) => v == null)) {
+      for (let i=0;i<81;i+=1) if (board[i] != null && ((i%9<8 && board[i+1]!=null) || (Math.floor(i/9)<8 && board[i+9]!=null))) return true;
+      return false;
     }
-    // En az bir boş hücre varken herhangi iki dolu taş koşulsuz yer değiştirebilir.
-    return board.filter((value) => value != null).length >= 2;
+    for (let from=0;from<81;from+=1) if (board[from]!=null) for (let to=0;to<81;to+=1) if (digitHuntMoveAllowed(board,from,to,false)) return true;
+    return false;
   }
   for (let i = 0; i < 81; i += 1) {
     const r = Math.floor(i / 9), c = i % 9;
-    if (c < 8 && digitHuntSwapCreatesMatch(board, i, i + 1, targetGroups)) return true;
-    if (r < 8 && digitHuntSwapCreatesMatch(board, i, i + 9, targetGroups)) return true;
+    if (c < 8 && digitHuntApplyMoveState({ board, score: 0, spawnCounter }, i, i + 1, seed, initialBoard, true, true)) return true;
+    if (r < 8 && digitHuntApplyMoveState({ board, score: 0, spawnCounter }, i, i + 9, seed, initialBoard, true, true)) return true;
   }
   return false;
 }
 
 function generateDigitHuntPuzzle() {
-  const validPairs = [];
-  for (let i = 0; i < DIGIT_HUNT_CANDIDATE_GROUPS.length; i += 1) {
-    for (let j = i + 1; j < DIGIT_HUNT_CANDIDATE_GROUPS.length; j += 1) {
-      const first = DIGIT_HUNT_CANDIDATE_GROUPS[i];
-      const second = DIGIT_HUNT_CANDIDATE_GROUPS[j];
-      if (first.some((v) => second.includes(v))) validPairs.push([first, second]);
-    }
-  }
-  for (let attempt = 0; attempt < 1600; attempt += 1) {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
     const seed = secureRandomInt(1, 0x7fffffff);
-    const pair = validPairs[secureRandomInt(0, validPairs.length)];
-    const targetGroups = [pair[0].slice(), pair[1].slice()];
-    const spawnEntries = [...targetGroups[0], ...targetGroups[1]];
-    // Altı grup girdisinin her biri 50 adetlik ayrı kota taşır. Ortak rakam varsa fiziksel
-    // olarak aynı değer iki kotadan da geldiği için toplamda 100 adet bulunabilir.
-    const stock = [];
-    for (const value of spawnEntries) {
-      for (let copy = 0; copy < DIGIT_HUNT_FINITE_COPIES_PER_GROUP_ENTRY; copy += 1) stock.push(value);
-    }
-    for (let i = stock.length - 1; i > 0; i -= 1) {
-      const j = secureRandomInt(0, i + 1);
-      [stock[i], stock[j]] = [stock[j], stock[i]];
-    }
-    const board = [];
-    function createsMatchAt(index, value) {
+    const extraDigit = secureRandomInt(1, 6);
+    const quota = [0,16,16,16,16,16]; quota[extraDigit] += 1;
+    const board = [], remaining = quota.slice();
+    const createsRunAt = (index, value) => {
       const row = Math.floor(index / 9), col = index % 9;
-      if (col >= 2 && digitHuntIsMatchTriple([board[index - 2], board[index - 1], value], targetGroups)) return true;
-      if (row >= 2 && digitHuntIsMatchTriple([board[index - 18], board[index - 9], value], targetGroups)) return true;
+      if (col >= 2) { const a=board[index-2],b=board[index-1]; if ((a===b&&b===value) || (Math.abs(b-a)===1 && value-b===b-a)) return true; }
+      if (row >= 2) { const a=board[index-18],b=board[index-9]; if ((a===b&&b===value) || (Math.abs(b-a)===1 && value-b===b-a)) return true; }
       return false;
+    };
+    let failed = false;
+    for (let i=0;i<81;i+=1) {
+      const candidates=[];
+      for (let v=1;v<=5;v+=1) if (remaining[v]>0 && !createsRunAt(i,v)) for(let k=0;k<remaining[v];k+=1) candidates.push(v);
+      if (!candidates.length) { failed=true; break; }
+      const value = candidates[secureRandomInt(0,candidates.length)]; board.push(value); remaining[value]-=1;
     }
-    for (let i = 0; i < DIGIT_HUNT_CELLS; i += 1) {
-      let chosen = -1;
-      // Önce rastgele adaylar, gerekirse kalan stok üzerinde doğrusal arama.
-      for (let t = 0; t < 80 && chosen < 0; t += 1) {
-        const candidateIndex = secureRandomInt(i, stock.length);
-        if (!createsMatchAt(i, stock[candidateIndex])) chosen = candidateIndex;
-      }
-      if (chosen < 0) {
-        for (let candidateIndex = i; candidateIndex < stock.length; candidateIndex += 1) {
-          if (!createsMatchAt(i, stock[candidateIndex])) { chosen = candidateIndex; break; }
-        }
-      }
-      if (chosen < 0) { board.length = 0; break; }
-      [stock[i], stock[chosen]] = [stock[chosen], stock[i]];
-      board.push(stock[i]);
-    }
-    if (board.length === 81 && digitHuntFindFirstRun(board, targetGroups) == null && digitHuntHasLegalMove(board, targetGroups)) {
-      return {
-        difficulty: "Standard",
-        target: 0,
-        numbers: [seed, DIGIT_HUNT_FINITE_SPAWN_LIMIT, ...targetGroups[0], ...targetGroups[1]],
-        gameKey: "digit_hunt",
-        initialGrid: board,
-      };
-    }
+    if (failed || board.length!==81 || digitHuntFindFirstRun(board)!=null) continue;
+    // Aynı tahta sonsuz challenge için target=0'a çevrildiğinden en az bir eski-tip
+    // (komşu takas + anında eşleşme) hamlesi de başlangıçta mevcut olmalıdır.
+    if (!digitHuntHasLegalMove(board, seed, 0, board, true)) continue;
+    const puzzle = { difficulty:"Standard", target:DIGIT_HUNT_TOTAL_TILES, numbers:[seed], gameKey:"digit_hunt", initialGrid:board };
+    if (digitHuntEncodingValid(puzzle)) return puzzle;
   }
   throw new Error("RAKAM AVI tahtası üretilemedi.");
 }
 
 function digitHuntEncodingValid(puzzle) {
-  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
-  const seed = Number(numbers[0]);
-  const spawnLimit = Number(numbers[1]);
-  const targetGroups = digitHuntTargetGroupsFromNumbers(numbers);
-  const spawnEntries = digitHuntSpawnEntriesFromNumbers(numbers);
-  const board = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid.map(Number) : [];
-  return Number(puzzle?.target) === 0 && numbers.length === 8 && Number.isInteger(seed) && seed > 0 &&
-    Number.isInteger(spawnLimit) && (spawnLimit === 0 || spawnLimit === DIGIT_HUNT_FINITE_SPAWN_LIMIT) &&
-    Array.isArray(targetGroups) && Array.isArray(spawnEntries) && spawnEntries.length === 6 &&
-    board.length === 81 && board.every((v) => Number.isInteger(v) && spawnEntries.includes(v)) &&
-    (spawnLimit === 0 || digitHuntFiniteSpawnDeck(seed, spawnEntries, board).length === DIGIT_HUNT_FINITE_SPAWN_LIMIT) &&
-    digitHuntFindFirstRun(board, targetGroups) == null;
+  const seed = Number(puzzle?.numbers?.[0]);
+  const board = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  const target = Number(puzzle?.target);
+  if (![0,DIGIT_HUNT_TOTAL_TILES].includes(target) || !Number.isInteger(seed) || seed <= 0 || board.length !== 81) return false;
+  if (!board.every((v)=>Number.isInteger(Number(v)) && Number(v)>=1 && Number(v)<=5) || digitHuntFindFirstRun(board.map(Number))!=null) return false;
+  for (let value=1;value<=5;value+=1) if (board.filter((v)=>Number(v)===value).length > DIGIT_HUNT_PER_DIGIT) return false;
+  return true;
 }
 
 function replayDigitHunt(puzzle, answer = {}) {
   if (!digitHuntEncodingValid(puzzle)) return null;
   const moves = Array.isArray(answer?.moves) ? answer.moves : [];
   if (moves.length > 5000) return null;
-  const numbers = puzzle.numbers.map(Number);
-  const seed = Number(numbers[0]);
-  const spawnLimit = Number(numbers[1]);
-  const targetGroups = digitHuntTargetGroupsFromNumbers(numbers);
-  const spawnEntries = digitHuntSpawnEntriesFromNumbers(numbers);
-  const initialGrid = puzzle.initialGrid.map(Number);
-  let state = { board: initialGrid.slice(), score: 0, spawnCounter: 0 };
+  const seed = Number(puzzle.numbers[0]);
+  const isInfiniteMode = Number(puzzle.target) === 0;
+  const initialBoard = puzzle.initialGrid.map(Number);
+  let state = { board: initialBoard.slice(), score: 0, spawnCounter: 0 };
   for (const move of moves) {
     if (!Array.isArray(move) || move.length !== 2) return null;
-    const next = digitHuntApplyMoveState(state, Number(move[0]), Number(move[1]), seed, spawnLimit, targetGroups, spawnEntries, initialGrid);
+    const next = digitHuntApplyMoveState(state, Number(move[0]), Number(move[1]), seed, initialBoard, isInfiniteMode, isInfiniteMode);
     if (!next) return null;
     state = next;
   }
@@ -6978,8 +6541,7 @@ function replayDigitHunt(puzzle, answer = {}) {
 function validateDigitHuntAnswer(puzzle, answer = {}) {
   const state = replayDigitHunt(puzzle, answer);
   if (!state) return false;
-  const claimed = Math.max(0, Math.floor(Number(answer?.score || 0)));
-  return claimed === state.score;
+  return Math.max(0, Math.floor(Number(answer?.score || 0))) === state.score;
 }
 
 const GAME_HANDLERS = Object.freeze({
@@ -7862,136 +7424,6 @@ async function awardRealtimeRoom(room, winner, loser) {
   if (loserSocket && loserState) loserSocket.emit("authoritative_reward", loserState);
 }
 
-app.get("/integrity/config", integrityGateRateLimit, (req, res) => {
-  if (!/^\d{6,20}$/.test(PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER)) {
-    res.status(503).json({
-      ok: false,
-      code: "PLAY_INTEGRITY_NOT_CONFIGURED",
-      message: "Play Integrity Cloud Project Number sunucuda tanımlı değil.",
-    });
-    return;
-  }
-
-  res.set("Cache-Control", "no-store");
-  res.json({
-    ok: true,
-    cloudProjectNumber: PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER,
-  });
-});
-
-app.post("/integrity/verify-access-risk", integrityGateRateLimit, async (req, res) => {
-  const requestId = safeText(req.body?.requestId, "", 128);
-  const integrityToken = String(req.body?.integrityToken || "").trim();
-
-  if (!/^[a-fA-F0-9-]{20,128}$/.test(requestId) || integrityToken.length < 100 || integrityToken.length > 60_000) {
-    res.status(400).json({
-      ok: false,
-      code: "INVALID_INTEGRITY_REQUEST",
-      message: "Play Integrity isteği geçersiz.",
-    });
-    return;
-  }
-
-  try {
-    const decoded = await decodePlayIntegrityToken(integrityToken);
-    const payload = decoded?.tokenPayloadExternal;
-    if (!payload || typeof payload !== "object") {
-      const error = new Error("Google Play Integrity payload döndürmedi.");
-      error.statusCode = 502;
-      error.publicCode = "PLAY_INTEGRITY_EMPTY_PAYLOAD";
-      throw error;
-    }
-
-    const requestDetails = payload.requestDetails || {};
-    const expectedHash = playIntegrityRequestHash(requestId);
-    const actualHash = String(requestDetails.requestHash || "").trim();
-    const requestPackageName = String(requestDetails.requestPackageName || "").trim();
-    const requestedAtMillis = parseIntegrityTimestampMillis(requestDetails.timestampMillis);
-    const now = Date.now();
-
-    if (requestPackageName !== PLAY_INTEGRITY_PACKAGE_NAME || actualHash !== expectedHash) {
-      res.status(403).json({
-        ok: false,
-        code: "INTEGRITY_REQUEST_MISMATCH",
-        message: "Play Integrity isteği bu uygulama/istek ile eşleşmiyor.",
-      });
-      return;
-    }
-
-    if (
-      requestedAtMillis <= 0 ||
-      requestedAtMillis < now - PLAY_INTEGRITY_REQUEST_MAX_AGE_MS ||
-      requestedAtMillis > now + 30_000
-    ) {
-      res.status(403).json({
-        ok: false,
-        code: "INTEGRITY_REQUEST_EXPIRED",
-        message: "Play Integrity isteği güncel değil.",
-      });
-      return;
-    }
-
-    // requestPackageName tek başına yeterli değildir; Google dokümantasyonunun önerdiği gibi
-    // uygulamanın Play tarafından tanınan imza/paket sürümü olduğunu da doğrula.
-    const appRecognitionVerdict = String(payload.appIntegrity?.appRecognitionVerdict || "").trim();
-    if (appRecognitionVerdict !== "PLAY_RECOGNIZED") {
-      res.status(403).json({
-        ok: false,
-        code: "APP_NOT_PLAY_RECOGNIZED",
-        message: "Uygulama Google Play tarafından tanınan resmi sürüm olarak doğrulanamadı.",
-      });
-      return;
-    }
-
-    const appAccessRiskVerdict = payload.environmentDetails?.appAccessRiskVerdict || {};
-    const appsDetected = Array.isArray(appAccessRiskVerdict.appsDetected)
-      ? appAccessRiskVerdict.appsDetected.map((value) => String(value || "").trim()).filter(Boolean)
-      : null;
-
-    // Bu alan yoksa Google riski değerlendirememiş demektir. Kullanıcının talep ettiği giriş kapısı
-    // için fail-closed davran: riskin olmadığı doğrulanmadan uygulamaya giriş verme.
-    if (!appsDetected) {
-      res.status(403).json({
-        ok: false,
-        code: "ACCESS_RISK_UNEVALUATED",
-        message: "Uygulama erişim riski Google Play tarafından değerlendirilemedi.",
-      });
-      return;
-    }
-
-    const blockedSignals = appsDetected.filter((value) =>
-      value.endsWith("_CONTROLLING") || value.endsWith("_OVERLAYS")
-    );
-
-    if (blockedSignals.length > 0) {
-      res.status(200).json({
-        ok: true,
-        allowed: false,
-        code: "ACCESS_RISK_BLOCKED",
-        blockedSignals,
-      });
-      return;
-    }
-
-    res.status(200).json({
-      ok: true,
-      allowed: true,
-      code: "ACCESS_RISK_CLEAR",
-    });
-  } catch (error) {
-    const statusCode = Number(error.statusCode || 503);
-    console.error("play integrity access-risk verify error:", {
-      message: error.message,
-      code: error.publicCode || error.code,
-    });
-    res.status(statusCode >= 400 && statusCode <= 599 ? statusCode : 503).json({
-      ok: false,
-      code: error.publicCode || "PLAY_INTEGRITY_VERIFY_FAILED",
-      message: "Play Integrity güvenlik doğrulaması tamamlanamadı.",
-    });
-  }
-});
-
 app.post("/auth/guest", guestAuthRateLimit, async (req, res) => {
   if (!requireDatabase(res)) return;
   const guestId = normalizeGuestId(req.body.guestId);
@@ -8664,7 +8096,6 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
       // için klasik "üst satıra taş dayanması" geometrik olarak oluşamaz; tek-koşu bitişi,
       // tahtada skor üretebilen hiçbir komşu takas kalmamasıdır.
       puzzle.target = 0;
-      if (Array.isArray(puzzle.numbers) && puzzle.numbers.length >= 2) puzzle.numbers[1] = 0;
       puzzle.endOnNoLegalMove = true;
     }
 
@@ -8693,71 +8124,6 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
   } catch (error) {
     await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Güvenli oyun başlatılamadı.", "challenge start error:");
-  } finally {
-    client.release();
-  }
-});
-
-app.post("/game/challenges/finalize-infinite-run", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
-  if (!requireJsonObject(req, res)) return;
-  const gameKey = normalizeBaseGameKey(req.body.gameKey);
-  const challengeId = String(req.body.challengeId || "").trim();
-  const answer = req.body.answer && typeof req.body.answer === "object" ? req.body.answer : {};
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
-    const progressResult = await client.query(
-      `SELECT infinite_score, infinite_run_score FROM player_game_progress
-       WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
-      [req.auth.sub, gameKey]
-    );
-    const oldHighScore = Math.max(0, Number(progressResult.rows[0]?.infinite_score || 0));
-    const oldRunScore = Math.max(0, Number(progressResult.rows[0]?.infinite_run_score || 0));
-    let finalizedRunScore = oldRunScore;
-
-    if (isScoreBasedGameKey(gameKey) && challengeId) {
-      const challengeResult = await client.query(
-        `SELECT challenge_id, puzzle, completed_at FROM secure_game_challenges
-         WHERE challenge_id = $1 AND player_id = $2 AND game_key = $3 AND mode = 'infinite'
-         FOR UPDATE`,
-        [challengeId, req.auth.sub, gameKey]
-      );
-      const challenge = challengeResult.rows[0];
-      if (!challenge) {
-        const error = new Error("Sonlandırılacak sonsuz oyun bulunamadı."); error.statusCode = 404; throw error;
-      }
-      if (challenge.completed_at == null) {
-        if (!validateChallengeAnswer(challenge.puzzle, [], [], answer)) {
-          const error = new Error("Sonsuz oyun ara kaydı sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
-        }
-        const gameScore = Math.max(0, Math.floor(Number(answer?.score || 0)));
-        finalizedRunScore = Math.floor(gameScore / 20);
-        await client.query(
-          `UPDATE secure_game_challenges
-           SET completed_at = NOW(), result = $2::jsonb
-           WHERE challenge_id = $1`,
-          [challengeId, JSON.stringify({ status: "finalized_by_new_game", gameScore, runScore: finalizedRunScore })]
-        );
-      }
-    }
-
-    const newHighScore = Math.max(oldHighScore, finalizedRunScore);
-    const highScoreDelta = Math.max(0, newHighScore - oldHighScore);
-    await client.query(
-      `UPDATE player_game_progress
-       SET infinite_score = $3, infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
-       WHERE player_id = $1 AND game_key = $2`,
-      [req.auth.sub, gameKey, newHighScore]
-    );
-    if (highScoreDelta > 0) {
-      await applyLeaderboardScoreDeltaInTransaction(client, req.auth.sub, 0, highScoreDelta);
-    }
-    await client.query("COMMIT");
-    res.json({ ok: true, gameKey, gameInfiniteScore: newHighScore, finalizedRunScore });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    sendLeaderboardError(res, error, "Sonsuz oyun sonlandırılamadı.", "infinite finalize error:");
   } finally {
     client.release();
   }
@@ -8822,8 +8188,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     }
     if (digitHuntInfiniteSingleRun) {
       const replayed = replayDigitHunt(challenge.puzzle, req.body.answer || {});
-      const targetGroups = digitHuntTargetGroupsFromNumbers(challenge.puzzle.numbers || []);
-      if (!replayed || !targetGroups || digitHuntHasLegalMove(replayed.board, targetGroups)) {
+      if (!replayed || digitHuntHasLegalMove(replayed.board, Number(challenge.puzzle.numbers?.[0] || 1), replayed.spawnCounter, challenge.puzzle.initialGrid, true)) {
         const error = new Error("RAKAM AVI sonsuz oyunu yalnız geçerli hamle kalmadığında tamamlanabilir.");
         error.statusCode = 422;
         throw error;
@@ -8858,7 +8223,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       if (isScoreBasedGameKey(gameKey)) {
         const roundLimitMs = gameDefinition(gameKey).roundDurationMs;
         if (elapsedServerMs < roundLimitMs - 2_000) {
-          const error = new Error("Skor turun sonundan önce gönderilemez.");
+          const error = new Error("Skor, turun bitişinden önce gönderilemez.");
           error.statusCode = 409;
           throw error;
         }
