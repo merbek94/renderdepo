@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "merge729-digit-hunt-triples-v13-20260908";
+const SERVER_BUILD_ID = "game729-adaptive-bots-digit240-v14-20260909";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -763,6 +763,7 @@ async function initDatabase() {
       two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0),
       two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0),
       two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0),
+      bot_timing_game_count INTEGER NOT NULL DEFAULT 0 CHECK (bot_timing_game_count >= 0),
       stats JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (player_id, game_key)
@@ -798,6 +799,8 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS bot_timing_game_count INTEGER NOT NULL DEFAULT 0 CHECK (bot_timing_game_count >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS stats JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE player_game_progress
@@ -2104,7 +2107,7 @@ const GAME_DEFINITIONS = Object.freeze({
     displayName: "RAKAM AVI",
     roundDurationMs: 10 * 60 * 1000,
     hundredStageDurationMs: 10 * 60 * 1000,
-    // Rakam Avı ikili/turnuvada skor yarışı değil, sonlu 250 taş akışını ilk tamamlayan yarışıdır.
+    // Rakam Avı ikili/turnuvada skor yarışı değil, sonlu 240 taş akışını ilk tamamlayan yarışıdır.
     infiniteDifficultyForStage: () => "Standard",
   }),
   next_number: Object.freeze({
@@ -2164,10 +2167,10 @@ const GAME_DEFINITIONS = Object.freeze({
   }),
   merge_5120: Object.freeze({
     key: "merge_5120",
-    displayName: "5120",
-    roundDurationMs: 5 * 60 * 1000,
+    displayName: "729",
+    roundDurationMs: 8 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
-    // 5120 ikili/turnuvada skor yarışı değil, 729 taşına ilk ulaşan yarışıdır.
+    // 729 ikili/turnuvada skor yarışı değil, 729 taşına ilk ulaşan yarışıdır.
     infiniteDifficultyForStage: () => "Standard",
   }),
   number_puzzle: Object.freeze({
@@ -3300,7 +3303,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
   const result = await client.query(
     `SELECT s.general_score, p.game_rights, p.game_rights_refill_at,
             gp.two_player_finish_count, gp.two_player_finish_total_ms,
-            gp.two_player_score_count, gp.two_player_score_total,
+            gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count,
             gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
             gp.tournament_completed, p.tournament_tickets, gp.tournament_entry_active
      FROM player_scores s
@@ -3319,6 +3322,7 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
     finishTotalMs: lockedRow.two_player_finish_total_ms,
     scoreCount: lockedRow.two_player_score_count,
     scoreTotal: lockedRow.two_player_score_total,
+    botGameCount: lockedRow.bot_timing_game_count,
     generalScore: lockedRow.general_score,
   });
   state.tournamentResponse = {
@@ -4314,8 +4318,11 @@ function normalizeTwoPlayerFinishProfile(profile = {}) {
   const generalScore = Number.isFinite(parsedGeneralScore)
     ? Math.max(0, Math.min(2_000_000_000, Math.floor(parsedGeneralScore)))
     : 0;
-  // averageFinishMs istatistik/geriye dönük uyumluluk için kalır; bot hızı artık bunu kullanmaz.
-  return { finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore, generalScore };
+  const parsedBotGameCount = Number(profile.botGameCount || 0);
+  const botGameCount = Number.isFinite(parsedBotGameCount)
+    ? Math.max(0, Math.min(2_000_000_000, Math.floor(parsedBotGameCount)))
+    : 0;
+  return { finishCount, finishTotalMs, averageFinishMs, scoreCount, scoreTotal, averageScore, generalScore, botGameCount };
 }
 
 async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey = "target_number") {
@@ -4323,7 +4330,7 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
     `SELECT gp.two_player_finish_count, gp.two_player_finish_total_ms,
-            gp.two_player_score_count, gp.two_player_score_total, s.general_score
+            gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count, s.general_score
      FROM player_game_progress gp
      JOIN player_scores s ON s.player_id = gp.player_id
      WHERE gp.player_id = $1 AND gp.game_key = $2
@@ -4336,6 +4343,7 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey
     finishTotalMs: row.two_player_finish_total_ms,
     scoreCount: row.two_player_score_count,
     scoreTotal: row.two_player_score_total,
+    botGameCount: row.bot_timing_game_count,
     generalScore: row.general_score,
   });
 }
@@ -4401,12 +4409,40 @@ async function recordTwoPlayerFinishTime(playerId, elapsedMs, roundCountValue = 
   }
 }
 
+async function incrementAdaptiveBotTimingGameInTransaction(client, playerId, gameKey) {
+  const base = normalizeBaseGameKey(gameKey);
+  if (base !== "merge_5120" && base !== "digit_hunt") return;
+  await ensurePlayerGameProgress(client, playerId, base);
+  await client.query(
+    `UPDATE player_game_progress
+     SET bot_timing_game_count = LEAST(bot_timing_game_count + 1, 2000000000),
+         updated_at = NOW()
+     WHERE player_id = $1 AND game_key = $2`,
+    [playerId, base]
+  );
+}
+
+async function incrementAdaptiveBotTimingGame(playerId, gameKey) {
+  if (!pool || !playerId) return;
+  const base = normalizeBaseGameKey(gameKey);
+  if (base !== "merge_5120" && base !== "digit_hunt") return;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await incrementAdaptiveBotTimingGameInTransaction(client, playerId, base);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /**
- * Süreli botlarda oyuncunun ortalama bitirme süresi artık KULLANILMAZ.
- * İlk 5 bitiriş kaydı ve 1000 puan altı profil varsayılan olarak ortak aralıkları kullanır;
- * oyun isterse GAME_DEFINITIONS içinde bu iki aralığı kendine özel tanımlayabilir.
- * Sonrasında authoritative genel puan, oyun-bazlı puan aralıklarından bot süresini seçer.
- * 5120 kendi adaptif 729 bot kuralını kullanır; Rakam Avı ise normal ilk-bitiren bot zamanlamasını kullanır.
+ * Diğer süreli oyunların mevcut bot sistemi korunur. 729 ve Rakam Avı bu genel puan/lig
+ * tabanlı profile girmez; onlar createAverageDrivenFirstFinishBotMs ile ilk 5 bot oyunu
+ * + oyun-bazlı authoritative ortalama bitirme süresini kullanır.
  */
 function secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs) {
   const minSeconds = Math.max(1, Math.floor(Number(rangeSeconds?.[0] || 1)));
@@ -4504,23 +4540,64 @@ function isFirstFinishRaceGameKey(gameKey) {
   return base === "merge_5120" || base === "digit_hunt";
 }
 
-function merge5120PlayerWinChanceBps(elapsedMs) {
-  const elapsedSeconds = Math.max(0, Number(elapsedMs || 0)) / 1000;
-  const drops = elapsedSeconds <= 100 ? 0 : Math.floor((elapsedSeconds - 100) / 3);
-  return Math.max(0, Math.min(8500, 8500 - drops * 100));
+function createAverageDrivenFirstFinishBotMs(finishProfile = {}, gameKey = "merge_5120") {
+  const profile = normalizeTwoPlayerFinishProfile(finishProfile);
+  const config = gameDefinition(gameKey);
+  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 480_000) - 1);
+
+  // İlk 5 BOT OYUNU, oyuncunun liginden ve geçmiş hızından bağımsız olarak 6-8 dakika.
+  if (profile.botGameCount < 5) {
+    return secureBotFinishMsFromSecondRange([360, 480], absoluteMaxMs);
+  }
+
+  // Beş oyundan sonra bot yalnız bu oyundaki authoritative ortalama bitirme süresini kullanır.
+  // Hiç bitiriş örneği yoksa 300 saniyelik eşik profili güvenli varsayımdır.
+  const averageSecondsRaw = profile.averageFinishMs == null
+    ? 300
+    : Math.max(1, Number(profile.averageFinishMs) / 1000);
+  const averageSeconds = Math.max(1, Math.min(480, averageSecondsRaw));
+
+  let fastChancePercent;
+  let fastRange;
+  let slowRange;
+
+  if (averageSeconds <= 120) {
+    fastChancePercent = 10;
+    fastRange = [90, 120];
+    slowRange = [120, 300];
+  } else if (averageSeconds < 300) {
+    // 120 sn'de %10 hızlı / %90 yavaş. 120 üstündeki her TAM 3 saniyede
+    // hızlı olasılık +1, yavaş olasılık -1. Örn. 150 => %20/%80, 177 => %29/%71.
+    const steps = Math.floor((averageSeconds - 120) / 3);
+    fastChancePercent = Math.max(0, Math.min(100, 10 + steps));
+    const split = Math.max(100, Math.min(300, Math.floor(averageSeconds)));
+    fastRange = [100, split];
+    slowRange = [split, 300];
+  } else {
+    fastChancePercent = 60;
+    fastRange = [100, 300];
+    slowRange = [300, 480];
+  }
+
+  const useFastRange = secureRandomInt(0, 100) < fastChancePercent;
+  return secureBotFinishMsFromSecondRange(useFastRange ? fastRange : slowRange, absoluteMaxMs);
 }
 
 function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
   const config = gameDefinition(gameKey);
   const baseGameKey = normalizeBaseGameKey(gameKey);
 
-  if (baseGameKey === "merge_5120") {
-    // 729 yarışı botu oyuncunun gerçek bitirme süresi geldiğinde adaptif olasılıkla çözülür.
-    // Lig, genel puan ve geçmiş performans bu olasılığa etki etmez.
-    return { finishMs: null, leaveMs: null, adaptive729Race: true };
+  if (baseGameKey === "merge_5120" || baseGameKey === "digit_hunt") {
+    // 729 ve Rakam Avı: lig/genel puan/difficulty bot hızını etkilemez.
+    // Her iki oyun da ilk bitiren yarışı olduğu için botun gerçek finishMs zamanı baştan belirlenir.
+    return {
+      finishMs: createAverageDrivenFirstFinishBotMs(finishProfile, baseGameKey),
+      leaveMs: null,
+      averageDrivenFirstFinishRace: true,
+    };
   }
 
-  // Oyuna özel yanlış/başarısız bot davranışları korunur; yalnız normal bot bitirme süresi puan bazlıdır.
+  // Oyuna özel yanlış/başarısız bot davranışları korunur; diğer oyunların eski bot sistemi değişmez.
   const wrongShortestPathRoute = baseGameKey === "shortest_path" && secureRandomInt(0, 10000) < 2100;
   const digitAttackForcedLoss = baseGameKey === "digit_attack" && secureRandomInt(0, 10000) < 2100;
   const digitAttackLossMaxMs = Math.max(28_000, Math.min(70_000, Number(config.roundDurationMs || 300_000) - 1));
@@ -4563,7 +4640,7 @@ function botOutcomeForElapsed(plan, elapsedMs, solvedByPlayer) {
   if (plan?.scoreBased === true) {
     const roundDurationMs = Math.max(1_000, Number(plan?.roundDurationMs || 300_000));
     if (elapsedMs >= roundDurationMs) {
-      // Skor tabanlı 5120 botunda oyuncu süre sonuna kadar sonuç göndermediyse botun
+      // Legacy skor-planı taşıyan eski bir challenge süre sonuna kadar sonuçlanmadıysa botun
       // pozitif skoru karşısında hükmen kaybeder; bağlantıyı keserek beraberlik kazanılamaz.
       return { resolvable: true, won: false, reason: "lower_score" };
     }
@@ -5212,10 +5289,10 @@ function shortestPathAnswerIsWinning(puzzle, answer = {}) {
 }
 
 // ============================================================================
-// 5120 / SAYI BULMACASI
+// 729 / SAYI BULMACASI
 
 // ============================================================================
-// 5120 / SAYI BULMACASI / SUDOKU / NONOGRAM / SONUCU BUL authoritative rules
+// 729 / SAYI BULMACASI / SUDOKU / NONOGRAM / SONUCU BUL authoritative rules
 // ============================================================================
 const MERGE_5120_ROWS = 8;
 const MERGE_5120_COLS = 6;
@@ -6371,8 +6448,8 @@ function validateWrongNumbersAnswer(puzzle, answer = {}) {
 const DIGIT_HUNT_ROWS = 9;
 const DIGIT_HUNT_COLS = 9;
 const DIGIT_HUNT_CELLS = 81;
-const DIGIT_HUNT_TOTAL_TILES = 250;
-const DIGIT_HUNT_PER_DIGIT = 50;
+const DIGIT_HUNT_TOTAL_TILES = 240;
+const DIGIT_HUNT_PER_DIGIT = 48;
 const DIGIT_HUNT_FINITE_SPAWNS = DIGIT_HUNT_TOTAL_TILES - DIGIT_HUNT_CELLS;
 
 function digitHuntHash(seed, order) {
@@ -6571,7 +6648,7 @@ function digitHuntAnswerFinishedFiniteRun(puzzle, answer = {}) {
   if (Number(puzzle?.target) !== DIGIT_HUNT_TOTAL_TILES) return false;
   const state = replayDigitHunt(puzzle, answer);
   if (!state || Number(state.spawnCounter || 0) < DIGIT_HUNT_FINITE_SPAWNS) return false;
-  // Her rakamdan toplam 50 taş vardır ve yalnız aynı rakamdan üçlüler silinir.
+  // Her rakamdan toplam 48 taş vardır ve yalnız aynı rakamdan üçlüler silinir.
   // Sonlu oyun, artık hiçbir rakamdan yeni bir üçlü kurulamayacağı (her biri en fazla 2 kaldığı) anda tamamlanır.
   for (let value = 1; value <= 5; value += 1) {
     if (state.board.filter((tile) => Number(tile) === value).length >= 3) return false;
@@ -7119,13 +7196,13 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
        tournament_stage, tournament_rights, tournament_bank, tournament_completed,
        tournament_entry_active, hundred_active, hundred_stage,
        two_player_finish_count, two_player_finish_total_ms,
-       two_player_score_count, two_player_score_total, stats, updated_at
+       two_player_score_count, two_player_score_total, bot_timing_game_count, stats, updated_at
      )
      SELECT $2, game_key, infinite_score, infinite_run_score, infinite_next_stage,
             tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active, hundred_active, hundred_stage,
             two_player_finish_count, two_player_finish_total_ms,
-            two_player_score_count, two_player_score_total, stats, NOW()
+            two_player_score_count, two_player_score_total, bot_timing_game_count, stats, NOW()
      FROM player_game_progress
      WHERE player_id = $1
      ON CONFLICT (player_id, game_key) DO UPDATE SET
@@ -7155,6 +7232,10 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          player_game_progress.two_player_score_total + EXCLUDED.two_player_score_total,
          9223372036854775807::bigint
        ),
+       bot_timing_game_count = LEAST(
+         player_game_progress.bot_timing_game_count::bigint + EXCLUDED.bot_timing_game_count::bigint,
+         2000000000
+       )::integer,
        stats = CASE
          WHEN EXCLUDED.updated_at > player_game_progress.updated_at THEN EXCLUDED.stats
          ELSE player_game_progress.stats
@@ -8001,7 +8082,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
                 gp.tournament_completed, gp.tournament_entry_active,
                 p.tournament_tickets, s.general_score,
                 gp.two_player_finish_count, gp.two_player_finish_total_ms,
-                gp.two_player_score_count, gp.two_player_score_total
+                gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count
          FROM player_game_progress gp
          JOIN player_progress p ON p.player_id = gp.player_id
          JOIN player_scores s ON s.player_id = gp.player_id
@@ -8026,6 +8107,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         finishTotalMs: progress.two_player_finish_total_ms,
         scoreCount: progress.two_player_score_count,
         scoreTotal: progress.two_player_score_total,
+        botGameCount: progress.bot_timing_game_count,
         generalScore: progress.general_score,
       });
       tournamentResponse = {
@@ -8041,6 +8123,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
 
     const puzzle = generatePuzzleForGame(gameKey, difficulty);
     const plan = createGameAwareBotPlan(gameKey, difficulty, finishProfile || {});
+    await incrementAdaptiveBotTimingGameInTransaction(client, req.auth.sub, gameKey);
     await client.query(
       `INSERT INTO secure_game_challenges
        (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
@@ -8121,7 +8204,7 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
       : requestedDifficulty;
     const puzzle = generatePuzzleForGame(gameKey, difficulty);
     if (gameKey === "merge_5120") {
-      // 5120 sonsuz modu tek ve süresiz bir koşudur; hedef skor/aşama yoktur.
+      // 729 sonsuz modu tek ve süresiz bir koşudur; hedef skor/aşama yoktur.
       // Bitiş, oyuncunun dolu sütunun üstüne yeni taş bırakmaya çalışmasıdır.
       puzzle.target = 0;
       puzzle.endOnOverflow = true;
@@ -8216,7 +8299,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     if (mergeInfiniteSingleRun) {
       const replayedMergeState = replayMerge5120(challenge.puzzle, req.body.answer || {});
       if (!replayedMergeState || !merge5120OverflowColumnIsValid(replayedMergeState, req.body?.answer?.overflowColumn)) {
-        const error = new Error("5120 sonsuz oyunu yalnız üst sınır aşıldığında tamamlanabilir.");
+        const error = new Error("729 sonsuz oyunu yalnız üst sınır aşıldığında tamamlanabilir.");
         error.statusCode = 422;
         throw error;
       }
@@ -8261,19 +8344,12 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       outcomeReason = "no_legal_move";
     }
     if (challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") {
-      if (gameKey === "merge_5120" && answerWon) {
-        const winChanceBps = merge5120PlayerWinChanceBps(elapsedServerMs);
-        won = secureRandomInt(0, 10000) < winChanceBps;
-        outcomeReason = won ? "reached_729_first" : "bot_reached_729_first";
-        rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
-      } else {
-        const outcome = answerWon
-          ? botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true)
-          : { resolvable: true, won: false, reason: wrongAnswerReason };
-        won = outcome.won;
-        outcomeReason = outcome.reason;
-        rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
-      }
+      const outcome = answerWon
+        ? botOutcomeForElapsed(challenge.result?.plan || {}, elapsedServerMs, true)
+        : { resolvable: true, won: false, reason: wrongAnswerReason };
+      won = outcome.won;
+      outcomeReason = outcome.reason;
+      rewards = twoPlayerBotRewards(challenge.difficulty, won === true, challenge.wager_points);
     }
 
     if (challenge.mode === "hundred") {
@@ -9831,7 +9907,7 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
           botPlan.forcedLoss === true ? "bot_three_mistakes" : "bot_wrong_route"
         );
       } else {
-        // Adaptif 5120 botu kullanıcı 729'a hiç ulaşamazsa süre sonunda kazanır.
+        // 729/Rakam Avı dahil ilk-bitiren botu kendi planlanmış finishMs anında tamamlar.
         registerRealtimeRoundFinish(room, botParticipant, botElapsedMs);
       }
     }, safePrepareMs + botElapsedMs);
@@ -10052,8 +10128,8 @@ function createRealtimeRoom(
     awardedAt: null,
     deadlineHandle: null,
     botFinishHandle: null,
-    // Hazır oda botlarında ilk 5 kalibrasyon sayacı + authoritative genel puan bu profile taşınır.
-    // Ortalama bitirme süresi artık bot hızında kullanılmaz; skor-bazlı oyunların averageScore alanı korunur.
+    // Hazır oda botlarında oyun-bazlı bitiriş ortalaması ve bot oyun sayacı profile taşınır.
+    // 729/Rakam Avı bu ikisini kullanır; diğer oyunların mevcut genel puan tabanlı sistemi korunur.
     botFinishProfile: opponentPlayer.isBot === true
       ? normalizeTwoPlayerFinishProfile(botFinishProfile || {})
       : null,
@@ -10567,7 +10643,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
               gp.tournament_completed, gp.tournament_entry_active,
               s.general_score,
               gp.two_player_finish_count, gp.two_player_finish_total_ms,
-              gp.two_player_score_count, gp.two_player_score_total
+              gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count
        FROM players p
        JOIN player_progress g ON g.player_id = p.player_id
        JOIN player_game_progress gp ON gp.player_id = p.player_id AND gp.game_key = $3
@@ -10599,6 +10675,7 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
         finishTotalMs: row.two_player_finish_total_ms,
         scoreCount: row.two_player_score_count,
         scoreTotal: row.two_player_score_total,
+        botGameCount: row.bot_timing_game_count,
         generalScore: row.general_score,
       }),
     };
@@ -10883,6 +10960,9 @@ io.on("connection", (socket) => {
           table.difficulty,
           table.stakePoints
         );
+        // identity.twoPlayerFinishProfile bu oyun başlamadan ÖNCEKİ sayacı taşır;
+        // DB sayacını şimdi artırmak bu karşılaşmayı 1..5 / 6+ ayrımına doğru dahil eder.
+        await incrementAdaptiveBotTimingGame(identity.player.id, table.gameKey);
       } catch (error) {
         socket.emit("match_error", {
           code: error.publicCode || "NO_GAME_RIGHT",
@@ -11027,6 +11107,7 @@ io.on("connection", (socket) => {
         try {
           assertRoundCountEligibility(botTable.roundCount, identity.generalScore, botTable.stakePoints);
           await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints);
+          await incrementAdaptiveBotTimingGame(player.id, gameKey);
         } catch (error) {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
@@ -11759,18 +11840,7 @@ io.on("connection", (socket) => {
       if (baseGameKey === "digit_hunt") winningAnswer = digitHuntAnswerFinishedFiniteRun(room.puzzle, payload.answer || {});
 
       if (winningAnswer) {
-        const opponent = getOpponentParticipant(room, participant.playerId);
-        if (baseGameKey === "merge_5120" && opponent?.isBot === true && room.activeBotPlan?.adaptive729Race === true) {
-          const winChanceBps = merge5120PlayerWinChanceBps(elapsedMs);
-          if (secureRandomInt(0, 10000) < winChanceBps) {
-            registerRealtimeRoundFinish(room, participant, elapsedMs);
-          } else {
-            // Kaybedilen adaptif senaryoda botun 729'a çok az önce ulaştığı kabul edilir.
-            registerRealtimeRoundFinish(room, opponent, Math.max(1, elapsedMs - 1));
-          }
-        } else {
-          registerRealtimeRoundFinish(room, participant, elapsedMs);
-        }
+        registerRealtimeRoundFinish(room, participant, elapsedMs);
       } else {
         registerRealtimeRoundLoss(
           room,
