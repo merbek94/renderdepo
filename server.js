@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "game729-adaptive-bots-digit240-v14-20260909";
+const SERVER_BUILD_ID = "game729-digit-hunt-first5-slow-v16-20260909";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2108,6 +2108,16 @@ const GAME_DEFINITIONS = Object.freeze({
     roundDurationMs: 10 * 60 * 1000,
     hundredStageDurationMs: 10 * 60 * 1000,
     // Rakam Avı ikili/turnuvada skor yarışı değil, sonlu 240 taş akışını ilk tamamlayan yarışıdır.
+    // İlk 5 bot oyununda puan bandı yok sayılır ve bot 480-600 saniyede bitirir.
+    // 6. bot oyunundan itibaren lig/difficulty/ortalama bitirişten bağımsız olarak yalnız authoritative genel puana bakılır.
+    botFirstFiveTimingSeconds: Object.freeze([480, 600]),
+    botUnder1000TimingSeconds: Object.freeze([300, 600]),
+    botScoreTimingSeconds: Object.freeze({
+      million: [100, 140],
+      hundredThousand: [110, 170],
+      tenThousand: [130, 200],
+      thousand: [160, 280],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   next_number: Object.freeze({
@@ -2168,9 +2178,19 @@ const GAME_DEFINITIONS = Object.freeze({
   merge_5120: Object.freeze({
     key: "merge_5120",
     displayName: "729",
-    roundDurationMs: 8 * 60 * 1000,
+    roundDurationMs: 10 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
     // 729 ikili/turnuvada skor yarışı değil, 729 taşına ilk ulaşan yarışıdır.
+    // İlk 5 bot oyununda puan bandı yok sayılır ve bot 480-600 saniyede bitirir.
+    // 6. bot oyunundan itibaren lig/difficulty/ortalama bitirişten bağımsız olarak yalnız authoritative genel puana bakılır.
+    botFirstFiveTimingSeconds: Object.freeze([480, 600]),
+    botUnder1000TimingSeconds: Object.freeze([350, 600]),
+    botScoreTimingSeconds: Object.freeze({
+      million: [105, 190],
+      hundredThousand: [120, 240],
+      tenThousand: [130, 280],
+      thousand: [160, 350],
+    }),
     infiniteDifficultyForStage: () => "Standard",
   }),
   number_puzzle: Object.freeze({
@@ -4440,9 +4460,9 @@ async function incrementAdaptiveBotTimingGame(playerId, gameKey) {
 }
 
 /**
- * Diğer süreli oyunların mevcut bot sistemi korunur. 729 ve Rakam Avı bu genel puan/lig
- * tabanlı profile girmez; onlar createAverageDrivenFirstFinishBotMs ile ilk 5 bot oyunu
- * + oyun-bazlı authoritative ortalama bitirme süresini kullanır.
+ * Bot bitirme aralıkları oyun tanımından ve authoritative genel puandan seçilir.
+ * 729 ve Rakam Avı ilk-bitiren yarışında da aynı puan-bantlı yaklaşımı kullanır;
+ * geçmiş ortalama bitirme süresi, lig ve difficulty bu iki oyunda hesaba katılmaz.
  */
 function secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs) {
   const minSeconds = Math.max(1, Math.floor(Number(rangeSeconds?.[0] || 1)));
@@ -4540,47 +4560,25 @@ function isFirstFinishRaceGameKey(gameKey) {
   return base === "merge_5120" || base === "digit_hunt";
 }
 
-function createAverageDrivenFirstFinishBotMs(finishProfile = {}, gameKey = "merge_5120") {
+function createScoreDrivenFirstFinishBotMs(finishProfile = {}, gameKey = "merge_5120") {
   const profile = normalizeTwoPlayerFinishProfile(finishProfile);
   const config = gameDefinition(gameKey);
-  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 480_000) - 1);
+  const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 600_000) - 1);
 
-  // İlk 5 BOT OYUNU, oyuncunun liginden ve geçmiş hızından bağımsız olarak 6-8 dakika.
+  // 729 ve Rakam Avı için ilk 5 BOT karşılaşması özel yavaş kalibrasyon profilidir.
+  // Sayaç maç başlatılırken artırıldığı için 0..4 değerleri tam olarak ilk beş oyunu temsil eder.
   if (profile.botGameCount < 5) {
-    return secureBotFinishMsFromSecondRange([360, 480], absoluteMaxMs);
+    const firstFiveRange = config?.botFirstFiveTimingSeconds;
+    if (Array.isArray(firstFiveRange) && firstFiveRange.length >= 2) {
+      return secureBotFinishMsFromSecondRange(firstFiveRange, absoluteMaxMs);
+    }
   }
 
-  // Beş oyundan sonra bot yalnız bu oyundaki authoritative ortalama bitirme süresini kullanır.
-  // Hiç bitiriş örneği yoksa 300 saniyelik eşik profili güvenli varsayımdır.
-  const averageSecondsRaw = profile.averageFinishMs == null
-    ? 300
-    : Math.max(1, Number(profile.averageFinishMs) / 1000);
-  const averageSeconds = Math.max(1, Math.min(480, averageSecondsRaw));
-
-  let fastChancePercent;
-  let fastRange;
-  let slowRange;
-
-  if (averageSeconds <= 120) {
-    fastChancePercent = 10;
-    fastRange = [90, 120];
-    slowRange = [120, 300];
-  } else if (averageSeconds < 300) {
-    // 120 sn'de %10 hızlı / %90 yavaş. 120 üstündeki her TAM 3 saniyede
-    // hızlı olasılık +1, yavaş olasılık -1. Örn. 150 => %20/%80, 177 => %29/%71.
-    const steps = Math.floor((averageSeconds - 120) / 3);
-    fastChancePercent = Math.max(0, Math.min(100, 10 + steps));
-    const split = Math.max(100, Math.min(300, Math.floor(averageSeconds)));
-    fastRange = [100, split];
-    slowRange = [split, 300];
-  } else {
-    fastChancePercent = 60;
-    fastRange = [100, 300];
-    slowRange = [300, 480];
+  const rangeSeconds = botScoreTimingRangeSeconds(config, profile.generalScore);
+  if (!Array.isArray(rangeSeconds) || rangeSeconds.length < 2) {
+    return secureBotFinishMsFromSecondRange(botUnder1000TimingRangeSeconds(config), absoluteMaxMs);
   }
-
-  const useFastRange = secureRandomInt(0, 100) < fastChancePercent;
-  return secureBotFinishMsFromSecondRange(useFastRange ? fastRange : slowRange, absoluteMaxMs);
+  return secureBotFinishMsFromSecondRange(rangeSeconds, absoluteMaxMs);
 }
 
 function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
@@ -4588,12 +4586,12 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
   const baseGameKey = normalizeBaseGameKey(gameKey);
 
   if (baseGameKey === "merge_5120" || baseGameKey === "digit_hunt") {
-    // 729 ve Rakam Avı: lig/genel puan/difficulty bot hızını etkilemez.
-    // Her iki oyun da ilk bitiren yarışı olduğu için botun gerçek finishMs zamanı baştan belirlenir.
+    // 729 ve Rakam Avı ilk-bitiren yarışıdır. Botun bitirme zamanı yalnız oyuncunun
+    // authoritative genel puan bandından seçilir; geçmiş ortalama, lig ve difficulty kullanılmaz.
     return {
-      finishMs: createAverageDrivenFirstFinishBotMs(finishProfile, baseGameKey),
+      finishMs: createScoreDrivenFirstFinishBotMs(finishProfile, baseGameKey),
       leaveMs: null,
-      averageDrivenFirstFinishRace: true,
+      scoreDrivenFirstFinishRace: true,
     };
   }
 
@@ -6386,13 +6384,35 @@ function wrongNumbersEvaluate(values, operators, parenStart) {
   const innerOp = operators[parenStart];
   if (innerOp !== WRONG_NUMBERS_PLUS && innerOp !== WRONG_NUMBERS_MINUS) return null;
   const inner = innerOp === WRONG_NUMBERS_PLUS ? values[parenStart] + values[parenStart + 1] : values[parenStart] - values[parenStart + 1];
-  if (!(inner > 0)) return null;
+  if (!(inner > 0) || inner > 25) return null;
   const collapsedValues = [], collapsedOps = [];
   for (let i = 0; i < values.length; i += 1) {
     if (i === parenStart) { collapsedValues.push(inner); i += 1; } else collapsedValues.push(values[i]);
   }
   for (let i = 0; i < operators.length; i += 1) if (i !== parenStart) collapsedOps.push(operators[i]);
   return wrongNumbersEvaluateFlat(collapsedValues, collapsedOps);
+}
+
+function wrongNumbersParenthesisLimitsValid(values, operators, parenStart) {
+  if (!Array.isArray(values) || !Array.isArray(operators)) return false;
+  const innerOp = operators[parenStart];
+  const inner = innerOp === WRONG_NUMBERS_PLUS
+    ? Number(values[parenStart]) + Number(values[parenStart + 1])
+    : innerOp === WRONG_NUMBERS_MINUS
+      ? Number(values[parenStart]) - Number(values[parenStart + 1])
+      : NaN;
+  if (!Number.isFinite(inner) || inner <= 0 || inner > 25) return false;
+
+  // Parantezin solundaki ×, parantezi values[parenStart - 1] ile; sağındaki × ise
+  // values[parenStart + 2] ile çarpar. Çarpan dış sayı 5'i geçemez.
+  if (parenStart > 0 && operators[parenStart - 1] === WRONG_NUMBERS_MULTIPLY) {
+    if (Number(values[parenStart - 1]) > 5) return false;
+  }
+  if (parenStart + 1 < operators.length && operators[parenStart + 1] === WRONG_NUMBERS_MULTIPLY) {
+    const rightExternalIndex = parenStart + 2;
+    if (rightExternalIndex >= values.length || Number(values[rightExternalIndex]) > 5) return false;
+  }
+  return true;
 }
 
 function wrongNumbersEncodingValid(puzzle) {
@@ -6409,6 +6429,7 @@ function wrongNumbersEncodingValid(puzzle) {
   if (parenStart > 0) touching.push(operators[parenStart - 1]);
   if (parenStart + 1 < operators.length) touching.push(operators[parenStart + 1]);
   if (touching.filter((op) => op === WRONG_NUMBERS_MULTIPLY || op === WRONG_NUMBERS_DIVIDE).length !== 1) return false;
+  if (!wrongNumbersParenthesisLimitsValid(values, operators, parenStart)) return false;
   if (initialGrid.filter((v) => v == null).length !== 1) return false;
   for (let i = 0; i < WRONG_NUMBERS_COUNT; i += 1) if (initialGrid[i] != null && Number(initialGrid[i]) !== values[i]) return false;
   const result = wrongNumbersEvaluate(values, operators, parenStart);
@@ -8123,7 +8144,6 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
 
     const puzzle = generatePuzzleForGame(gameKey, difficulty);
     const plan = createGameAwareBotPlan(gameKey, difficulty, finishProfile || {});
-    await incrementAdaptiveBotTimingGameInTransaction(client, req.auth.sub, gameKey);
     await client.query(
       `INSERT INTO secure_game_challenges
        (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, wager_points, expires_at, result)
@@ -8132,6 +8152,9 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       [challengeId, req.auth.sub, gameKey, challengeMode, difficulty, stage,
        JSON.stringify(puzzle), stakePoints, lifetimeMs, JSON.stringify({ status: "active", plan, matchMode, gameKey })]
     );
+    if (isFirstFinishRaceGameKey(gameKey)) {
+      await incrementAdaptiveBotTimingGameInTransaction(client, req.auth.sub, gameKey);
+    }
     await client.query("COMMIT");
     res.json({
       ok: true,
@@ -10960,9 +10983,6 @@ io.on("connection", (socket) => {
           table.difficulty,
           table.stakePoints
         );
-        // identity.twoPlayerFinishProfile bu oyun başlamadan ÖNCEKİ sayacı taşır;
-        // DB sayacını şimdi artırmak bu karşılaşmayı 1..5 / 6+ ayrımına doğru dahil eder.
-        await incrementAdaptiveBotTimingGame(identity.player.id, table.gameKey);
       } catch (error) {
         socket.emit("match_error", {
           code: error.publicCode || "NO_GAME_RIGHT",
@@ -11001,6 +11021,13 @@ io.on("connection", (socket) => {
         table.puzzles,
         identity.twoPlayerFinishProfile
       );
+      if (isFirstFinishRaceGameKey(table.gameKey)) {
+        try {
+          await incrementAdaptiveBotTimingGame(identity.player.id, table.gameKey);
+        } catch (error) {
+          console.error("first-finish bot game counter update failed:", error);
+        }
+      }
 
       socket.emit("match_found", {
         roomId: room.roomId,
@@ -11107,7 +11134,6 @@ io.on("connection", (socket) => {
         try {
           assertRoundCountEligibility(botTable.roundCount, identity.generalScore, botTable.stakePoints);
           await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints);
-          await incrementAdaptiveBotTimingGame(player.id, gameKey);
         } catch (error) {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
@@ -11119,6 +11145,13 @@ io.on("connection", (socket) => {
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
           botTable.roundCount, botPuzzles, identity.twoPlayerFinishProfile
         );
+        if (isFirstFinishRaceGameKey(gameKey)) {
+          try {
+            await incrementAdaptiveBotTimingGame(player.id, gameKey);
+          } catch (error) {
+            console.error("first-finish bot game counter update failed:", error);
+          }
+        }
         socket.emit("match_found", {
           roomId: room.roomId,
           opponent: { name: botTable.player.name, country: botTable.player.country, matchKey: matchmakingPlayerKey(botTable.player.id) },
