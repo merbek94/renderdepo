@@ -5334,7 +5334,7 @@ function merge5120SpawnBounds(board) {
   const highest = merge5120HighestTile(board);
   if (highest <= 243) return [3, 27];
   if (highest < 2187) return [3, 81];
-  return [Math.max(3, Math.floor(highest / 243)), Math.max(3, Math.floor(highest / 9))];
+  return [Math.max(3, Math.floor(highest / 729)), Math.max(3, Math.floor(highest / 9))];
 }
 
 function merge5120TopValues(board) {
