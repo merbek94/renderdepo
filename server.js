@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "game729-digit-hunt-first5-slow-v16-20260909";
+const SERVER_BUILD_ID = "game729-floor729-explosion-v17-20260910";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5352,17 +5352,10 @@ function merge5120Tile(seed, orderValue, board) {
   const order = Math.max(1, Math.floor(Number(orderValue) || 1));
   if (order <= 10) return merge5120Hash(seed, order) < 0.60 ? 3 : 9;
   const [minValue, maxValue] = merge5120SpawnBounds(board);
+  // Alt sınırın altındaki eski taşlar artık yeniden spawn edilmez; authoritative replay
+  // onları hamle akışında otomatik olarak temizler.
   const allowedRaw = merge5120AllowedValues(minValue, maxValue);
-  const standardAllowed = allowedRaw.length ? allowedRaw : [Math.max(3, minValue)];
-  // Dinamik alt sınır yükselmiş olsa bile tahtada daha küçük eski bir taş kaldıysa,
-  // yalnız tahtadaki EN KÜÇÜK eski değer ek aday olur; normal aralık genişlemez.
-  const boardValues = board.filter((v) => v != null).map(Number);
-  const legacySmallest = boardValues.length ? Math.min(...boardValues) : null;
-  const allowed = Array.from(new Set(
-    legacySmallest != null && legacySmallest < minValue
-      ? standardAllowed.concat([legacySmallest])
-      : standardAllowed
-  )).sort((a, b) => a - b);
+  const allowed = allowedRaw.length ? allowedRaw : [Math.max(3, minValue)];
   const topValues = merge5120TopValues(board);
   const topAllowed = topValues.filter((v) => allowed.includes(v));
   const chooseSame = merge5120Hash((Number(seed) | 0) ^ (0x13579BDF | 0), order) < 0.80;
@@ -5411,6 +5404,29 @@ function merge5120Gravity(board) {
   }
 }
 
+function merge5120BelowFloorIndices(board) {
+  const [minValue] = merge5120SpawnBounds(board);
+  if (minValue <= 3) return [];
+  const result = [];
+  board.forEach((value, index) => {
+    if (value != null && Number(value) < minValue) result.push(index);
+  });
+  return result;
+}
+
+function merge5120ExplodeBelowFloor(board, indices, trackedRow, trackedCol) {
+  if (!Array.isArray(indices) || indices.length === 0) return trackedRow;
+  for (const index of indices) {
+    if (index >= 0 && index < board.length) board[index] = null;
+  }
+  let occupiedBelow = 0;
+  for (let row = trackedRow + 1; row < MERGE_5120_ROWS; row += 1) {
+    if (board[row * MERGE_5120_COLS + trackedCol] != null) occupiedBelow += 1;
+  }
+  merge5120Gravity(board);
+  return Math.max(0, Math.min(MERGE_5120_ROWS - 1, MERGE_5120_ROWS - 1 - occupiedBelow));
+}
+
 function merge5120DropState(state, seed, columnValue) {
   const column = Math.floor(Number(columnValue));
   if (!Number.isInteger(column) || column < 0 || column >= MERGE_5120_COLS) return null;
@@ -5424,6 +5440,13 @@ function merge5120DropState(state, seed, columnValue) {
   const currentCol = column;
   let currentValue = merge5120Tile(seed, state.moves.length + 1, board);
   board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
+
+  // Eski client kaydında alt sınırın altında kalmış taşlar varsa ilk yeni hamlede de temizle.
+  const initialExplosions = merge5120BelowFloorIndices(board);
+  if (initialExplosions.length) {
+    currentRow = merge5120ExplodeBelowFloor(board, initialExplosions, currentRow, currentCol);
+  }
+
   let score = Math.max(0, Number(state.score || 0));
   let maxTileEver = Math.max(0, Number(state.maxTileEver || 0), currentValue);
 
@@ -5443,6 +5466,11 @@ function merge5120DropState(state, seed, columnValue) {
     }
     if (currentRow < 0) break;
     board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
+
+    const exploding = merge5120BelowFloorIndices(board);
+    if (exploding.length) {
+      currentRow = merge5120ExplodeBelowFloor(board, exploding, currentRow, currentCol);
+    }
   }
 
   merge5120Gravity(board);
