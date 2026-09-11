@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "game729-floor729-explosion-v17-20260910";
+const SERVER_BUILD_ID = "game729-infinite-save-history-v18-20260911";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -841,6 +841,8 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS wager_points INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE secure_game_challenges
       ADD COLUMN IF NOT EXISTS game_key TEXT NOT NULL DEFAULT 'target_number';
+    ALTER TABLE secure_game_challenges
+      ADD COLUMN IF NOT EXISTS progress_state JSONB;
 
     -- Yeni görev mimarisi: geçmiş event taramak yerine oyuncu başına tek aggregate satır.
     CREATE TABLE IF NOT EXISTS player_task_state (
@@ -5295,7 +5297,8 @@ function shortestPathAnswerIsWinning(puzzle, answer = {}) {
 const MERGE_5120_ROWS = 8;
 const MERGE_5120_COLS = 6;
 const MERGE_5120_CELLS = MERGE_5120_ROWS * MERGE_5120_COLS;
-const MERGE_5120_MOVE_CAP = 512;
+// Sonsuz 729'da toplam hamle sayısına yapay bir üst sınır yoktur.
+// Uzun koşular secure_game_challenges.progress_state içinde kompakt authoritative checkpoint olarak tutulur.
 const NUMBER_PUZZLE_COLS = 17;
 const NUMBER_PUZZLE_ROWS = 17;
 const NUMBER_PUZZLE_CELLS = NUMBER_PUZZLE_COLS * NUMBER_PUZZLE_ROWS;
@@ -5438,7 +5441,7 @@ function merge5120DropState(state, seed, columnValue) {
   if (currentRow < 0) return null;
 
   const currentCol = column;
-  let currentValue = merge5120Tile(seed, state.moves.length + 1, board);
+  let currentValue = merge5120Tile(seed, Number(state.moveCount || 0) + 1, board);
   board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
 
   // Eski client kaydında alt sınırın altında kalmış taşlar varsa ilk yeni hamlede de temizle.
@@ -5474,14 +5477,14 @@ function merge5120DropState(state, seed, columnValue) {
   }
 
   merge5120Gravity(board);
-  return { board, moves: state.moves.concat(column), score, maxTileEver };
+  return { board, moveCount: Number(state.moveCount || 0) + 1, score, maxTileEver };
 }
 
 function replayMerge5120(puzzle, answer = {}) {
   const seed = Number(puzzle?.numbers?.[0]);
   const moves = Array.isArray(answer?.moves) ? answer.moves : [];
-  if (!Number.isInteger(seed) || moves.length > MERGE_5120_MOVE_CAP) return null;
-  let state = { board: Array(MERGE_5120_CELLS).fill(null), moves: [], score: 0, maxTileEver: 0 };
+  if (!Number.isInteger(seed)) return null;
+  let state = { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
   for (const move of moves) {
     if (!Number.isInteger(Number(move))) return null;
     const next = merge5120DropState(state, seed, Number(move));
@@ -5489,6 +5492,67 @@ function replayMerge5120(puzzle, answer = {}) {
     state = next;
   }
   return state;
+}
+
+function normalizeMerge5120Checkpoint(raw) {
+  const board = Array.isArray(raw?.board) ? raw.board.map((value) => value == null ? null : Number(value)) : null;
+  const moveCount = Number(raw?.moveCount ?? 0);
+  const score = Number(raw?.score ?? 0);
+  const maxTileEver = Number(raw?.maxTileEver ?? 0);
+  if (!board || board.length !== MERGE_5120_CELLS) {
+    return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+  }
+  if (!Number.isSafeInteger(moveCount) || moveCount < 0 ||
+      !Number.isInteger(score) || score < 0 ||
+      !Number.isInteger(maxTileEver) || maxTileEver < 0) {
+    return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+  }
+  const boardValid = board.every((value) => {
+    if (value == null) return true;
+    if (!Number.isInteger(value) || value < 3) return false;
+    let v = value;
+    while (v > 3 && v % 3 === 0) v /= 3;
+    return v === 3;
+  });
+  if (!boardValid) return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+  return { board, moveCount, score, maxTileEver };
+}
+
+function merge5120ApplyCheckpointMoves(puzzle, checkpointRaw, baseMoveCountValue, movesRaw) {
+  const seed = Number(puzzle?.numbers?.[0]);
+  if (!Number.isInteger(seed)) return null;
+  const moves = Array.isArray(movesRaw) ? movesRaw.map(Number) : [];
+  if (moves.some((move) => !Number.isInteger(move) || move < 0 || move >= MERGE_5120_COLS)) return null;
+  const baseMoveCount = Number(baseMoveCountValue ?? 0);
+  if (!Number.isSafeInteger(baseMoveCount) || baseMoveCount < 0) return null;
+
+  let state = normalizeMerge5120Checkpoint(checkpointRaw);
+  if (baseMoveCount > state.moveCount) return null;
+
+  // İstek daha önce uygulanmış bir parçayı tekrar içeriyorsa authoritative checkpoint kadarını atla.
+  // Böylece ağ cevabı sonrası uygulama kapanması gibi durumlarda senkronizasyon idempotent kalır.
+  const alreadyApplied = Math.max(0, state.moveCount - baseMoveCount);
+  if (alreadyApplied >= moves.length) return state;
+
+  for (let index = alreadyApplied; index < moves.length; index += 1) {
+    const next = merge5120DropState(state, seed, moves[index]);
+    if (!next) return null;
+    state = next;
+  }
+  return state;
+}
+
+function merge5120AnswerMatchesState(state, answer = {}) {
+  if (!state) return false;
+  if (!Number.isInteger(Number(answer?.score)) || Number(answer.score) !== Number(state.score || 0)) return false;
+  const board = Array.isArray(answer?.board) ? answer.board : [];
+  if (board.length !== MERGE_5120_CELLS) return false;
+  if (!board.every((value, index) => {
+    const expected = state.board[index];
+    return expected == null ? value == null : Number(value) === expected;
+  })) return false;
+  const totalMoveCount = Number(answer?.totalMoveCount ?? state.moveCount);
+  return Number.isSafeInteger(totalMoveCount) && totalMoveCount === Number(state.moveCount || 0);
 }
 
 function validateMerge5120Answer(puzzle, answer = {}) {
@@ -8298,6 +8362,89 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
   }
 });
 
+app.post("/game/challenges/progress", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const challengeId = safeText(req.body.challengeId, "", 128);
+  if (!challengeId) {
+    res.status(400).json({ ok: false, message: "challengeId zorunlu." });
+    return;
+  }
+
+  const moves = Array.isArray(req.body.moves) ? req.body.moves : [];
+  const baseMoveCount = Number(req.body.baseMoveCount ?? 0);
+  if (!Number.isSafeInteger(baseMoveCount) || baseMoveCount < 0) {
+    res.status(400).json({ ok: false, message: "Geçersiz 729 checkpoint sayacı." });
+    return;
+  }
+  // Bu yalnız tek bir ağ paketinin büyüklüğünü sınırlar; toplam oyun hamlesine sınır koymaz.
+  if (moves.length > 512) {
+    res.status(413).json({ ok: false, message: "729 checkpoint paketi çok büyük." });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT * FROM secure_game_challenges
+       WHERE challenge_id = $1 AND player_id = $2
+         AND mode = 'infinite' AND completed_at IS NULL
+       FOR UPDATE`,
+      [challengeId, req.auth.sub]
+    );
+    if (result.rowCount === 0) {
+      const error = new Error("Aktif sonsuz oyun doğrulama kaydı bulunamadı.");
+      error.statusCode = 404;
+      throw error;
+    }
+
+    const challenge = result.rows[0];
+    const gameKey = normalizeBaseGameKey(challenge.game_key || challenge.puzzle?.gameKey);
+    if (gameKey !== "merge_5120") {
+      const error = new Error("Bu checkpoint endpoint'i yalnız 729 sonsuz modunu destekler.");
+      error.statusCode = 400;
+      throw error;
+    }
+    if (Date.now() > new Date(challenge.expires_at).getTime()) {
+      const error = new Error("Oyun doğrulama kaydının süresi doldu.");
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const state = merge5120ApplyCheckpointMoves(
+      challenge.puzzle,
+      challenge.progress_state,
+      baseMoveCount,
+      moves
+    );
+    if (!state) {
+      const error = new Error("729 checkpoint hamleleri doğrulanamadı.");
+      error.statusCode = 422;
+      throw error;
+    }
+
+    await client.query(
+      `UPDATE secure_game_challenges
+       SET progress_state = $2::jsonb
+       WHERE challenge_id = $1`,
+      [challengeId, JSON.stringify(state)]
+    );
+    await client.query("COMMIT");
+    res.json({
+      ok: true,
+      moveCount: state.moveCount,
+      score: state.score,
+      board: state.board,
+      maxTileEver: state.maxTileEver,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "729 sonsuz ilerlemesi kaydedilemedi.", "729 checkpoint error:");
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const challengeId = safeText(req.body.challengeId, "", 128);
@@ -8342,18 +8489,28 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       error.publicCode = "HUNDRED_STAGE_EXPIRED";
       throw error;
     }
-    if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer)) {
-      const error = new Error("Oyun sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
-    }
     const mergeInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "merge_5120";
     const digitHuntInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "digit_hunt";
+    let replayedMergeState = null;
     if (mergeInfiniteSingleRun) {
-      const replayedMergeState = replayMerge5120(challenge.puzzle, req.body.answer || {});
-      if (!replayedMergeState || !merge5120OverflowColumnIsValid(replayedMergeState, req.body?.answer?.overflowColumn)) {
+      replayedMergeState = merge5120ApplyCheckpointMoves(
+        challenge.puzzle,
+        challenge.progress_state,
+        req.body?.answer?.baseMoveCount,
+        req.body?.answer?.moves
+      );
+      if (!replayedMergeState || !merge5120AnswerMatchesState(replayedMergeState, req.body.answer || {})) {
+        const error = new Error("729 sonsuz oyunu checkpoint state'i sunucuda doğrulanamadı.");
+        error.statusCode = 422;
+        throw error;
+      }
+      if (!merge5120OverflowColumnIsValid(replayedMergeState, req.body?.answer?.overflowColumn)) {
         const error = new Error("729 sonsuz oyunu yalnız üst sınır aşıldığında tamamlanabilir.");
         error.statusCode = 422;
         throw error;
       }
+    } else if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer)) {
+      const error = new Error("Oyun sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
     }
     if (digitHuntInfiniteSingleRun) {
       const replayed = replayDigitHunt(challenge.puzzle, req.body.answer || {});
@@ -8363,16 +8520,18 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         throw error;
       }
     }
-    let answerWon = challengeAnswerIsWinning(
-      challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer
-    );
+    let answerWon = mergeInfiniteSingleRun
+      ? true
+      : challengeAnswerIsWinning(
+          challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer
+        );
     if ((challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") && gameKey === "merge_5120") {
       answerWon = merge5120AnswerReached729(challenge.puzzle, req.body.answer || {});
     }
     if ((challenge.mode === "two_player_bot" || challenge.mode === "tournament_bot") && gameKey === "digit_hunt") {
       answerWon = digitHuntAnswerFinishedFiniteRun(challenge.puzzle, req.body.answer || {});
     }
-    if (mergeInfiniteSingleRun || digitHuntInfiniteSingleRun) answerWon = true;
+    if (digitHuntInfiniteSingleRun) answerWon = true;
     const wrongAnswerReason = gameKey === "shortest_path"
       ? "wrong_route"
       : gameKey === "digit_attack" ? "three_mistakes" : "wrong_answer";
