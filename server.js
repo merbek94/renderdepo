@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "game729-infinite-highest-tile-v19-20260911";
+const SERVER_BUILD_ID = "game729-unbounded-exponent-tiles-v20-20260912";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -5319,25 +5319,53 @@ function merge5120Hash(seedValue, orderValue) {
   return (x >>> 0) / 4294967296;
 }
 
-function merge5120AllowedValues(minValue, maxValue) {
-  const result = [];
-  for (let value = 3; value <= maxValue && value <= 2_000_000_000; value *= 3) {
-    if (value >= minValue) result.push(value);
-    if (value > Math.floor(2_000_000_000 / 3)) break;
+const MERGE_729_CHECKPOINT_ENCODING = "power_exponent_v1";
+
+function merge729LegacyPowerToExponent(valueRaw) {
+  const value = Number(valueRaw);
+  if (!Number.isInteger(value)) return null;
+  // v16 client 3^20'yi Int'e sığdıramadığı için 2 milyara clamp ediyordu.
+  if (value === 2_000_000_000) return 20;
+  if (value < 3) return null;
+  let current = 3;
+  let exponent = 1;
+  while (current < value && current <= Math.floor(Number.MAX_SAFE_INTEGER / 3)) {
+    current *= 3;
+    exponent += 1;
   }
+  return current === value ? exponent : null;
+}
+
+function merge729RawValueCapped(exponentValue, cap = 2_000_000_000) {
+  const exponent = Math.max(0, Math.floor(Number(exponentValue) || 0));
+  let value = 1;
+  for (let i = 0; i < exponent; i += 1) {
+    if (value > Math.floor(cap / 3)) return cap;
+    value *= 3;
+  }
+  return Math.min(cap, value);
+}
+
+function merge5120AllowedValues(minExponent, maxExponent) {
+  const min = Math.max(1, Math.floor(Number(minExponent) || 1));
+  const max = Math.max(min, Math.floor(Number(maxExponent) || min));
+  const result = [];
+  for (let exponent = min; exponent <= max; exponent += 1) result.push(exponent);
   return result;
 }
 
+// v17+: 729 tahtasında ham sayı değil 3'ün üssü tutulur.
+// 1=3, 2=9, 6=729, 19=3^19, 20=3^20 ...
 function merge5120HighestTile(board) {
   const values = board.filter((v) => v != null).map(Number);
-  return values.length ? Math.max(...values) : 3;
+  return values.length ? Math.max(...values) : 1;
 }
 
 function merge5120SpawnBounds(board) {
-  const highest = merge5120HighestTile(board);
-  if (highest <= 243) return [3, 27];
-  if (highest < 2187) return [3, 81];
-  return [Math.max(3, Math.floor(highest / 729)), Math.max(3, Math.floor(highest / 9))];
+  const highestExponent = merge5120HighestTile(board);
+  if (highestExponent <= 5) return [1, 3];
+  if (highestExponent < 7) return [1, 4];
+  return [Math.max(1, highestExponent - 6), Math.max(1, highestExponent - 2)];
 }
 
 function merge5120TopValues(board) {
@@ -5353,12 +5381,9 @@ function merge5120TopValues(board) {
 
 function merge5120Tile(seed, orderValue, board) {
   const order = Math.max(1, Math.floor(Number(orderValue) || 1));
-  if (order <= 10) return merge5120Hash(seed, order) < 0.60 ? 3 : 9;
-  const [minValue, maxValue] = merge5120SpawnBounds(board);
-  // Alt sınırın altındaki eski taşlar artık yeniden spawn edilmez; authoritative replay
-  // onları hamle akışında otomatik olarak temizler.
-  const allowedRaw = merge5120AllowedValues(minValue, maxValue);
-  const allowed = allowedRaw.length ? allowedRaw : [Math.max(3, minValue)];
+  if (order <= 10) return merge5120Hash(seed, order) < 0.60 ? 1 : 2; // 3 veya 9
+  const [minExponent, maxExponent] = merge5120SpawnBounds(board);
+  const allowed = merge5120AllowedValues(minExponent, maxExponent);
   const topValues = merge5120TopValues(board);
   const topAllowed = topValues.filter((v) => allowed.includes(v));
   const chooseSame = merge5120Hash((Number(seed) | 0) ^ (0x13579BDF | 0), order) < 0.80;
@@ -5408,11 +5433,11 @@ function merge5120Gravity(board) {
 }
 
 function merge5120BelowFloorIndices(board) {
-  const [minValue] = merge5120SpawnBounds(board);
-  if (minValue <= 3) return [];
+  const [minExponent] = merge5120SpawnBounds(board);
+  if (minExponent <= 1) return [];
   const result = [];
   board.forEach((value, index) => {
-    if (value != null && Number(value) < minValue) result.push(index);
+    if (value != null && Number(value) < minExponent) result.push(index);
   });
   return result;
 }
@@ -5444,7 +5469,6 @@ function merge5120DropState(state, seed, columnValue) {
   let currentValue = merge5120Tile(seed, Number(state.moveCount || 0) + 1, board);
   board[currentRow * MERGE_5120_COLS + currentCol] = currentValue;
 
-  // Eski client kaydında alt sınırın altında kalmış taşlar varsa ilk yeni hamlede de temizle.
   const initialExplosions = merge5120BelowFloorIndices(board);
   if (initialExplosions.length) {
     currentRow = merge5120ExplodeBelowFloor(board, initialExplosions, currentRow, currentCol);
@@ -5453,15 +5477,15 @@ function merge5120DropState(state, seed, columnValue) {
   let score = Math.max(0, Number(state.score || 0));
   let maxTileEver = Math.max(0, Number(state.maxTileEver || 0), currentValue);
 
-  for (let chain = 0; chain < 32; chain += 1) {
+  while (true) {
     const currentIndex = currentRow * MERGE_5120_COLS + currentCol;
     const connected = merge5120ConnectedSame(board, currentIndex, currentValue);
     if (connected.length < 3) break;
     connected.slice(0, 3).forEach((index) => { board[index] = null; });
     merge5120Gravity(board);
-    currentValue = Math.min(2_000_000_000, currentValue * 3);
+    currentValue += 1;
     maxTileEver = Math.max(maxTileEver, currentValue);
-    score = Math.min(2_000_000_000, score + currentValue);
+    score = Math.min(2_000_000_000, score + merge729RawValueCapped(currentValue));
 
     currentRow = -1;
     for (let r = MERGE_5120_ROWS - 1; r >= 0; r -= 1) {
@@ -5495,35 +5519,58 @@ function replayMerge5120(puzzle, answer = {}) {
 }
 
 function normalizeMerge5120Checkpoint(raw) {
-  const board = Array.isArray(raw?.board) ? raw.board.map((value) => value == null ? null : Number(value)) : null;
+  const rawBoard = Array.isArray(raw?.board) ? raw.board : null;
   const moveCount = Number(raw?.moveCount ?? 0);
-  const score = Number(raw?.score ?? 0);
-  const maxTileEver = Number(raw?.maxTileEver ?? 0);
-  if (!board || board.length !== MERGE_5120_CELLS) {
+  if (!rawBoard || rawBoard.length !== MERGE_5120_CELLS || !Number.isSafeInteger(moveCount) || moveCount < 0) {
     return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
   }
-  if (!Number.isSafeInteger(moveCount) || moveCount < 0 ||
-      !Number.isInteger(score) || score < 0 ||
-      !Number.isInteger(maxTileEver) || maxTileEver < 0) {
-    return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+
+  const exponentEncoding = raw?.tileEncoding === MERGE_729_CHECKPOINT_ENCODING;
+  let board;
+  let maxTileEver;
+  if (exponentEncoding) {
+    board = rawBoard.map((value) => value == null ? null : Number(value));
+    maxTileEver = Number(raw?.maxTileExponent ?? raw?.maxTileEver ?? 0);
+    const valid = board.every((value) => value == null || (Number.isInteger(value) && value > 0));
+    if (!valid || !Number.isInteger(maxTileEver) || maxTileEver < 0) {
+      return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+    }
+  } else {
+    // v16 ve öncesi DB checkpoint'leri gerçek 3^n değerleri taşır. İlk sync'te exponent'e migrate edilir.
+    board = [];
+    for (const value of rawBoard) {
+      if (value == null) { board.push(null); continue; }
+      const exponent = merge729LegacyPowerToExponent(value);
+      if (exponent == null) return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+      board.push(exponent);
+    }
+    const oldMax = Number(raw?.maxTileEver ?? 0);
+    maxTileEver = oldMax === 0 ? 0 : merge729LegacyPowerToExponent(oldMax);
+    if (maxTileEver == null) maxTileEver = board.filter((v) => v != null).reduce((m, v) => Math.max(m, v), 0);
   }
-  const boardValid = board.every((value) => {
-    if (value == null) return true;
-    if (!Number.isInteger(value) || value < 3) return false;
-    let v = value;
-    while (v > 3 && v % 3 === 0) v /= 3;
-    return v === 3;
-  });
-  if (!boardValid) return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
-  return { board, moveCount, score, maxTileEver };
+
+  // Sütunlarda boşluğun altında taş bulunamaz.
+  for (let col = 0; col < MERGE_5120_COLS; col += 1) {
+    let emptySeen = false;
+    for (let row = MERGE_5120_ROWS - 1; row >= 0; row -= 1) {
+      const value = board[row * MERGE_5120_COLS + col];
+      if (value == null) emptySeen = true;
+      else if (emptySeen) return { board: Array(MERGE_5120_CELLS).fill(null), moveCount: 0, score: 0, maxTileEver: 0 };
+    }
+  }
+  maxTileEver = Math.max(maxTileEver, ...board.filter((v) => v != null), 0);
+  return { board, moveCount, score: 0, maxTileEver };
 }
 
 function merge5120InfiniteCheckpointPayload(state) {
-  // Sonsuz 729'da skor sistemi yoktur. Kalıcı authoritative checkpoint yalnız oyun state'ini taşır.
+  const maxTileExponent = Math.max(0, Number(state?.maxTileEver || 0));
   return {
+    tileEncoding: MERGE_729_CHECKPOINT_ENCODING,
     board: Array.isArray(state?.board) ? state.board.slice() : Array(MERGE_5120_CELLS).fill(null),
     moveCount: Math.max(0, Number(state?.moveCount || 0)),
-    maxTileEver: Math.max(0, Number(state?.maxTileEver || 0)),
+    // Alan adı geriye dönük istemci koduyla uyumlu tutulur; değeri artık exponent'tir.
+    maxTileEver: maxTileExponent,
+    maxTileExponent,
   };
 }
 
@@ -5537,9 +5584,6 @@ function merge5120ApplyCheckpointMoves(puzzle, checkpointRaw, baseMoveCountValue
 
   let state = normalizeMerge5120Checkpoint(checkpointRaw);
   if (baseMoveCount > state.moveCount) return null;
-
-  // İstek daha önce uygulanmış bir parçayı tekrar içeriyorsa authoritative checkpoint kadarını atla.
-  // Böylece ağ cevabı sonrası uygulama kapanması gibi durumlarda senkronizasyon idempotent kalır.
   const alreadyApplied = Math.max(0, state.moveCount - baseMoveCount);
   if (alreadyApplied >= moves.length) return state;
 
@@ -5553,7 +5597,6 @@ function merge5120ApplyCheckpointMoves(puzzle, checkpointRaw, baseMoveCountValue
 
 function merge5120AnswerMatchesState(state, answer = {}) {
   if (!state) return false;
-  // Sonsuz 729'da skor yoktur; doğrulama yalnız authoritative tahta + toplam hamle sayısına dayanır.
   const board = Array.isArray(answer?.board) ? answer.board : [];
   if (board.length !== MERGE_5120_CELLS) return false;
   if (!board.every((value, index) => {
@@ -5580,7 +5623,6 @@ function merge5120OverflowColumnIsValid(state, columnValue) {
   const column = Number(columnValue);
   if (!state || !Array.isArray(state.board)) return false;
   if (!Number.isInteger(column) || column < 0 || column >= MERGE_5120_COLS) return false;
-  // Yerçekimi nedeniyle üst hücre doluysa bu sütunda artık yeni taş için yer yoktur.
   return state.board[column] != null;
 }
 
@@ -5591,7 +5633,7 @@ function merge5120AnswerIsWinning(puzzle, answer = {}) {
 
 function merge5120AnswerReached729(puzzle, answer = {}) {
   const state = replayMerge5120(puzzle, answer);
-  return !!state && Number(state.maxTileEver || 0) >= 729;
+  return !!state && Number(state.maxTileEver || 0) >= 6; // 3^6 = 729
 }
 
 function generateMerge5120Puzzle() {
