@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "score64-global-digit-hunt-v21-20260914";
+const SERVER_BUILD_ID = "per-game-scoreboards-home-wins-v22-20260914";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -512,6 +512,7 @@ async function initDatabase() {
       game_rights INTEGER NOT NULL DEFAULT 10 CHECK (game_rights BETWEEN 0 AND 10),
       game_rights_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       diamond_balance INTEGER NOT NULL DEFAULT 0 CHECK (diamond_balance >= 0),
+      home_two_player_wins BIGINT NOT NULL DEFAULT 0 CHECK (home_two_player_wins >= 0),
       level_reward_claimed_through INTEGER NOT NULL DEFAULT 0
         CHECK (level_reward_claimed_through BETWEEN 0 AND 1000),
       two_player_finish_count INTEGER NOT NULL DEFAULT 0
@@ -695,6 +696,8 @@ async function initDatabase() {
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS diamond_balance INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS home_two_player_wins BIGINT NOT NULL DEFAULT 0 CHECK (home_two_player_wins >= 0);
+    ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS level_reward_claimed_through INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0;
@@ -761,13 +764,18 @@ async function initDatabase() {
       ON guest_credentials (updated_at, guest_id)
       WHERE linked_player_id IS NULL;
 
-    -- Oyunların kendileri dışında bütün sistem ortaktır; yalnızca oyun bazlı ilerleme
-    -- bu tabloda game_key ile ayrılır. Genel puan, 10 oyun hakkı, günlük 100 kişilik
-    -- hakları ve turnuva biletleri player_progress içinde ortak kalır.
+    -- Oyunların kendileri dışında bütün sistem ortaktır. Oyun-bazlı normal skor, sonsuz skor
+    -- ve oyun ilerlemesi bu tabloda game_key ile ayrılır; 10 oyun hakkı ve turnuva biletleri
+    -- gibi gerçekten ortak kaynaklar player_progress içinde kalır.
     CREATE TABLE IF NOT EXISTS player_game_progress (
       player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
       game_key TEXT NOT NULL,
+      general_score BIGINT NOT NULL DEFAULT 0 CHECK (general_score >= 0),
       infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
+      monthly_key TEXT NOT NULL DEFAULT '',
+      monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
+      monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0),
+      monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
       infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
       tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
@@ -790,7 +798,17 @@ async function initDatabase() {
     -- player_game_progress daha önce oluşmuşsa eksik kolonların tamamını burada tamamla.
     -- Bu blok tekrar çalıştırılabilir; mevcut kolonlara dokunmaz.
     ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS general_score BIGINT NOT NULL DEFAULT 0 CHECK (general_score >= 0);
+    ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS monthly_key TEXT NOT NULL DEFAULT '';
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
+    ALTER TABLE player_game_progress
+      ADD COLUMN IF NOT EXISTS monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0);
     ALTER TABLE player_game_progress
@@ -824,7 +842,10 @@ async function initDatabase() {
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
+    ALTER TABLE player_game_progress ALTER COLUMN general_score TYPE BIGINT USING general_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
+    ALTER TABLE player_game_progress ALTER COLUMN monthly_general_score TYPE BIGINT USING monthly_general_score::bigint;
+    ALTER TABLE player_game_progress ALTER COLUMN monthly_infinite_score TYPE BIGINT USING monthly_infinite_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
     ALTER TABLE player_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
@@ -833,14 +854,57 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_player_game_progress_game
       ON player_game_progress (game_key, player_id);
 
+    -- 20 ayrı leaderboard fiziksel olarak tek tabloda tutulur. game_key öndeki kolon
+    -- olduğu için her oyunun normal/sonsuz sıralaması kendi küçük indeks aralığını tarar.
+    CREATE INDEX IF NOT EXISTS idx_player_game_progress_general_leaderboard
+      ON player_game_progress (game_key, general_score DESC, player_id ASC)
+      WHERE general_score > 0;
+    CREATE INDEX IF NOT EXISTS idx_player_game_progress_infinite_leaderboard
+      ON player_game_progress (game_key, infinite_score DESC, player_id ASC)
+      WHERE infinite_score > 0;
+    CREATE INDEX IF NOT EXISTS idx_player_game_progress_month_general_leaderboard
+      ON player_game_progress (game_key, monthly_key, monthly_general_score DESC, player_id ASC)
+      WHERE monthly_general_score > 0;
+    CREATE INDEX IF NOT EXISTS idx_player_game_progress_month_infinite_leaderboard
+      ON player_game_progress (game_key, monthly_key, monthly_infinite_score DESC, player_id ASC)
+      WHERE monthly_infinite_score > 0;
+
+    -- Eski tek/global puan yalnız bir kez Hedef Sayıyı Bul oyununa taşınır. Geçmişte hangi
+    -- puanın hangi oyundan geldiği bilinmediği için 20 oyuna çoğaltılmaz.
+    DO $per_game_score_v22$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE migration_id = 'per_game_score_v22_20260914'
+      ) THEN
+        UPDATE player_game_progress gp
+        SET general_score = GREATEST(gp.general_score, s.general_score),
+            monthly_key = CASE WHEN s.monthly_key <> '' THEN s.monthly_key ELSE gp.monthly_key END,
+            monthly_general_score = GREATEST(gp.monthly_general_score, s.monthly_general_score),
+            monthly_infinite_score = GREATEST(gp.monthly_infinite_score, s.monthly_infinite_score),
+            updated_at = NOW()
+        FROM player_scores s
+        WHERE gp.player_id = s.player_id
+          AND gp.game_key = 'target_number';
+
+        INSERT INTO schema_migrations (migration_id)
+        VALUES ('per_game_score_v22_20260914')
+        ON CONFLICT (migration_id) DO NOTHING;
+      END IF;
+    END
+    $per_game_score_v22$;
+
     -- Eski tek oyun sürümündeki Hedef Sayıyı Bul ilerlemesini ilk geçişte koru.
     INSERT INTO player_game_progress (
-      player_id, game_key, infinite_score, infinite_run_score, infinite_next_stage,
+      player_id, game_key, general_score, infinite_score,
+      monthly_key, monthly_general_score, monthly_infinite_score,
+      infinite_run_score, infinite_next_stage,
       tournament_stage, tournament_rights, tournament_bank, tournament_completed,
       tournament_entry_active, hundred_active, hundred_stage,
       two_player_finish_count, two_player_finish_total_ms, updated_at
     )
-    SELECT p.player_id, 'target_number', s.infinite_score, p.infinite_run_score, p.infinite_next_stage,
+    SELECT p.player_id, 'target_number', s.general_score, s.infinite_score,
+           s.monthly_key, s.monthly_general_score, s.monthly_infinite_score,
+           p.infinite_run_score, p.infinite_next_stage,
            p.tournament_stage, p.tournament_rights, p.tournament_bank, p.tournament_completed,
            p.tournament_entry_active, p.hundred_active, p.hundred_stage,
            p.two_player_finish_count, p.two_player_finish_total_ms, NOW()
@@ -913,21 +977,12 @@ async function initDatabase() {
     END
     $leaderboard_index_cleanup_v4$;
 
-    CREATE INDEX IF NOT EXISTS idx_player_scores_general_v3
-      ON player_scores (general_score DESC, player_id ASC)
-      WHERE general_score > 0;
-
-    CREATE INDEX IF NOT EXISTS idx_player_scores_infinite_v3
-      ON player_scores (infinite_score DESC, player_id ASC)
-      WHERE infinite_score > 0;
-
-    CREATE INDEX IF NOT EXISTS idx_player_scores_month_general_v4
-      ON player_scores (monthly_key, monthly_general_score DESC, player_id ASC)
-      WHERE monthly_general_score > 0;
-
-    CREATE INDEX IF NOT EXISTS idx_player_scores_month_infinite_v4
-      ON player_scores (monthly_key, monthly_infinite_score DESC, player_id ASC)
-      WHERE monthly_infinite_score > 0;
+    -- v22: Skor tablosu artık player_game_progress üzerinden oyun-bazlıdır. Eski global
+    -- sıralama indekslerini tutmak yalnız disk/RAM tüketirdi; deploy sırasında kaldır.
+    DROP INDEX IF EXISTS idx_player_scores_general_v3;
+    DROP INDEX IF EXISTS idx_player_scores_infinite_v3;
+    DROP INDEX IF EXISTS idx_player_scores_month_general_v4;
+    DROP INDEX IF EXISTS idx_player_scores_month_infinite_v4;
 
     CREATE INDEX IF NOT EXISTS idx_players_country_player_v2
       ON players (country, player_id);
@@ -1008,6 +1063,93 @@ async function applyLeaderboardGeneralDeltaAndInfiniteHighScoreInTransaction(
          updated_at = NOW()
      WHERE player_id = $1`,
     [playerId, generalDelta, infiniteHighScore, monthKey]
+  );
+}
+
+
+/**
+ * Yeni skor mimarisi: normal ve sonsuz skorlar oyuncu + oyun anahtarında tutulur.
+ * Böylece 20 leaderboard tek player_game_progress tablosu ve game_key önekli indeksleri paylaşır.
+ */
+async function applyGameGeneralScoreDeltaInTransaction(
+  client,
+  playerId,
+  gameKey,
+  generalDelta = 0
+) {
+  const baseGameKey = await ensurePlayerGameProgress(client, playerId, gameKey);
+  const delta = Number(generalDelta || 0);
+  if (!Number.isFinite(delta) || delta === 0) return baseGameKey;
+  const monthKey = currentMonthKey();
+  await client.query(
+    `UPDATE player_game_progress
+     SET general_score = LEAST(
+           9223372036854775807::numeric,
+           GREATEST(0::numeric, general_score::numeric + $3::numeric)
+         )::bigint,
+         monthly_general_score = CASE
+           WHEN monthly_key = $4 THEN
+             LEAST(
+               9223372036854775807::numeric,
+               GREATEST(0::numeric, monthly_general_score::numeric + $3::numeric)
+             )::bigint
+           ELSE LEAST(
+             9223372036854775807::numeric,
+             GREATEST(0::numeric, $3::numeric)
+           )::bigint
+         END,
+         monthly_infinite_score = CASE
+           WHEN monthly_key = $4 THEN monthly_infinite_score
+           ELSE 0
+         END,
+         monthly_key = $4,
+         monthly_updated_at = NOW(),
+         updated_at = NOW()
+     WHERE player_id = $1 AND game_key = $2`,
+    [playerId, baseGameKey, delta, monthKey]
+  );
+  return baseGameKey;
+}
+
+async function applyGameInfiniteHighScoreInTransaction(
+  client,
+  playerId,
+  gameKey,
+  infiniteHighScore
+) {
+  const baseGameKey = await ensurePlayerGameProgress(client, playerId, gameKey);
+  const highScore = safeScoreNumber(infiniteHighScore);
+  const monthKey = currentMonthKey();
+  await client.query(
+    `UPDATE player_game_progress
+     SET infinite_score = GREATEST(infinite_score, $3::bigint),
+         monthly_infinite_score = CASE
+           WHEN monthly_key = $4 THEN GREATEST(monthly_infinite_score, $3::bigint)
+           ELSE $3::bigint
+         END,
+         monthly_general_score = CASE
+           WHEN monthly_key = $4 THEN monthly_general_score
+           ELSE 0
+         END,
+         monthly_key = $4,
+         monthly_updated_at = NOW(),
+         updated_at = NOW()
+     WHERE player_id = $1 AND game_key = $2`,
+    [playerId, baseGameKey, highScore, monthKey]
+  );
+  return baseGameKey;
+}
+
+async function incrementHomeTwoPlayerWinInTransaction(client, playerId) {
+  await client.query(
+    `UPDATE player_progress
+     SET home_two_player_wins = LEAST(
+           home_two_player_wins::numeric + 1,
+           9223372036854775807::numeric
+         )::bigint,
+         updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId]
   );
 }
 
@@ -2135,7 +2277,7 @@ const GAME_DEFINITIONS = Object.freeze({
     hundredStageDurationMs: 10 * 60 * 1000,
     // Rakam Avı ikili/turnuvada skor yarışı değil, sonlu 240 taş akışını ilk tamamlayan yarışıdır.
     // İlk 5 bot oyununda puan bandı yok sayılır ve bot 480-600 saniyede bitirir.
-    // 6. bot oyunundan itibaren lig/difficulty/ortalama bitirişten bağımsız olarak yalnız authoritative genel puana bakılır.
+    // 6. bot oyunundan itibaren lig/difficulty/ortalama bitirişten bağımsız olarak yalnız authoritative ilgili oyun puanına bakılır.
     botFirstFiveTimingSeconds: Object.freeze([480, 600]),
     botUnder1000TimingSeconds: Object.freeze([300, 600]),
     botScoreTimingSeconds: Object.freeze({
@@ -2208,7 +2350,7 @@ const GAME_DEFINITIONS = Object.freeze({
     hundredStageDurationMs: 90 * 1000,
     // 729 ikili/turnuvada skor yarışı değil, 729 taşına ilk ulaşan yarışıdır.
     // İlk 5 bot oyununda puan bandı yok sayılır ve bot 480-600 saniyede bitirir.
-    // 6. bot oyunundan itibaren lig/difficulty/ortalama bitirişten bağımsız olarak yalnız authoritative genel puana bakılır.
+    // 6. bot oyunundan itibaren lig/difficulty/ortalama bitirişten bağımsız olarak yalnız authoritative ilgili oyun puanına bakılır.
     botFirstFiveTimingSeconds: Object.freeze([480, 600]),
     botUnder1000TimingSeconds: Object.freeze([350, 600]),
     botScoreTimingSeconds: Object.freeze({
@@ -3094,7 +3236,7 @@ function challengeRewards(mode, stage) {
   if (mode === "infinite") {
     const points = Math.min(MAX_SAFE_SCORE, safeStage * 5);
     const stageSum = safeStage * (safeStage + 1) / 2;
-    // Sonsuz mod puanı ayrı tutulur; normal/genel puanı artırmaz.
+    // Sonsuz mod puanı ayrı tutulur; normal oyun puanını artırmaz.
     return { generalDelta: 0, infiniteDelta: points, xpDelta: Math.min(2_000_000_000, stageSum * 5) };
   }
   return { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 };
@@ -3255,7 +3397,7 @@ function assertOpenTableStake(stakePoints, availableScore, difficulty) {
     throw error;
   }
   if (requested > Number(availableScore || 0)) {
-    const error = new Error("Masa puanı mevcut genel puanınızı aşamaz.");
+    const error = new Error("Masa puanı mevcut oyun puanınızı aşamaz.");
     error.statusCode = 409;
     error.publicCode = "INSUFFICIENT_SCORE";
     throw error;
@@ -3278,7 +3420,7 @@ function normalizeRequestedStake(value, difficulty, availableScore, allowAutomat
     throw error;
   }
   if (requested > score) {
-    const error = new Error("Seçilen oyun puanı mevcut genel puanınızı aşamaz.");
+    const error = new Error("Seçilen oyun puanı mevcut oyun puanınızı aşamaz.");
     error.statusCode = 409;
     error.publicCode = "INSUFFICIENT_SCORE";
     throw error;
@@ -3286,15 +3428,19 @@ function normalizeRequestedStake(value, difficulty, availableScore, allowAutomat
   return requested;
 }
 
-async function assertTwoPlayerEntryScoreInTransaction(client, playerId, difficulty, wagerPoints = 0, allowAutomatic = false) {
+async function assertTwoPlayerEntryScoreInTransaction(
+  client, playerId, difficulty, wagerPoints = 0, allowAutomatic = false, gameKey = "target_number"
+) {
+  const baseGameKey = await ensurePlayerGameProgress(client, playerId, gameKey);
   const result = await client.query(
-    `SELECT general_score FROM player_scores WHERE player_id = $1 FOR UPDATE`,
-    [playerId]
+    `SELECT general_score FROM player_game_progress
+     WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
+    [playerId, baseGameKey]
   );
   const generalScore = Number(result.rows[0]?.general_score || 0);
   const requiredScore = minimumTwoPlayerStake(difficulty);
   if (generalScore < requiredScore) {
-    const error = new Error(`Bu zorluk için en az ${requiredScore} genel puan gerekli.`);
+    const error = new Error(`Bu zorluk için en az ${requiredScore} oyun puanı gerekli.`);
     error.statusCode = 409;
     error.publicCode = 'INSUFFICIENT_SCORE';
     throw error;
@@ -3307,7 +3453,7 @@ function normalizedGameRightConsumption(row, difficulty, wagerPoints, allowAutom
   const generalScore = Math.max(0, Number(row?.general_score || 0));
   const requiredScore = minimumTwoPlayerStake(difficulty);
   if (generalScore < requiredScore) {
-    const error = new Error(`Bu zorluk için en az ${requiredScore} genel puan gerekli.`);
+    const error = new Error(`Bu zorluk için en az ${requiredScore} oyun puanı gerekli.`);
     error.statusCode = 409;
     error.publicCode = 'INSUFFICIENT_SCORE';
     throw error;
@@ -3345,20 +3491,19 @@ function normalizedGameRightConsumption(row, difficulty, wagerPoints, allowAutom
 }
 
 async function consumeGameRightInTransaction(client, playerId, difficulty, wagerPoints = minimumTwoPlayerStake(difficulty), allowAutomatic = false, gameKey = "target_number") {
-  // Genel skor ve 10 oyun hakkı oyuncuya ortaktır; bot hız profili ve turnuva ilerlemesi oyuna özeldir.
+  // Normal skor, bot hız profili ve turnuva ilerlemesi oyuna özeldir; yalnız 10 oyun hakkı ortaktır.
   const normalizedGameKey = normalizeBaseGameKey(gameKey);
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
-    `SELECT s.general_score, p.game_rights, p.game_rights_refill_at,
+    `SELECT gp.general_score AS general_score, p.game_rights, p.game_rights_refill_at,
             gp.two_player_finish_count, gp.two_player_finish_total_ms,
             gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count,
             gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
             gp.tournament_completed, p.tournament_tickets, gp.tournament_entry_active
-     FROM player_scores s
-     JOIN player_progress p ON p.player_id = s.player_id
-     JOIN player_game_progress gp ON gp.player_id = s.player_id AND gp.game_key = $2
-     WHERE s.player_id = $1
-     FOR UPDATE OF s, p, gp`,
+     FROM player_game_progress gp
+     JOIN player_progress p ON p.player_id = gp.player_id
+     WHERE gp.player_id = $1 AND gp.game_key = $2
+     FOR UPDATE OF p, gp`,
     [playerId, normalizedGameKey]
   );
   const lockedRow = result.rows[0] || {};
@@ -3391,7 +3536,13 @@ async function consumeGameRightInTransaction(client, playerId, difficulty, wager
   return state;
 }
 
-async function consumeGameRightsForPlayers(playerIds, difficulty, wagerPoints = minimumTwoPlayerStake(difficulty)) {
+async function consumeGameRightsForPlayers(
+  playerIds,
+  difficulty,
+  wagerPoints = minimumTwoPlayerStake(difficulty),
+  gameKey = "target_number"
+) {
+  const baseGameKey = normalizeBaseGameKey(gameKey);
   const uniqueIds = [...new Set((playerIds || []).filter(Boolean).map(String))].sort();
   if (uniqueIds.length === 0) return true;
   const client = await pool.connect();
@@ -3400,14 +3551,17 @@ async function consumeGameRightsForPlayers(playerIds, difficulty, wagerPoints = 
 
     // İki gerçek oyuncuyu tek seferde ve deterministik player_id sırasıyla kilitle.
     // Böylece oyuncu başına 3 sorgu yerine tüm eşleşme için 1 SELECT + 1 UPDATE yeterlidir.
+    for (const playerId of uniqueIds) {
+      await ensurePlayerGameProgress(client, playerId, baseGameKey);
+    }
     const locked = await client.query(
-      `SELECT s.player_id, s.general_score, p.game_rights, p.game_rights_refill_at
-       FROM player_scores s
-       JOIN player_progress p ON p.player_id = s.player_id
-       WHERE s.player_id = ANY($1::text[])
-       ORDER BY s.player_id
-       FOR UPDATE OF s, p`,
-      [uniqueIds]
+      `SELECT gp.player_id, gp.general_score, p.game_rights, p.game_rights_refill_at
+       FROM player_game_progress gp
+       JOIN player_progress p ON p.player_id = gp.player_id
+       WHERE gp.player_id = ANY($1::text[]) AND gp.game_key = $2
+       ORDER BY gp.player_id
+       FOR UPDATE OF gp, p`,
+      [uniqueIds, baseGameKey]
     );
     if (locked.rowCount !== uniqueIds.length) {
       const error = new Error('Oyuncu hak durumu bulunamadı.');
@@ -3885,12 +4039,13 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
   await ensureAuthenticatedPlayer(client, playerId);
   const baseGameKey = await ensurePlayerGameProgress(client, playerId, gameKey);
   const result = await client.query(
-    `SELECT s.general_score, s.infinite_score,
-            p.total_xp, p.diamond_balance, p.level_reward_claimed_through,
+    `SELECT s.general_score AS legacy_general_score, s.infinite_score AS legacy_infinite_score,
+            p.total_xp, p.diamond_balance, p.home_two_player_wins, p.level_reward_claimed_through,
             p.tournament_tickets, p.tournament_reward_day_key, p.tournament_rewarded_tickets_today,
             p.hundred_daily_key, p.hundred_daily_base_used, p.hundred_daily_base_used_count,
             p.hundred_daily_ad_used, p.hundred_rewarded_rights,
             p.game_rights, p.game_rights_refill_at,
+            gp.general_score AS game_general_score,
             gp.infinite_score AS game_infinite_score,
             gp.infinite_run_score, gp.infinite_next_stage,
             gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
@@ -3916,7 +4071,9 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
     Math.floor(Number(row.level_reward_claimed_through || 0) / 10) * 10));
   const levelSettlementNeeded = levelSettlement.claimedThroughLevel !== storedClaimedThrough;
   if (levelSettlement.generalDelta > 0) {
-    await applyLeaderboardScoreDeltaInTransaction(client, playerId, levelSettlement.generalDelta, 0);
+    await applyGameGeneralScoreDeltaInTransaction(
+      client, playerId, baseGameKey, levelSettlement.generalDelta
+    );
   }
 
   const todayKey = currentUtcDayKey();
@@ -3970,8 +4127,8 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
     );
   }
 
-  const globalGeneralScore = safeScoreNumber(
-    Number(row.general_score || 0) + (levelSettlementNeeded ? levelSettlement.generalDelta : 0)
+  const gameGeneralScore = safeScoreNumber(
+    Number(row.game_general_score || 0) + (levelSettlementNeeded ? levelSettlement.generalDelta : 0)
   );
   const diamondBalance = Math.max(0, Math.min(2_000_000_000,
     Number(row.diamond_balance || 0) + (levelSettlementNeeded ? levelSettlement.diamondDelta : 0)));
@@ -3981,9 +4138,11 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
 
   return {
     gameKey: baseGameKey,
-    generalScore: globalGeneralScore,
-    infiniteScore: safeScoreNumber(row.infinite_score),
+    // generalScore/infiniteScore artık aktif oyunun kendi skorlarıdır.
+    generalScore: gameGeneralScore,
+    infiniteScore: safeScoreNumber(row.game_infinite_score),
     gameInfiniteScore: safeScoreNumber(row.game_infinite_score),
+    homeScore: safeScoreNumber(row.home_two_player_wins),
     totalXp,
     diamondBalance,
     levelRewardClaimedThrough: levelSettlementNeeded ? levelSettlement.claimedThroughLevel : storedClaimedThrough,
@@ -4096,7 +4255,9 @@ async function applyTournamentOutcomeInTransaction(
   const levelSettlement = calculateLevelMilestoneSettlement(totalXpAfter, before.levelRewardClaimedThrough);
   const persistedGeneralDelta = awardedScore + levelSettlement.generalDelta;
   if (persistedGeneralDelta !== 0) {
-    await applyLeaderboardScoreDeltaInTransaction(client, playerId, persistedGeneralDelta, 0);
+    await applyGameGeneralScoreDeltaInTransaction(
+      client, playerId, baseGameKey, persistedGeneralDelta
+    );
   }
   await client.query(
     `UPDATE player_progress SET
@@ -4226,7 +4387,7 @@ async function completeHundredStageInTransaction(client, playerId, stageValue, g
   const totalXpAfter = Math.min(2_000_000_000, Number(before.totalXp || 0) + xpDelta);
   const levelSettlement = calculateLevelMilestoneSettlement(totalXpAfter, before.levelRewardClaimedThrough);
   const persistedGeneralDelta = generalDelta + levelSettlement.generalDelta;
-  if (persistedGeneralDelta !== 0) await applyLeaderboardScoreDeltaInTransaction(client, playerId, persistedGeneralDelta, 0);
+  if (persistedGeneralDelta !== 0) await applyGameGeneralScoreDeltaInTransaction(client, playerId, baseGameKey, persistedGeneralDelta);
   await client.query(
     `UPDATE player_progress SET
        total_xp = $2,
@@ -4298,7 +4459,7 @@ async function forfeitHundredRunInTransaction(client, playerId, gameKey = "targe
   const totalXpAfter = Math.min(2_000_000_000, Number(before.totalXp || 0) + xpDelta);
   const levelSettlement = calculateLevelMilestoneSettlement(totalXpAfter, before.levelRewardClaimedThrough);
   const persistedGeneralDelta = generalDelta + levelSettlement.generalDelta;
-  if (persistedGeneralDelta !== 0) await applyLeaderboardScoreDeltaInTransaction(client, playerId, persistedGeneralDelta, 0);
+  if (persistedGeneralDelta !== 0) await applyGameGeneralScoreDeltaInTransaction(client, playerId, baseGameKey, persistedGeneralDelta);
   await client.query(
     `UPDATE player_progress SET
        total_xp = $2,
@@ -4379,11 +4540,11 @@ async function readTwoPlayerFinishProfileInTransaction(client, playerId, gameKey
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   const result = await client.query(
     `SELECT gp.two_player_finish_count, gp.two_player_finish_total_ms,
-            gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count, s.general_score
+            gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count,
+            gp.general_score
      FROM player_game_progress gp
-     JOIN player_scores s ON s.player_id = gp.player_id
      WHERE gp.player_id = $1 AND gp.game_key = $2
-     FOR UPDATE OF gp, s`,
+     FOR UPDATE OF gp`,
     [playerId, normalizedGameKey]
   );
   const row = result.rows[0] || {};
@@ -4489,7 +4650,7 @@ async function incrementAdaptiveBotTimingGame(playerId, gameKey) {
 }
 
 /**
- * Bot bitirme aralıkları oyun tanımından ve authoritative genel puandan seçilir.
+ * Bot bitirme aralıkları oyun tanımından ve authoritative ilgili oyunun puanından seçilir.
  * 729 ve Rakam Avı ilk-bitiren yarışında da aynı puan-bantlı yaklaşımı kullanır;
  * geçmiş ortalama bitirme süresi, lig ve difficulty bu iki oyunda hesaba katılmaz.
  */
@@ -4616,7 +4777,7 @@ function createGameAwareBotPlan(gameKey, difficulty, finishProfile = {}) {
 
   if (baseGameKey === "merge_5120" || baseGameKey === "digit_hunt") {
     // 729 ve Rakam Avı ilk-bitiren yarışıdır. Botun bitirme zamanı yalnız oyuncunun
-    // authoritative genel puan bandından seçilir; geçmiş ortalama, lig ve difficulty kullanılmaz.
+    // authoritative ilgili oyun puanı bandından seçilir; geçmiş ortalama, lig ve difficulty kullanılmaz.
     return {
       finishMs: createScoreDrivenFirstFinishBotMs(finishProfile, baseGameKey),
       leaveMs: null,
@@ -4759,10 +4920,8 @@ async function applyTwoPlayerBotRewardsInTransaction(
   rewards,
   { finishElapsedMs = null, finishRoundCount = 1, gameKey = "target_number" } = {}
 ) {
-  // Tek full state kilidi hem mevcut score/progress değerlerini hem de bakım normalizasyonlarını verir.
-  // Sonrasında ayrı finish UPDATE + score UPDATE + XP UPDATE + final full-state SELECT yerine
-  // score/progress değişikliklerini tek CTE statement'ında uygularız.
-  const before = await readAuthoritativePlayerState(client, playerId, gameKey);
+  const baseGameKey = normalizeBaseGameKey(gameKey);
+  const before = await readAuthoritativePlayerState(client, playerId, baseGameKey);
   const safeXpDelta = Math.max(0, Math.min(Number(rewards?.xpDelta || 0), 2_000_000_000));
   const totalXpAfter = Math.min(2_000_000_000, Math.max(0, Number(before.totalXp || 0)) + safeXpDelta);
   const levelSettlement = calculateLevelMilestoneSettlement(
@@ -4771,78 +4930,56 @@ async function applyTwoPlayerBotRewardsInTransaction(
   );
   const gameGeneralDelta = Number(rewards?.generalDelta || 0);
   const persistedGeneralDelta = gameGeneralDelta + levelSettlement.generalDelta;
-  const finishSampleMs = safeTwoPlayerFinishSample(finishElapsedMs, finishRoundCount, gameKey);
+  const finishSampleMs = safeTwoPlayerFinishSample(finishElapsedMs, finishRoundCount, baseGameKey);
 
-  const progressNeedsUpdate =
-    safeXpDelta > 0 ||
-    levelSettlement.diamondDelta > 0 ||
-    levelSettlement.claimedThroughLevel !== before.levelRewardClaimedThrough ||
-    finishSampleMs !== null;
+  if (persistedGeneralDelta !== 0) {
+    await applyGameGeneralScoreDeltaInTransaction(
+      client, playerId, baseGameKey, persistedGeneralDelta
+    );
+  }
 
-  if (persistedGeneralDelta !== 0 || progressNeedsUpdate) {
-    const monthKey = currentMonthKey();
-    // Score + XP/finish/level progress tek PostgreSQL statement/round-trip. Score değişmiyorsa
-    // score_update CTE'si 0 satır, progress değişmiyorsa final UPDATE 0 satır etkiler.
+  await client.query(
+    `UPDATE player_progress
+     SET total_xp = $2,
+         diamond_balance = LEAST(diamond_balance + $3, 2000000000),
+         level_reward_claimed_through = $4,
+         updated_at = NOW()
+     WHERE player_id = $1`,
+    [
+      playerId,
+      totalXpAfter,
+      levelSettlement.diamondDelta,
+      levelSettlement.claimedThroughLevel,
+    ]
+  );
+
+  // Ana sayfa puanı yalnız normal ikili galibiyet sayısıdır. Botlu normal ikili de normal
+  // ikili sayılır; kayıp, turnuva, 100'lü, arkadaş ve sonsuz bu sayacı değiştirmez.
+  const homeWinDelta = gameGeneralDelta > 0 ? 1 : 0;
+  if (homeWinDelta > 0) {
+    await incrementHomeTwoPlayerWinInTransaction(client, playerId);
+  }
+
+  if (finishSampleMs !== null) {
+    await ensurePlayerGameProgress(client, playerId, baseGameKey);
     await client.query(
-      `WITH score_update AS (
-         UPDATE player_scores
-         SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, general_score::numeric + $2::numeric))::bigint,
-             monthly_general_score = CASE
-               WHEN monthly_key = $8 THEN
-                 LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_general_score::numeric + $2::numeric))::bigint
-               ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $2::numeric))::bigint
-             END,
-             monthly_infinite_score = CASE WHEN monthly_key = $8 THEN monthly_infinite_score ELSE 0 END,
-             monthly_key = $8,
-             monthly_updated_at = NOW(),
-             updated_at = NOW()
-         WHERE player_id = $1 AND $2::bigint <> 0
-         RETURNING player_id
-       )
-       UPDATE player_progress
-       SET total_xp = $3,
-           diamond_balance = LEAST(diamond_balance + $4, 2000000000),
-           level_reward_claimed_through = $5,
-           two_player_finish_count = LEAST(
-             two_player_finish_count + CASE WHEN $6::bigint IS NULL THEN 0 ELSE 1 END,
-             2000000000
-           ),
+      `UPDATE player_game_progress
+       SET two_player_finish_count = LEAST(two_player_finish_count + 1, 2000000000),
            two_player_finish_total_ms = LEAST(
-             two_player_finish_total_ms + COALESCE($6::bigint, 0),
+             two_player_finish_total_ms + $3::bigint,
              9223372036854775807::bigint
            ),
            updated_at = NOW()
-       WHERE player_id = $1 AND $7::boolean`,
-      [
-        playerId,
-        persistedGeneralDelta,
-        totalXpAfter,
-        levelSettlement.diamondDelta,
-        levelSettlement.claimedThroughLevel,
-        finishSampleMs,
-        progressNeedsUpdate,
-        monthKey,
-      ]
+       WHERE player_id = $1 AND game_key = $2`,
+      [playerId, baseGameKey, finishSampleMs]
     );
-    if (finishSampleMs !== null) {
-      await ensurePlayerGameProgress(client, playerId, gameKey);
-      await client.query(
-        `UPDATE player_game_progress
-         SET two_player_finish_count = LEAST(two_player_finish_count + 1, 2000000000),
-             two_player_finish_total_ms = LEAST(
-               two_player_finish_total_ms + $3::bigint,
-               9223372036854775807::bigint
-             ),
-             updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [playerId, normalizeBaseGameKey(gameKey), finishSampleMs]
-      );
-    }
   }
 
   return {
     ...before,
+    gameKey: baseGameKey,
     generalScore: safeScoreNumber(Number(before.generalScore || 0) + persistedGeneralDelta),
+    homeScore: safeScoreNumber(Number(before.homeScore || 0) + homeWinDelta),
     totalXp: totalXpAfter,
     diamondBalance: Math.max(0, Math.min(2_000_000_000,
       Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
@@ -7369,6 +7506,10 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          game_rights = GREATEST(target.game_rights, guest.game_rights),
          game_rights_refill_at = LEAST(target.game_rights_refill_at, guest.game_rights_refill_at),
          diamond_balance = LEAST(target.diamond_balance::bigint + guest.diamond_balance::bigint, 2000000000)::integer,
+         home_two_player_wins = LEAST(
+           target.home_two_player_wins::numeric + guest.home_two_player_wins::numeric,
+           9223372036854775807::numeric
+         )::bigint,
          level_reward_claimed_through = GREATEST(target.level_reward_claimed_through, guest.level_reward_claimed_through),
          two_player_finish_count = LEAST(target.two_player_finish_count::bigint + guest.two_player_finish_count::bigint, 2000000000)::integer,
          two_player_finish_total_ms = LEAST(target.two_player_finish_total_ms::numeric + guest.two_player_finish_total_ms::numeric, 9223372036854775807)::bigint,
@@ -7383,13 +7524,17 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
   // player_progress üzerinde kaldığı için burada çoğaltılmaz.
   await client.query(
     `INSERT INTO player_game_progress (
-       player_id, game_key, infinite_score, infinite_run_score, infinite_next_stage,
+       player_id, game_key, general_score, infinite_score,
+       monthly_key, monthly_general_score, monthly_infinite_score, monthly_updated_at,
+       infinite_run_score, infinite_next_stage,
        tournament_stage, tournament_rights, tournament_bank, tournament_completed,
        tournament_entry_active, hundred_active, hundred_stage,
        two_player_finish_count, two_player_finish_total_ms,
        two_player_score_count, two_player_score_total, bot_timing_game_count, stats, updated_at
      )
-     SELECT $2, game_key, infinite_score, infinite_run_score, infinite_next_stage,
+     SELECT $2, game_key, general_score, infinite_score,
+            monthly_key, monthly_general_score, monthly_infinite_score, monthly_updated_at,
+            infinite_run_score, infinite_next_stage,
             tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active, hundred_active, hundred_stage,
             two_player_finish_count, two_player_finish_total_ms,
@@ -7397,7 +7542,22 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
      FROM player_game_progress
      WHERE player_id = $1
      ON CONFLICT (player_id, game_key) DO UPDATE SET
+       general_score = LEAST(
+         player_game_progress.general_score::numeric + EXCLUDED.general_score::numeric,
+         9223372036854775807::numeric
+       )::bigint,
        infinite_score = GREATEST(player_game_progress.infinite_score, EXCLUDED.infinite_score),
+       monthly_general_score = LEAST(
+         (CASE WHEN player_game_progress.monthly_key = $3 THEN player_game_progress.monthly_general_score ELSE 0 END)::numeric +
+         (CASE WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_general_score ELSE 0 END)::numeric,
+         9223372036854775807::numeric
+       )::bigint,
+       monthly_infinite_score = GREATEST(
+         CASE WHEN player_game_progress.monthly_key = $3 THEN player_game_progress.monthly_infinite_score ELSE 0 END,
+         CASE WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_infinite_score ELSE 0 END
+       ),
+       monthly_key = $3,
+       monthly_updated_at = NOW(),
        infinite_run_score = GREATEST(player_game_progress.infinite_run_score, EXCLUDED.infinite_run_score),
        infinite_next_stage = GREATEST(player_game_progress.infinite_next_stage, EXCLUDED.infinite_next_stage),
        tournament_stage = GREATEST(player_game_progress.tournament_stage, EXCLUDED.tournament_stage),
@@ -7432,19 +7592,11 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          ELSE player_game_progress.stats
        END,
        updated_at = NOW()`,
-    [guestId, playGamesPlayerId]
+    [guestId, playGamesPlayerId, migrationMonthKey]
   );
 
-  // Global sonsuz puan, bütün oyunların oyun-bazlı yüksek skor toplamıdır.
-  await client.query(
-    `UPDATE player_scores
-     SET infinite_score = LEAST(COALESCE((
-       SELECT SUM(infinite_score::numeric) FROM player_game_progress WHERE player_id = $1
-     ), 0::numeric), 9223372036854775807::numeric)::bigint,
-         updated_at = NOW()
-     WHERE player_id = $1`,
-    [playGamesPlayerId]
-  );
+  // v22: Oyunların sonsuz skorları artık birbirine eklenmez. Her oyun kendi
+  // player_game_progress satırındaki yüksek skoru bağımsız taşır.
 
   // Tamamlanmamış güvenli challenge'lar ve görev geçmişleri de hedef hesaba bağlanır.
   await client.query(
@@ -7476,12 +7628,17 @@ async function applyAuthoritativeScoreDelta(playerId, generalDelta, infiniteDelt
     // Gerçek zamanlı oda katılımcısı odaya alınmadan önce imzalı session token ve
     // gameplay sessionId doğrulanır; oyuncunun DB satırları da o aşamada garanti edilir.
     // Buradaki ikinci ensureAuthenticatedPlayer() her ödülde gereksiz bir SELECT idi.
-    await applyLeaderboardScoreDeltaInTransaction(
-      client,
-      playerId,
-      generalDelta,
-      infiniteDelta
-    );
+    const baseGameKey = normalizeBaseGameKey(gameKey);
+    if (Number(generalDelta || 0) !== 0) {
+      await applyGameGeneralScoreDeltaInTransaction(client, playerId, baseGameKey, generalDelta);
+    }
+    if (Number(infiniteDelta || 0) > 0) {
+      const progress = await readPlayerGameProgress(client, playerId, baseGameKey, true);
+      const currentInfinite = safeScoreNumber(progress.row?.infinite_score);
+      await applyGameInfiniteHighScoreInTransaction(
+        client, playerId, baseGameKey, Math.min(MAX_SAFE_SCORE, currentInfinite + Number(infiniteDelta || 0))
+      );
+    }
     await client.query(
       `UPDATE player_progress SET
          total_xp = GREATEST(0, LEAST(total_xp + $2, 2000000000)),
@@ -7543,96 +7700,107 @@ function safeTwoPlayerFinishSampleMs(elapsedMs, roundCountValue = 1, gameKey = "
 async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWinner, realLoser) {
   const reward = Math.max(minimumTwoPlayerStake(room.difficulty), Number(room.stakePoints || 0));
   const winnerXp = 20;
+  const baseGameKey = normalizeBaseGameKey(room.gameKey);
   const entries = [];
   if (realWinner) {
     entries.push({
       playerId: realWinner.playerId,
       generalDelta: reward,
       xpDelta: winnerXp,
+      homeWinDelta: 1,
       finishSampleMs: isRealtimeScoreBasedGameKey(room.gameKey) ||
-        (["shortest_path", "digit_attack"].includes(normalizeBaseGameKey(room.gameKey)) &&
+        (["shortest_path", "digit_attack"].includes(baseGameKey) &&
           realWinner.wonRoundBecauseOpponentWrongAnswer === true)
         ? null
         : safeTwoPlayerFinishSampleMs(realWinner.totalElapsedMs, room.roundCount, room.gameKey),
     });
   }
   if (realLoser) {
-    entries.push({ playerId: realLoser.playerId, generalDelta: -reward, xpDelta: 0, finishSampleMs: null });
+    entries.push({
+      playerId: realLoser.playerId,
+      generalDelta: -reward,
+      xpDelta: 0,
+      homeWinDelta: 0,
+      finishSampleMs: null,
+    });
   }
   if (entries.length === 0) return { reward, winnerXp };
 
+  for (const item of entries) {
+    await ensurePlayerGameProgress(client, item.playerId, baseGameKey);
+  }
+
   const monthKey = currentMonthKey();
-  // player_scores (iki oyuncu) + kazananın XP/finish profili tek PostgreSQL round-trip'te.
   await client.query(
     `WITH changes AS (
        SELECT * FROM UNNEST(
-         $1::text[], $2::bigint[], $3::integer[], $4::bigint[]
-       ) AS c(player_id, general_delta, xp_delta, finish_sample_ms)
-     ), score_updates AS (
-       UPDATE player_scores AS s
-       SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, s.general_score::numeric + c.general_delta::numeric))::bigint,
-           monthly_general_score = CASE
-             WHEN s.monthly_key = $5 THEN
-               LEAST(9223372036854775807::numeric, GREATEST(0::numeric, s.monthly_general_score::numeric + c.general_delta::numeric))::bigint
-             ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, c.general_delta::numeric))::bigint
-           END,
-           -- Normal ikili oyunda infinite delta 0'dır; ay değiştiyse eski ayın infinite skoru
-           -- yeni monthly_key altında taşınmamalı. Eski helper'ın ay rollover semantiğini koru.
-           monthly_infinite_score = CASE WHEN s.monthly_key = $5 THEN s.monthly_infinite_score ELSE 0 END,
-           monthly_key = $5,
-           monthly_updated_at = NOW(),
-           updated_at = NOW()
-       FROM changes c
-       WHERE s.player_id = c.player_id
-       RETURNING s.player_id
+         $1::text[], $2::bigint[], $3::integer[], $4::integer[], $5::bigint[]
+       ) AS c(player_id, general_delta, xp_delta, home_win_delta, finish_sample_ms)
      )
-     UPDATE player_progress AS p
-     SET total_xp = LEAST(p.total_xp + c.xp_delta, 2000000000),
+     UPDATE player_game_progress AS gp
+     SET general_score = LEAST(
+           9223372036854775807::numeric,
+           GREATEST(0::numeric, gp.general_score::numeric + c.general_delta::numeric)
+         )::bigint,
+         monthly_general_score = CASE
+           WHEN gp.monthly_key = $7 THEN
+             LEAST(
+               9223372036854775807::numeric,
+               GREATEST(0::numeric, gp.monthly_general_score::numeric + c.general_delta::numeric)
+             )::bigint
+           ELSE LEAST(
+             9223372036854775807::numeric,
+             GREATEST(0::numeric, c.general_delta::numeric)
+           )::bigint
+         END,
+         monthly_infinite_score = CASE WHEN gp.monthly_key = $7 THEN gp.monthly_infinite_score ELSE 0 END,
+         monthly_key = $7,
+         monthly_updated_at = NOW(),
          two_player_finish_count = LEAST(
-           p.two_player_finish_count + CASE WHEN c.finish_sample_ms IS NULL THEN 0 ELSE 1 END,
+           gp.two_player_finish_count + CASE WHEN c.finish_sample_ms IS NULL THEN 0 ELSE 1 END,
            2000000000
          ),
          two_player_finish_total_ms = LEAST(
-           p.two_player_finish_total_ms + COALESCE(c.finish_sample_ms, 0),
+           gp.two_player_finish_total_ms + COALESCE(c.finish_sample_ms, 0),
            9223372036854775807::bigint
          ),
          updated_at = NOW()
      FROM changes c
-     WHERE p.player_id = c.player_id
-       AND (c.xp_delta <> 0 OR c.finish_sample_ms IS NOT NULL)`,
+     WHERE gp.player_id = c.player_id AND gp.game_key = $6`,
     [
       entries.map((item) => item.playerId),
       entries.map((item) => item.generalDelta),
       entries.map((item) => item.xpDelta),
+      entries.map((item) => item.homeWinDelta),
       entries.map((item) => item.finishSampleMs),
+      baseGameKey,
       monthKey,
     ]
   );
-  const finishEntries = entries.filter((item) => item.finishSampleMs !== null);
-  if (finishEntries.length > 0) {
-    for (const item of finishEntries) {
-      await ensurePlayerGameProgress(client, item.playerId, room.gameKey);
-    }
-    await client.query(
-      `WITH changes AS (
-         SELECT * FROM UNNEST($1::text[], $2::bigint[]) AS c(player_id, finish_sample_ms)
-       )
-       UPDATE player_game_progress AS gp
-       SET two_player_finish_count = LEAST(gp.two_player_finish_count + 1, 2000000000),
-           two_player_finish_total_ms = LEAST(
-             gp.two_player_finish_total_ms + c.finish_sample_ms,
-             9223372036854775807::bigint
-           ),
-           updated_at = NOW()
-       FROM changes c
-       WHERE gp.player_id = c.player_id AND gp.game_key = $3`,
-      [
-        finishEntries.map((item) => item.playerId),
-        finishEntries.map((item) => item.finishSampleMs),
-        normalizeBaseGameKey(room.gameKey),
-      ]
-    );
-  }
+
+  await client.query(
+    `WITH changes AS (
+       SELECT * FROM UNNEST(
+         $1::text[], $2::integer[], $3::integer[]
+       ) AS c(player_id, xp_delta, home_win_delta)
+     )
+     UPDATE player_progress AS p
+     SET total_xp = LEAST(p.total_xp + c.xp_delta, 2000000000),
+         home_two_player_wins = LEAST(
+           p.home_two_player_wins::numeric + c.home_win_delta::numeric,
+           9223372036854775807::numeric
+         )::bigint,
+         updated_at = NOW()
+     FROM changes c
+     WHERE p.player_id = c.player_id
+       AND (c.xp_delta <> 0 OR c.home_win_delta <> 0)`,
+    [
+      entries.map((item) => item.playerId),
+      entries.map((item) => item.xpDelta),
+      entries.map((item) => item.homeWinDelta),
+    ]
+  );
+
   return { reward, winnerXp };
 }
 
@@ -8271,14 +8439,13 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       const progressResult = await client.query(
         `SELECT gp.tournament_stage, gp.tournament_rights, gp.tournament_bank,
                 gp.tournament_completed, gp.tournament_entry_active,
-                p.tournament_tickets, s.general_score,
+                p.tournament_tickets, gp.general_score,
                 gp.two_player_finish_count, gp.two_player_finish_total_ms,
                 gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count
          FROM player_game_progress gp
          JOIN player_progress p ON p.player_id = gp.player_id
-         JOIN player_scores s ON s.player_id = gp.player_id
          WHERE gp.player_id = $1 AND gp.game_key = $2
-         FOR UPDATE OF gp, p, s`,
+         FOR UPDATE OF gp, p`,
         [req.auth.sub, gameKey]
       );
       const progress = progressResult.rows[0] || {};
@@ -8621,8 +8788,10 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     }
     if (digitHuntInfiniteSingleRun) {
       const gameScore = safeScoreNumber(req.body?.answer?.score);
-      const earnedInfinite = Math.floor(gameScore / 20);
-      rewards = { generalDelta: 0, infiniteDelta: earnedInfinite, xpDelta: earnedInfinite };
+      const earnedInfinite = gameScore;
+      // Yalnız sonsuz skor artık ham oyun skorudur. XP ekonomisi önceki /20 oranını korur.
+      const earnedXp = Math.floor(gameScore / 20);
+      rewards = { generalDelta: 0, infiniteDelta: earnedInfinite, xpDelta: earnedXp };
       won = true;
       outcomeReason = "no_legal_move";
     }
@@ -8775,9 +8944,14 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
            WHERE player_id = $1`,
           [req.auth.sub, rewards.xpDelta]
         );
-        if (highScoreDelta > 0 || Number(rewards.generalDelta || 0) !== 0) {
-          await applyLeaderboardScoreDeltaInTransaction(
-            client, req.auth.sub, Number(rewards.generalDelta || 0), highScoreDelta
+        if (highScoreDelta > 0) {
+          await applyGameInfiniteHighScoreInTransaction(
+            client, req.auth.sub, gameKey, newHighScore
+          );
+        }
+        if (Number(rewards.generalDelta || 0) !== 0) {
+          await applyGameGeneralScoreDeltaInTransaction(
+            client, req.auth.sub, gameKey, Number(rewards.generalDelta || 0)
           );
         }
       }
@@ -9279,8 +9453,9 @@ function setLeaderboardResponseCacheEntry(key, rows) {
   cleanupLeaderboardResponseCache();
 }
 
-function leaderboardServerCacheKey({ scoreType, period, scope, country, monthKey }) {
+function leaderboardServerCacheKey({ gameKey, scoreType, period, scope, country, monthKey }) {
   return [
+    normalizeBaseGameKey(gameKey),
     scoreType,
     period,
     scope,
@@ -9289,16 +9464,20 @@ function leaderboardServerCacheKey({ scoreType, period, scope, country, monthKey
   ].join("|");
 }
 
-async function queryLeaderboardTopRows({ scoreType, period, scope, country, monthKey }) {
+async function queryLeaderboardTopRows({ gameKey, scoreType, period, scope, country, monthKey }) {
+  const baseGameKey = normalizeBaseGameKey(gameKey);
   const scoreColumn = period === "month"
     ? (scoreType === "infinite" ? "monthly_infinite_score" : "monthly_general_score")
     : (scoreType === "infinite" ? "infinite_score" : "general_score");
-  const values = [];
-  const conditions = [`s.${scoreColumn} > 0`];
+  const values = [baseGameKey];
+  const conditions = [
+    `gp.game_key = $1`,
+    `gp.${scoreColumn} > 0`,
+  ];
 
   if (period === "month") {
     values.push(monthKey);
-    conditions.push(`s.monthly_key = $${values.length}`);
+    conditions.push(`gp.monthly_key = $${values.length}`);
   }
 
   if (scope === "country") {
@@ -9308,26 +9487,101 @@ async function queryLeaderboardTopRows({ scoreType, period, scope, country, mont
 
   const result = await pool.query(
     `SELECT
+       gp.player_id,
        p.username,
        p.country,
-       s.${scoreColumn} AS score
-     FROM player_scores s
-     JOIN players p ON p.player_id = s.player_id
+       gp.${scoreColumn} AS score
+     FROM player_game_progress gp
+     JOIN players p ON p.player_id = gp.player_id
      WHERE ${conditions.join(" AND ")}
      ORDER BY
-       s.${scoreColumn} DESC,
-       s.player_id ASC
-     LIMIT 50`,
+       gp.${scoreColumn} DESC,
+       gp.player_id ASC
+     LIMIT 100`,
     values
   );
 
-  // Sorgu zaten yalnızca ilk 50 satırı döndürdüğü için pahalı ROW_NUMBER() gerekmez.
+  // Yalnız ilk 100 kesin sıra döner. 100 sonrası tüm listeye ROW_NUMBER() uygulanmaz;
+  // yalnız isteği yapan oyuncunun kaba sıra bandı ayrı ve indeksli tek sorguyla hesaplanır.
   return result.rows.map((row, index) => ({
     rank: index + 1,
+    playerId: String(row.player_id || ""),
     username: row.username,
     country: row.country,
     score: safeScoreNumber(row.score),
   }));
+}
+
+function leaderboardRankRangeLabel(rankValue) {
+  const rank = Math.max(1, Math.floor(Number(rankValue || 1)));
+  if (rank <= 100) return String(rank);
+  const bandSize = rank <= 1_000 ? 100 : rank <= 10_000 ? 1_000 : 10_000;
+  const start = Math.floor((rank - 1) / bandSize) * bandSize + 1;
+  const end = start + bandSize - 1;
+  return `${start}-${end}`;
+}
+
+async function queryLeaderboardPersonalRank({
+  playerId, gameKey, scoreType, period, scope, country, monthKey
+}) {
+  const baseGameKey = normalizeBaseGameKey(gameKey);
+  const scoreColumn = period === "month"
+    ? (scoreType === "infinite" ? "monthly_infinite_score" : "monthly_general_score")
+    : (scoreType === "infinite" ? "infinite_score" : "general_score");
+  const ownValues = [playerId, baseGameKey];
+  const ownConditions = [
+    `gp.player_id = $1`,
+    `gp.game_key = $2`,
+    `gp.${scoreColumn} > 0`,
+  ];
+  if (period === "month") {
+    ownValues.push(monthKey);
+    ownConditions.push(`gp.monthly_key = $${ownValues.length}`);
+  }
+  if (scope === "country") {
+    ownValues.push(country);
+    ownConditions.push(`p.country = $${ownValues.length}`);
+  }
+  const own = await pool.query(
+    `SELECT gp.${scoreColumn} AS score
+     FROM player_game_progress gp
+     JOIN players p ON p.player_id = gp.player_id
+     WHERE ${ownConditions.join(" AND ")}
+     LIMIT 1`,
+    ownValues
+  );
+  if (own.rowCount === 0) return null;
+  const myScore = safeScoreNumber(own.rows[0]?.score);
+
+  // Yalnız kullanıcının bandını bulmak için tek indeksli COUNT yapılır; tüm satırlar istemciye
+  // gönderilmez ve ROW_NUMBER() ile bütün leaderboard materyalize edilmez. Sonuç zaten kaba banttır.
+  const countValues = [baseGameKey, myScore, playerId];
+  const countConditions = [
+    `gp.game_key = $1`,
+    `gp.${scoreColumn} > 0`,
+    `(gp.${scoreColumn} > $2 OR (gp.${scoreColumn} = $2 AND gp.player_id < $3))`,
+  ];
+  if (period === "month") {
+    countValues.push(monthKey);
+    countConditions.push(`gp.monthly_key = $${countValues.length}`);
+  }
+  if (scope === "country") {
+    countValues.push(country);
+    countConditions.push(`p.country = $${countValues.length}`);
+  }
+  const rankResult = await pool.query(
+    `SELECT COUNT(*)::bigint AS ahead
+     FROM player_game_progress gp
+     JOIN players p ON p.player_id = gp.player_id
+     WHERE ${countConditions.join(" AND ")}`,
+    countValues
+  );
+  const rank = Math.max(1, Number(rankResult.rows[0]?.ahead || 0) + 1);
+  return {
+    score: myScore,
+    rank: rank <= 100 ? rank : null,
+    rankRange: leaderboardRankRangeLabel(rank),
+  };
 }
 
 async function loadLeaderboardRowsCached(args) {
@@ -9369,6 +9623,7 @@ async function loadLeaderboardRowsCached(args) {
 app.get("/leaderboard", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
 
+  const gameKey = normalizeBaseGameKey(req.query.gameKey || "target_number");
   const scoreType = req.query.scoreType === "infinite" ? "infinite" : "general";
   const period = req.query.period === "month" ? "month" : "all";
   const scope = req.query.scope === "country" ? "country" : "world";
@@ -9377,21 +9632,31 @@ app.get("/leaderboard", requireAuth, async (req, res) => {
 
   try {
     const rows = await loadLeaderboardRowsCached({
+      gameKey,
       scoreType,
       period,
       scope,
       country,
       monthKey,
     });
+    const topRow = rows.find((row) => row.playerId === String(req.auth.sub));
+    const myRank = topRow
+      ? { score: topRow.score, rank: topRow.rank, rankRange: String(topRow.rank) }
+      : await queryLeaderboardPersonalRank({
+          playerId: String(req.auth.sub), gameKey, scoreType, period, scope, country, monthKey,
+        });
+    const publicRows = rows.map(({ playerId: _playerId, ...row }) => row);
 
     res.json({
       ok: true,
+      gameKey,
       scoreType,
       period,
       scope,
       country,
       monthKey,
-      rows,
+      myRank,
+      rows: publicRows,
     });
   } catch (error) {
     console.error("leaderboard get error:", {
@@ -10425,7 +10690,7 @@ function createRealtimeRoom(
     deadlineHandle: null,
     botFinishHandle: null,
     // Hazır oda botlarında oyun-bazlı bitiriş ortalaması ve bot oyun sayacı profile taşınır.
-    // 729/Rakam Avı bu ikisini kullanır; diğer oyunların mevcut genel puan tabanlı sistemi korunur.
+    // 729/Rakam Avı bu ikisini kullanır; diğer oyunların mevcut oyun puanı tabanlı sistemi korunur.
     botFinishProfile: opponentPlayer.isBot === true
       ? normalizeTwoPlayerFinishProfile(botFinishProfile || {})
       : null,
@@ -10937,13 +11202,12 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
       `SELECT p.username, p.country,
               gp.tournament_stage, gp.tournament_rights,
               gp.tournament_completed, gp.tournament_entry_active,
-              s.general_score,
+              gp.general_score,
               gp.two_player_finish_count, gp.two_player_finish_total_ms,
               gp.two_player_score_count, gp.two_player_score_total, gp.bot_timing_game_count
        FROM players p
        JOIN player_progress g ON g.player_id = p.player_id
        JOIN player_game_progress gp ON gp.player_id = p.player_id AND gp.game_key = $3
-       JOIN player_scores s ON s.player_id = p.player_id
        JOIN player_game_sessions gs
          ON gs.player_id = p.player_id
         AND gs.session_id = $2
@@ -10997,8 +11261,10 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
     let requesterScore = safeScore(req.query.score);
     if (!clientBots) {
       const scoreResult = await pool.query(
-        `SELECT general_score FROM player_scores WHERE player_id = $1`,
-        [req.auth.sub]
+        `SELECT general_score
+         FROM player_game_progress
+         WHERE player_id = $1 AND game_key = $2`,
+        [req.auth.sub, gameKey]
       );
       requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
     }
@@ -11254,7 +11520,8 @@ io.on("connection", (socket) => {
         await consumeGameRightsForPlayers(
           [identity.player.id],
           table.difficulty,
-          table.stakePoints
+          table.stakePoints,
+          table.gameKey
         );
       } catch (error) {
         socket.emit("match_error", {
@@ -11406,7 +11673,7 @@ io.on("connection", (socket) => {
         }
         try {
           assertRoundCountEligibility(botTable.roundCount, identity.generalScore, botTable.stakePoints);
-          await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints);
+          await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints, gameKey);
         } catch (error) {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
@@ -11453,7 +11720,7 @@ io.on("connection", (socket) => {
         }
         try {
           assertRoundCountEligibility(table.roundCount, identity.generalScore, table.stakePoints);
-          await consumeGameRightsForPlayers([player.id, table.player.id], table.difficulty, table.stakePoints);
+          await consumeGameRightsForPlayers([player.id, table.player.id], table.difficulty, table.stakePoints, gameKey);
         } catch (error) {
           const message = error.message || "İki oyunculu oyun hakkı doğrulanamadı.";
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
@@ -11545,7 +11812,7 @@ io.on("connection", (socket) => {
         const selectedPuzzle = opponent.puzzle || puzzle;
         if (!gameKey.endsWith("_tournament")) {
           try {
-            await consumeGameRightsForPlayers([player.id, opponent.player.id], difficulty, selectedStake);
+            await consumeGameRightsForPlayers([player.id, opponent.player.id], difficulty, selectedStake, gameKey);
           } catch (error) {
             const message = error.message || "İki oyunculu oyun hakkı doğrulanamadı.";
             socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
@@ -12046,7 +12313,7 @@ io.on("connection", (socket) => {
       leaveRoomAsCancel(socket);
 
       try {
-        await consumeGameRightsForPlayers([player.id, room.player.id], room.difficulty);
+        await consumeGameRightsForPlayers([player.id, room.player.id], room.difficulty, minimumTwoPlayerStake(room.difficulty), room.gameKey);
       } catch (error) {
         const message = error.message || "İki oyunculu oyun hakkı doğrulanamadı.";
         socket.emit("friend_room_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
