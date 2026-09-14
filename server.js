@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "per-game-scoreboards-home-wins-v22-20260914";
+const SERVER_BUILD_ID = "per-game-score50-task-routing-v23-20260914";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -770,7 +770,7 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS player_game_progress (
       player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
       game_key TEXT NOT NULL,
-      general_score BIGINT NOT NULL DEFAULT 0 CHECK (general_score >= 0),
+      general_score BIGINT NOT NULL DEFAULT 50 CHECK (general_score >= 0),
       infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
       monthly_key TEXT NOT NULL DEFAULT '',
       monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
@@ -798,7 +798,7 @@ async function initDatabase() {
     -- player_game_progress daha önce oluşmuşsa eksik kolonların tamamını burada tamamla.
     -- Bu blok tekrar çalıştırılabilir; mevcut kolonlara dokunmaz.
     ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS general_score BIGINT NOT NULL DEFAULT 0 CHECK (general_score >= 0);
+      ADD COLUMN IF NOT EXISTS general_score BIGINT NOT NULL DEFAULT 50 CHECK (general_score >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
     ALTER TABLE player_game_progress
@@ -843,6 +843,7 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
     ALTER TABLE player_game_progress ALTER COLUMN general_score TYPE BIGINT USING general_score::bigint;
+    ALTER TABLE player_game_progress ALTER COLUMN general_score SET DEFAULT 50;
     ALTER TABLE player_game_progress ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN monthly_general_score TYPE BIGINT USING monthly_general_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN monthly_infinite_score TYPE BIGINT USING monthly_infinite_score::bigint;
@@ -943,10 +944,13 @@ async function initDatabase() {
       monthly_state JSONB NOT NULL DEFAULT '{}'::jsonb,
       game_totals JSONB NOT NULL DEFAULT '{}'::jsonb,
       recent_sources JSONB NOT NULL DEFAULT '[]'::jsonb,
+      reward_game_key TEXT NOT NULL DEFAULT 'target_number',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     ALTER TABLE player_task_state
       ADD COLUMN IF NOT EXISTS recent_sources JSONB NOT NULL DEFAULT '[]'::jsonb;
+    ALTER TABLE player_task_state
+      ADD COLUMN IF NOT EXISTS reward_game_key TEXT NOT NULL DEFAULT 'target_number';
 
     CREATE INDEX IF NOT EXISTS idx_secure_challenges_player_active
       ON secure_game_challenges (player_id, mode, completed_at, expires_at);
@@ -1286,6 +1290,7 @@ function taskAggregateSkeleton(now = new Date()) {
     monthlyState: emptyTaskAggregatePeriod(),
     gameTotals: {},
     recentSources: [],
+    rewardGameKey: "target_number",
   };
 }
 
@@ -1312,6 +1317,7 @@ function normalizeTaskAggregateRow(row, now = new Date()) {
           .filter((item) => /^[a-f0-9]{32}$/.test(item))
           .slice(-TASK_RECENT_SOURCE_LIMIT)
       : [],
+    rewardGameKey: safeTaskRewardGameKey(row.reward_game_key),
   };
 }
 
@@ -1437,7 +1443,7 @@ async function persistTaskAggregateState(
 async function readTaskAggregateState(client, playerId, now = new Date()) {
   const current = await client.query(
     `SELECT daily_key, daily_state, weekly_key, weekly_state,
-            monthly_key, monthly_state, game_totals, recent_sources
+            monthly_key, monthly_state, game_totals, recent_sources, reward_game_key
      FROM player_task_state
      WHERE player_id = $1`,
     [playerId]
@@ -1458,7 +1464,7 @@ async function loadTaskAggregateStateForUpdate(
   void playerAlreadyEnsured;
   let current = await client.query(
     `SELECT daily_key, daily_state, weekly_key, weekly_state,
-            monthly_key, monthly_state, game_totals, recent_sources
+            monthly_key, monthly_state, game_totals, recent_sources, reward_game_key
      FROM player_task_state
      WHERE player_id = $1
      FOR UPDATE`,
@@ -1472,7 +1478,7 @@ async function loadTaskAggregateStateForUpdate(
   await client.query(`SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, [`task:${playerId}`]);
   current = await client.query(
     `SELECT daily_key, daily_state, weekly_key, weekly_state,
-            monthly_key, monthly_state, game_totals, recent_sources
+            monthly_key, monthly_state, game_totals, recent_sources, reward_game_key
      FROM player_task_state
      WHERE player_id = $1
      FOR UPDATE`,
@@ -1585,7 +1591,7 @@ async function recordTaskEventInTransaction(client, {
        updated_at = NOW()
      WHERE NOT (COALESCE(player_task_state.recent_sources, '[]'::jsonb) ? $5)
      RETURNING daily_key, daily_state, weekly_key, weekly_state,
-               monthly_key, monthly_state, game_totals, recent_sources`,
+               monthly_key, monthly_state, game_totals, recent_sources, reward_game_key`,
     [
       playerId,
       initial.dailyKey,
@@ -1626,6 +1632,14 @@ async function recordTaskGameEvent(playerId, sourceKey, gameKey, multiplayer, wo
     throw error;
   } finally {
     client.release();
+  }
+}
+
+function safeTaskRewardGameKey(value) {
+  try {
+    return normalizeBaseGameKey(value || "target_number");
+  } catch (_) {
+    return "target_number";
   }
 }
 
@@ -1693,7 +1707,7 @@ async function buildTaskCenterStateFromAggregate(_client, _playerId, aggregate, 
     };
   });
 
-  return { serverNowMillis: now.getTime(), periods: periodStates };
+  return { serverNowMillis: now.getTime(), rewardGameKey: safeTaskRewardGameKey(aggregate.rewardGameKey), periods: periodStates };
 }
 
 async function readTaskCenterState(client, playerId, forUpdate = false) {
@@ -1708,7 +1722,7 @@ async function readTaskCenterStateReadMostly(playerId) {
   const now = new Date();
   const current = await pool.query(
     `SELECT daily_key, daily_state, weekly_key, weekly_state,
-            monthly_key, monthly_state, game_totals, recent_sources
+            monthly_key, monthly_state, game_totals, recent_sources, reward_game_key
      FROM player_task_state
      WHERE player_id = $1`,
     [playerId]
@@ -1775,7 +1789,15 @@ async function mergeTaskAggregateStateForGuest(client, guestId, targetPlayerId) 
     recentSources: [...new Set([...(target.recentSources || []), ...(guest.recentSources || [])])].slice(-TASK_RECENT_SOURCE_LIMIT),
   };
   await persistTaskAggregateState(client, targetPlayerId, merged);
+  const mergedRewardGameKey = target.rewardGameKey !== "target_number"
+    ? safeTaskRewardGameKey(target.rewardGameKey)
+    : safeTaskRewardGameKey(guest.rewardGameKey);
+  await client.query(
+    `UPDATE player_task_state SET reward_game_key = $2, updated_at = NOW() WHERE player_id = $1`,
+    [targetPlayerId, mergedRewardGameKey]
+  );
 }
+
 
 async function claimTaskRewardInTransaction(client, playerId, periodType, taskCode) {
   const type = TASK_PERIOD_CONFIG[periodType] ? periodType : "daily";
@@ -1819,7 +1841,8 @@ async function claimTaskRewardInTransaction(client, playerId, periodType, taskCo
 
   if (marked.rowCount === 0) return taskCenter;
 
-  if (rewardScore > 0) await addPositiveGeneralAndXpInTransaction(client, playerId, rewardScore, 0);
+  const rewardGameKey = safeTaskRewardGameKey(taskCenter.rewardGameKey);
+  if (rewardScore > 0) await applyGameGeneralScoreDeltaInTransaction(client, playerId, rewardGameKey, rewardScore);
   if (rewardDiamonds > 0) {
     await client.query(
       `UPDATE player_progress SET diamond_balance = LEAST(diamond_balance + $2, 2000000000), updated_at = NOW()
@@ -1841,6 +1864,21 @@ async function claimTaskRewardInTransaction(client, playerId, periodType, taskCo
       };
     }),
   };
+}
+
+async function updateTaskRewardGameInTransaction(client, playerId, requestedGameKey) {
+  const rewardGameKey = normalizeBaseGameKey(requestedGameKey);
+  await ensureAuthenticatedPlayer(client, playerId);
+  await ensurePlayerGameProgress(client, playerId, rewardGameKey);
+  await loadTaskAggregateStateForUpdate(client, playerId, new Date(), true);
+  await client.query(
+    `UPDATE player_task_state
+     SET reward_game_key = $2, updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, rewardGameKey]
+  );
+  const aggregate = await readTaskAggregateState(client, playerId, new Date());
+  return buildTaskCenterStateFromAggregate(client, playerId, aggregate, new Date());
 }
 
 function timestampMillis(value) {
@@ -1886,14 +1924,7 @@ function safeCountry(value) {
 }
 
 function safeScore(value) {
-  const number = Number(value || 0);
-
-  if (!Number.isFinite(number)) return 0;
-
-  return Math.max(
-    0,
-    Math.min(Math.floor(number), 2_000_000_000)
-  );
+  return safeScoreNumber(value);
 }
 
 function safeDelta(value) {
@@ -3858,15 +3889,34 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
   };
 }
 
+const INITIAL_PER_GAME_SCORE = 50;
+
 async function ensurePlayerGameProgress(client, playerId, gameKey) {
   const baseGameKey = normalizeBaseGameKey(gameKey);
+  const monthKey = currentMonthKey();
   await client.query(
-    `INSERT INTO player_game_progress (player_id, game_key)
-     VALUES ($1, $2)
+    `INSERT INTO player_game_progress (
+       player_id, game_key, general_score, monthly_key, monthly_general_score
+     )
+     VALUES ($1, $2, $3, $4, $3)
      ON CONFLICT (player_id, game_key) DO NOTHING`,
-    [playerId, baseGameKey]
+    [playerId, baseGameKey, INITIAL_PER_GAME_SCORE, monthKey]
   );
   return baseGameKey;
+}
+
+async function ensureAllPlayerGameProgress(client, playerId) {
+  const gameKeys = Object.keys(GAME_DEFINITIONS);
+  const monthKey = currentMonthKey();
+  await client.query(
+    `INSERT INTO player_game_progress (
+       player_id, game_key, general_score, monthly_key, monthly_general_score
+     )
+     SELECT $1, game_key, $3, $4, $3
+     FROM UNNEST($2::text[]) AS game_key
+     ON CONFLICT (player_id, game_key) DO NOTHING`,
+    [playerId, gameKeys, INITIAL_PER_GAME_SCORE, monthKey]
+  );
 }
 
 async function readPlayerGameProgress(client, playerId, gameKey, forUpdate = false) {
@@ -7152,6 +7202,9 @@ async function ensureAuthenticatedPlayer(client, playerId) {
      ON CONFLICT (player_id) DO NOTHING`,
     [playerId]
   );
+  // Yeni hesapta 20 oyunun tamamı 50 normal puanla başlar. Tek UNNEST INSERT ile
+  // 20 ayrı sorgu göndermeden bütün oyun satırları ekonomik biçimde oluşturulur.
+  await ensureAllPlayerGameProgress(client, playerId);
   return true;
 }
 
@@ -7542,14 +7595,23 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
      FROM player_game_progress
      WHERE player_id = $1
      ON CONFLICT (player_id, game_key) DO UPDATE SET
+       -- Her hesap 50 başlangıç puanı aldığı için guest + Play Games birleşiminde
+       -- bu başlangıç hibesi iki kez sayılmaz. Net kazanım/kayıp geçmişleri yine birleşir.
        general_score = LEAST(
-         player_game_progress.general_score::numeric + EXCLUDED.general_score::numeric,
+         GREATEST(
+           0::numeric,
+           player_game_progress.general_score::numeric + EXCLUDED.general_score::numeric - $4::numeric
+         ),
          9223372036854775807::numeric
        )::bigint,
        infinite_score = GREATEST(player_game_progress.infinite_score, EXCLUDED.infinite_score),
        monthly_general_score = LEAST(
-         (CASE WHEN player_game_progress.monthly_key = $3 THEN player_game_progress.monthly_general_score ELSE 0 END)::numeric +
-         (CASE WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_general_score ELSE 0 END)::numeric,
+         GREATEST(
+           0::numeric,
+           (CASE WHEN player_game_progress.monthly_key = $3 THEN player_game_progress.monthly_general_score ELSE 0 END)::numeric +
+           (CASE WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_general_score ELSE 0 END)::numeric -
+           (CASE WHEN player_game_progress.monthly_key = $3 AND EXCLUDED.monthly_key = $3 THEN $4::numeric ELSE 0::numeric END)
+         ),
          9223372036854775807::numeric
        )::bigint,
        monthly_infinite_score = GREATEST(
@@ -7592,7 +7654,7 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          ELSE player_game_progress.stats
        END,
        updated_at = NOW()`,
-    [guestId, playGamesPlayerId, migrationMonthKey]
+    [guestId, playGamesPlayerId, migrationMonthKey, INITIAL_PER_GAME_SCORE]
   );
 
   // v22: Oyunların sonsuz skorları artık birbirine eklenmez. Her oyun kendi
@@ -9271,6 +9333,32 @@ app.post("/tasks/login", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/tasks/reward-game", requireAuth, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  let rewardGameKey;
+  try {
+    rewardGameKey = normalizeBaseGameKey(req.body?.gameKey);
+  } catch (error) {
+    res.status(400).json({ ok: false, code: "INVALID_GAME", message: "Geçersiz görev puanı oyunu." });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const taskCenter = await updateTaskRewardGameInTransaction(
+      client, req.auth.sub, rewardGameKey
+    );
+    await client.query("COMMIT");
+    res.json({ ok: true, taskCenter });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Görev puanı oyunu değiştirilemedi.", "task reward game error:");
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/tasks/claim", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   const periodType = safeText(req.body.periodType, "daily", 16).toLowerCase();
@@ -9294,7 +9382,9 @@ app.post("/tasks/claim", requireAuth, async (req, res) => {
       periodType,
       taskCode
     );
-    const state = await readAuthoritativePlayerState(client, req.auth.sub);
+    const state = await readAuthoritativePlayerState(
+      client, req.auth.sub, safeTaskRewardGameKey(taskCenter.rewardGameKey)
+    );
     await client.query("COMMIT");
     res.json({ ok: true, taskCenter, ...state });
   } catch (error) {
