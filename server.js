@@ -7,7 +7,18 @@ const { Pool } = require("pg");
 
 const app = express();
 
-const SERVER_BUILD_ID = "game729-unbounded-exponent-tiles-v20-20260912";
+// Skorlar PostgreSQL BIGINT + Android Long olarak taşınır. Node.js tarafında JSON sayı
+// hassasiyetini korumak için bütün istemci kaynaklı skorları MAX_SAFE_INTEGER içinde tutarız.
+// Bu sınır 2 milyarın yaklaşık 4,5 milyon katıdır ve mevcut oyun ekonomisinin çok üzerindedir.
+const MAX_SAFE_SCORE = Number.MAX_SAFE_INTEGER;
+function safeScoreNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  const fallbackNumber = Number(fallback);
+  const candidate = Number.isFinite(parsed) ? parsed : (Number.isFinite(fallbackNumber) ? fallbackNumber : 0);
+  return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
+}
+
+const SERVER_BUILD_ID = "score64-global-digit-hunt-v21-20260914";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -436,11 +447,11 @@ async function initDatabase() {
 
     CREATE TABLE IF NOT EXISTS player_scores (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
-      general_score INTEGER NOT NULL DEFAULT 0 CHECK (general_score >= 0),
-      infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
+      general_score BIGINT NOT NULL DEFAULT 0 CHECK (general_score >= 0),
+      infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
       monthly_key TEXT NOT NULL DEFAULT '',
-      monthly_general_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
-      monthly_infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0),
+      monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
+      monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0),
       monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -448,11 +459,18 @@ async function initDatabase() {
     ALTER TABLE player_scores
       ADD COLUMN IF NOT EXISTS monthly_key TEXT NOT NULL DEFAULT '';
     ALTER TABLE player_scores
-      ADD COLUMN IF NOT EXISTS monthly_general_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
+      ADD COLUMN IF NOT EXISTS monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
     ALTER TABLE player_scores
-      ADD COLUMN IF NOT EXISTS monthly_infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
+      ADD COLUMN IF NOT EXISTS monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
     ALTER TABLE player_scores
       ADD COLUMN IF NOT EXISTS monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    -- v21: skor kolonları artık 32-bit INTEGER değildir. Mevcut kurulumlarda değerleri
+    -- kaybetmeden BIGINT'e yükselt; indeksler ve CHECK constraint'leri korunur.
+    ALTER TABLE player_scores ALTER COLUMN general_score TYPE BIGINT USING general_score::bigint;
+    ALTER TABLE player_scores ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
+    ALTER TABLE player_scores ALTER COLUMN monthly_general_score TYPE BIGINT USING monthly_general_score::bigint;
+    ALTER TABLE player_scores ALTER COLUMN monthly_infinite_score TYPE BIGINT USING monthly_infinite_score::bigint;
 
     -- Eski ayrı aylık leaderboard tablosunu yalnızca bir kez yeni player_scores
     -- kolonlarına taşı. Sonrasında aylık ve genel skor aynı satırda tutulur.
@@ -477,11 +495,11 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS player_progress (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
       total_xp INTEGER NOT NULL DEFAULT 0 CHECK (total_xp >= 0),
-      infinite_run_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
+      infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
       infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
       tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
       tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3),
-      tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
+      tournament_bank BIGINT NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
       tournament_completed BOOLEAN NOT NULL DEFAULT FALSE,
       tournament_tickets INTEGER NOT NULL DEFAULT 0 CHECK (tournament_tickets >= 0),
       tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE,
@@ -504,7 +522,7 @@ async function initDatabase() {
     );
 
     ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS infinite_run_score INTEGER NOT NULL DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0;
 
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS infinite_next_stage INTEGER NOT NULL DEFAULT 1;
@@ -514,7 +532,7 @@ async function initDatabase() {
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_rights INTEGER NOT NULL DEFAULT 3;
     ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_bank INTEGER NOT NULL DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS tournament_bank BIGINT NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_progress
@@ -749,12 +767,12 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS player_game_progress (
       player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
       game_key TEXT NOT NULL,
-      infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
-      infinite_run_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
+      infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
+      infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
       infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
       tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
       tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3),
-      tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
+      tournament_bank BIGINT NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
       tournament_completed BOOLEAN NOT NULL DEFAULT FALSE,
       tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE,
       hundred_active BOOLEAN NOT NULL DEFAULT FALSE,
@@ -772,9 +790,9 @@ async function initDatabase() {
     -- player_game_progress daha önce oluşmuşsa eksik kolonların tamamını burada tamamla.
     -- Bu blok tekrar çalıştırılabilir; mevcut kolonlara dokunmaz.
     ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS infinite_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
+      ADD COLUMN IF NOT EXISTS infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
     ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS infinite_run_score INTEGER NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0);
+      ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1);
     ALTER TABLE player_game_progress
@@ -782,7 +800,7 @@ async function initDatabase() {
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3);
     ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS tournament_bank INTEGER NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0);
+      ADD COLUMN IF NOT EXISTS tournament_bank BIGINT NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0);
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_game_progress
@@ -805,6 +823,12 @@ async function initDatabase() {
       ADD COLUMN IF NOT EXISTS stats JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE player_game_progress
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    ALTER TABLE player_game_progress ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
+    ALTER TABLE player_game_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
+    ALTER TABLE player_game_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
+    ALTER TABLE player_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
+    ALTER TABLE player_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
 
     CREATE INDEX IF NOT EXISTS idx_player_game_progress_game
       ON player_game_progress (game_key, player_id);
@@ -933,17 +957,17 @@ async function applyLeaderboardScoreDeltaInTransaction(
   const monthKey = currentMonthKey();
   return client.query(
     `UPDATE player_scores
-     SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
-         infinite_score = GREATEST(0, LEAST(infinite_score::bigint + $3::bigint, 2000000000))::integer,
+     SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, general_score::numeric + $2::numeric))::bigint,
+         infinite_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, infinite_score::numeric + $3::numeric))::bigint,
          monthly_general_score = CASE
            WHEN monthly_key = $4 THEN
-             GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
-           ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+             LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_general_score::numeric + $2::numeric))::bigint
+           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $2::numeric))::bigint
          END,
          monthly_infinite_score = CASE
            WHEN monthly_key = $4 THEN
-             GREATEST(0, LEAST(monthly_infinite_score::bigint + $3::bigint, 2000000000))::integer
-           ELSE GREATEST(0, LEAST($3::bigint, 2000000000))::integer
+             LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_infinite_score::numeric + $3::numeric))::bigint
+           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint
          END,
          monthly_key = $4,
          monthly_updated_at = NOW(),
@@ -967,17 +991,17 @@ async function applyLeaderboardGeneralDeltaAndInfiniteHighScoreInTransaction(
   const monthKey = currentMonthKey();
   return client.query(
     `UPDATE player_scores
-     SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
-         infinite_score = GREATEST(infinite_score, GREATEST(0, LEAST($3::bigint, 2000000000))::integer),
+     SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, general_score::numeric + $2::numeric))::bigint,
+         infinite_score = GREATEST(infinite_score, LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint),
          monthly_general_score = CASE
            WHEN monthly_key = $4 THEN
-             GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
-           ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+             LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_general_score::numeric + $2::numeric))::bigint
+           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $2::numeric))::bigint
          END,
          monthly_infinite_score = CASE
            WHEN monthly_key = $4 THEN
-             GREATEST(monthly_infinite_score, GREATEST(0, LEAST($3::bigint, 2000000000))::integer)
-           ELSE GREATEST(0, LEAST($3::bigint, 2000000000))::integer
+             GREATEST(monthly_infinite_score, LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint)
+           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint
          END,
          monthly_key = $4,
          monthly_updated_at = NOW(),
@@ -3068,7 +3092,7 @@ function generateSecurePuzzle(difficultyValue) {
 function challengeRewards(mode, stage) {
   const safeStage = Math.max(1, Math.min(Number(stage || 1), 1000));
   if (mode === "infinite") {
-    const points = Math.min(2_000_000_000, safeStage * 5);
+    const points = Math.min(MAX_SAFE_SCORE, safeStage * 5);
     const stageSum = safeStage * (safeStage + 1) / 2;
     // Sonsuz mod puanı ayrı tutulur; normal/genel puanı artırmaz.
     return { generalDelta: 0, infiniteDelta: points, xpDelta: Math.min(2_000_000_000, stageSum * 5) };
@@ -3165,7 +3189,9 @@ function minimumTwoPlayerStake(difficulty) {
 }
 
 function quickStakeRange(availableScore, difficulty) {
-  const score = Math.max(0, Math.min(Number(availableScore || 0), 2_000_000_000));
+  // Bahis/masa puanı protokolü hâlâ Int tabanlıdır; toplam oyuncu skoru 2 milyarı
+  // geçse bile yalnız bahis üretimi kendi bağımsız güvenli aralığında kalır.
+  const score = Math.min(safeScoreNumber(availableScore), 2_000_000_000);
   const minimum = minimumTwoPlayerStake(difficulty);
   const minStake = Math.max(minimum, Math.floor(score / 10));
   const maxStake = Math.max(minStake, Math.floor(score / 2));
@@ -3209,7 +3235,7 @@ function randomStakeWithNaturalEnding(minimumValue, maximumValue) {
 }
 
 function minimumOpenTableStake(availableScore, difficulty) {
-  const score = Math.max(0, Math.min(Number(availableScore || 0), 2_000_000_000));
+  const score = safeScoreNumber(availableScore);
   const lowestEligibleGroup = TWO_PLAYER_ROOM_GROUPS.find((group) =>
     score >= group.minScore && (group.maxScore == null || score <= group.maxScore)
   );
@@ -3239,7 +3265,7 @@ function assertOpenTableStake(stakePoints, availableScore, difficulty) {
 
 function normalizeRequestedStake(value, difficulty, availableScore, allowAutomatic = false) {
   const minimum = minimumTwoPlayerStake(difficulty);
-  const score = Math.max(0, Math.min(Number(availableScore || 0), 2_000_000_000));
+  const score = safeScoreNumber(availableScore);
   const requested = Math.floor(Number(value || 0));
   if (allowAutomatic && requested <= 0) {
     const { minStake: lower, maxStake: upper } = quickStakeRange(score, difficulty);
@@ -3944,8 +3970,9 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
     );
   }
 
-  const globalGeneralScore = Math.max(0, Math.min(2_000_000_000,
-    Number(row.general_score || 0) + (levelSettlementNeeded ? levelSettlement.generalDelta : 0)));
+  const globalGeneralScore = safeScoreNumber(
+    Number(row.general_score || 0) + (levelSettlementNeeded ? levelSettlement.generalDelta : 0)
+  );
   const diamondBalance = Math.max(0, Math.min(2_000_000_000,
     Number(row.diamond_balance || 0) + (levelSettlementNeeded ? levelSettlement.diamondDelta : 0)));
   const rewardedTournamentToday = String(row.tournament_reward_day_key || "") === todayKey
@@ -3955,15 +3982,15 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
   return {
     gameKey: baseGameKey,
     generalScore: globalGeneralScore,
-    infiniteScore: Math.max(0, Number(row.infinite_score || 0)),
-    gameInfiniteScore: Math.max(0, Number(row.game_infinite_score || 0)),
+    infiniteScore: safeScoreNumber(row.infinite_score),
+    gameInfiniteScore: safeScoreNumber(row.game_infinite_score),
     totalXp,
     diamondBalance,
     levelRewardClaimedThrough: levelSettlementNeeded ? levelSettlement.claimedThroughLevel : storedClaimedThrough,
     levelRewardSettlement: levelSettlementNeeded ? levelSettlement : {
       claimedThroughLevel: storedClaimedThrough, generalDelta: 0, diamondDelta: 0,
     },
-    runScore: Math.max(0, Number(row.infinite_run_score || 0)),
+    runScore: safeScoreNumber(row.infinite_run_score),
     infiniteNextStage: Math.max(1, Number(row.infinite_next_stage || 1)),
     profile: {
       username: safeUsername(row.username || ""),
@@ -4052,7 +4079,7 @@ async function applyTournamentOutcomeInTransaction(
   let xpDelta = 0;
   if (won === true) {
     const stageReward = tournamentStageReward(currentStage);
-    nextBank = Math.min(2_000_000_000, bank + stageReward);
+    nextBank = Math.min(MAX_SAFE_SCORE, bank + stageReward);
     xpDelta = stageReward;
     completed = currentStage >= 8;
     nextStage = completed ? 8 : currentStage + 1;
@@ -4095,7 +4122,7 @@ async function applyTournamentOutcomeInTransaction(
   return {
     ...before,
     gameKey: baseGameKey,
-    generalScore: Math.max(0, Math.min(2_000_000_000, Number(before.generalScore || 0) + persistedGeneralDelta)),
+    generalScore: safeScoreNumber(Number(before.generalScore || 0) + persistedGeneralDelta),
     totalXp: totalXpAfter,
     diamondBalance: Math.max(0, Math.min(2_000_000_000, Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
     levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
@@ -4139,7 +4166,7 @@ function hundredDifficultyForStage(stageValue) {
 }
 
 async function addPositiveGeneralAndXpInTransaction(client, playerId, generalDelta, xpDelta) {
-  const safeGeneral = Math.max(0, Math.min(Number(generalDelta || 0), 2_000_000_000));
+  const safeGeneral = safeScoreNumber(generalDelta);
   const safeXp = Math.max(0, Math.min(Number(xpDelta || 0), 2_000_000_000));
   if (safeGeneral > 0) {
     await applyLeaderboardScoreDeltaInTransaction(client, playerId, safeGeneral, 0);
@@ -4221,7 +4248,7 @@ async function completeHundredStageInTransaction(client, playerId, stageValue, g
   return {
     ...before,
     gameKey: baseGameKey,
-    generalScore: Math.max(0, Math.min(2_000_000_000, Number(before.generalScore || 0) + persistedGeneralDelta)),
+    generalScore: safeScoreNumber(Number(before.generalScore || 0) + persistedGeneralDelta),
     totalXp: totalXpAfter,
     diamondBalance: Math.max(0, Math.min(2_000_000_000, Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
     levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
@@ -4296,7 +4323,7 @@ async function forfeitHundredRunInTransaction(client, playerId, gameKey = "targe
   return {
     ...before,
     gameKey: baseGameKey,
-    generalScore: Math.max(0, Math.min(2_000_000_000, Number(before.generalScore || 0) + persistedGeneralDelta)),
+    generalScore: safeScoreNumber(Number(before.generalScore || 0) + persistedGeneralDelta),
     totalXp: totalXpAfter,
     diamondBalance: Math.max(0, Math.min(2_000_000_000, Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
     levelRewardClaimedThrough: levelSettlement.claimedThroughLevel,
@@ -4338,7 +4365,7 @@ function normalizeTwoPlayerFinishProfile(profile = {}) {
   const averageScore = scoreCount > 0 ? Math.round(scoreTotal / scoreCount) : null;
   const parsedGeneralScore = Number(profile.generalScore || 0);
   const generalScore = Number.isFinite(parsedGeneralScore)
-    ? Math.max(0, Math.min(2_000_000_000, Math.floor(parsedGeneralScore)))
+    ? safeScoreNumber(parsedGeneralScore)
     : 0;
   const parsedBotGameCount = Number(profile.botGameCount || 0);
   const botGameCount = Number.isFinite(parsedBotGameCount)
@@ -4395,7 +4422,7 @@ async function recordTwoPlayerFinishTimeInTransaction(client, playerId, elapsedM
 }
 
 async function recordTwoPlayerScoreInTransaction(client, playerId, scoreValue, gameKey = "merge_5120") {
-  const score = Math.max(0, Math.min(2_000_000_000, Math.floor(Number(scoreValue) || 0)));
+  const score = safeScoreNumber(scoreValue);
   const normalizedGameKey = normalizeBaseGameKey(gameKey);
   await ensurePlayerGameProgress(client, playerId, normalizedGameKey);
   await client.query(
@@ -4482,7 +4509,7 @@ function botUnder1000TimingRangeSeconds(config) {
 }
 
 function botScoreTimingRangeSeconds(config, generalScore) {
-  const score = Math.max(0, Math.min(2_000_000_000, Math.floor(Number(generalScore) || 0)));
+  const score = safeScoreNumber(generalScore);
   const timing = config?.botScoreTimingSeconds;
 
   if (score >= 1_000_000) {
@@ -4759,11 +4786,11 @@ async function applyTwoPlayerBotRewardsInTransaction(
     await client.query(
       `WITH score_update AS (
          UPDATE player_scores
-         SET general_score = GREATEST(0, LEAST(general_score::bigint + $2::bigint, 2000000000))::integer,
+         SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, general_score::numeric + $2::numeric))::bigint,
              monthly_general_score = CASE
                WHEN monthly_key = $8 THEN
-                 GREATEST(0, LEAST(monthly_general_score::bigint + $2::bigint, 2000000000))::integer
-               ELSE GREATEST(0, LEAST($2::bigint, 2000000000))::integer
+                 LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_general_score::numeric + $2::numeric))::bigint
+               ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $2::numeric))::bigint
              END,
              monthly_infinite_score = CASE WHEN monthly_key = $8 THEN monthly_infinite_score ELSE 0 END,
              monthly_key = $8,
@@ -4815,7 +4842,7 @@ async function applyTwoPlayerBotRewardsInTransaction(
 
   return {
     ...before,
-    generalScore: Math.max(0, Math.min(2_000_000_000, Number(before.generalScore || 0) + persistedGeneralDelta)),
+    generalScore: safeScoreNumber(Number(before.generalScore || 0) + persistedGeneralDelta),
     totalXp: totalXpAfter,
     diamondBalance: Math.max(0, Math.min(2_000_000_000,
       Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
@@ -5485,7 +5512,7 @@ function merge5120DropState(state, seed, columnValue) {
     merge5120Gravity(board);
     currentValue += 1;
     maxTileEver = Math.max(maxTileEver, currentValue);
-    score = Math.min(2_000_000_000, score + merge729RawValueCapped(currentValue));
+    score = Math.min(MAX_SAFE_SCORE, score + merge729RawValueCapped(currentValue));
 
     currentRow = -1;
     for (let r = MERGE_5120_ROWS - 1; r >= 0; r -= 1) {
@@ -6714,7 +6741,7 @@ function digitHuntApplyMoveState(state, from, to, seed, initialBoard, unlimitedS
   if (mustCreateMatch && !run) return null;
   let score = Number(state.score || 0), spawnCounter = Number(state.spawnCounter || 0), guard = 0;
   while (run && guard < 200) {
-    score = Math.min(2_000_000_000, score + run.length * 2);
+    score = Math.min(MAX_SAFE_SCORE, score + run.length * 2);
     const collapsed = digitHuntCollapseAndRefill(board, run, seed, spawnCounter, initialBoard, unlimitedSpawns);
     board = collapsed.board; spawnCounter = collapsed.spawnCounter;
     run = digitHuntFindFirstRun(board); guard += 1;
@@ -7290,22 +7317,22 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
   );
 
   // Puan ve XP misafir hesabında da yalnızca sunucunun doğruladığı oyun sonuçlarıyla oluşur.
-  // Bu nedenle iki ayrık geçmişi toplamak güvenlidir; Int üst sınırında kırpılır.
+  // Bu nedenle iki ayrık geçmişi toplamak güvenlidir; 64-bit skor alanında güvenle birleştirilir.
   const migrationMonthKey = currentMonthKey();
   await client.query(
     `UPDATE player_scores AS target
-     SET general_score = LEAST(target.general_score::bigint + guest.general_score::bigint, 2000000000)::integer,
-         infinite_score = LEAST(target.infinite_score::bigint + guest.infinite_score::bigint, 2000000000)::integer,
+     SET general_score = LEAST(target.general_score::numeric + guest.general_score::numeric, 9223372036854775807::numeric)::bigint,
+         infinite_score = LEAST(target.infinite_score::numeric + guest.infinite_score::numeric, 9223372036854775807::numeric)::bigint,
          monthly_general_score = LEAST(
-           (CASE WHEN target.monthly_key = $3 THEN target.monthly_general_score ELSE 0 END)::bigint +
-           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_general_score ELSE 0 END)::bigint,
-           2000000000
-         )::integer,
+           (CASE WHEN target.monthly_key = $3 THEN target.monthly_general_score ELSE 0 END)::numeric +
+           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_general_score ELSE 0 END)::numeric,
+           9223372036854775807::numeric
+         )::bigint,
          monthly_infinite_score = LEAST(
-           (CASE WHEN target.monthly_key = $3 THEN target.monthly_infinite_score ELSE 0 END)::bigint +
-           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_infinite_score ELSE 0 END)::bigint,
-           2000000000
-         )::integer,
+           (CASE WHEN target.monthly_key = $3 THEN target.monthly_infinite_score ELSE 0 END)::numeric +
+           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_infinite_score ELSE 0 END)::numeric,
+           9223372036854775807::numeric
+         )::bigint,
          monthly_key = $3,
          monthly_updated_at = NOW(),
          updated_at = NOW()
@@ -7412,8 +7439,8 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
   await client.query(
     `UPDATE player_scores
      SET infinite_score = LEAST(COALESCE((
-       SELECT SUM(infinite_score)::bigint FROM player_game_progress WHERE player_id = $1
-     ), 0), 2000000000)::integer,
+       SELECT SUM(infinite_score::numeric) FROM player_game_progress WHERE player_id = $1
+     ), 0::numeric), 9223372036854775807::numeric)::bigint,
          updated_at = NOW()
      WHERE player_id = $1`,
     [playGamesPlayerId]
@@ -7543,11 +7570,11 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
        ) AS c(player_id, general_delta, xp_delta, finish_sample_ms)
      ), score_updates AS (
        UPDATE player_scores AS s
-       SET general_score = GREATEST(0, LEAST(s.general_score::bigint + c.general_delta, 2000000000))::integer,
+       SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, s.general_score::numeric + c.general_delta::numeric))::bigint,
            monthly_general_score = CASE
              WHEN s.monthly_key = $5 THEN
-               GREATEST(0, LEAST(s.monthly_general_score::bigint + c.general_delta, 2000000000))::integer
-             ELSE GREATEST(0, LEAST(c.general_delta, 2000000000))::integer
+               LEAST(9223372036854775807::numeric, GREATEST(0::numeric, s.monthly_general_score::numeric + c.general_delta::numeric))::bigint
+             ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, c.general_delta::numeric))::bigint
            END,
            -- Normal ikili oyunda infinite delta 0'dır; ay değiştiyse eski ayın infinite skoru
            -- yeni monthly_key altında taşınmamalı. Eski helper'ın ay rollover semantiğini koru.
@@ -8593,7 +8620,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       outcomeReason = "top_overflow";
     }
     if (digitHuntInfiniteSingleRun) {
-      const gameScore = Math.max(0, Math.floor(Number(req.body?.answer?.score || 0)));
+      const gameScore = safeScoreNumber(req.body?.answer?.score);
       const earnedInfinite = Math.floor(gameScore / 20);
       rewards = { generalDelta: 0, infiniteDelta: earnedInfinite, xpDelta: earnedInfinite };
       won = true;
@@ -8717,7 +8744,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         const oldRunScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_run_score || 0));
         infiniteRunScore = digitHuntInfiniteSingleRun
           ? Math.max(0, Number(rewards.infiniteDelta || 0))
-          : Math.min(2_000_000_000, oldRunScore + Math.max(0, Number(rewards.infiniteDelta || 0)));
+          : Math.min(MAX_SAFE_SCORE, oldRunScore + Math.max(0, Number(rewards.infiniteDelta || 0)));
         const newHighScore = Math.max(oldHighScore, infiniteRunScore);
         const highScoreDelta = Math.max(0, newHighScore - oldHighScore);
 
@@ -9299,7 +9326,7 @@ async function queryLeaderboardTopRows({ scoreType, period, scope, country, mont
     rank: index + 1,
     username: row.username,
     country: row.country,
-    score: Number(row.score),
+    score: safeScoreNumber(row.score),
   }));
 }
 
@@ -10222,7 +10249,7 @@ function registerRealtimeRoundScore(room, participant, scoreValue, elapsedMs) {
   if (!room || !participant || room.resolved) return;
   if (participant.finishedRoundIndex === room.roundIndex) return;
   const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
-  const safeScore = Math.max(0, Math.min(2_000_000_000, Math.floor(Number(scoreValue) || 0)));
+  const safeScore = safeScoreNumber(scoreValue);
   participant.roundScore = safeScore;
   participant.finishedAt = Date.now();
   participant.elapsedMs = Math.max(1, Math.min(Number(elapsedMs || roundLimitMs), roundLimitMs));
