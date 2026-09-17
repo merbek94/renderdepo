@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "competitive-checkpoint-v25-20260917";
+const SERVER_BUILD_ID = "competitive-checkpoint-v26-20260917";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -10832,6 +10832,9 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
     participant.finishedRoundIndex = null;
     participant.roundScore = null;
     participant.progressState = null;
+    // Generic reconnect checkpoint is per-round and latest-only; a new round must never
+    // inherit the previous round's board.
+    participant.resumeCheckpoint = null;
   });
 
   const roundLimitMs = gameDefinition(room.gameKey).roundDurationMs;
@@ -11112,6 +11115,7 @@ function createRealtimeRoom(
         finishedRoundIndex: null,
         roundWins: 0,
         totalElapsedMs: 0,
+        resumeCheckpoint: null,
         tournamentStage: tournamentStage == null ? null : Math.max(1, Math.min(Number(tournamentStage || 1), 8)),
       },
 
@@ -11132,6 +11136,7 @@ function createRealtimeRoom(
         finishedRoundIndex: null,
         roundWins: 0,
         totalElapsedMs: 0,
+        resumeCheckpoint: null,
         tournamentStage: opponentTournamentStage == null ? null : Math.max(1, Math.min(Number(opponentTournamentStage || 1), 8)),
       },
     },
@@ -12409,6 +12414,15 @@ io.on("connection", (socket) => {
           opponentRoundWins: Number(opponent?.roundWins || 0),
 
           opponentFinishedMs: Number(opponent?.roundElapsedMs || 0),
+
+          // Generic games only need the latest board to continue after a reconnect.
+          // This object is replaced on every checkpoint update; no move history is retained.
+          resumeCheckpoint:
+            participant.resumeCheckpoint &&
+            participant.resumeCheckpoint.roundIndex === room.roundIndex &&
+            participant.resumeCheckpoint.gameKey === normalizeBaseGameKey(room.gameKey)
+              ? participant.resumeCheckpoint
+              : null,
         }
       );
 
@@ -12781,6 +12795,64 @@ io.on("connection", (socket) => {
           room.difficulty
         )
       );
+    }
+  );
+
+  socket.on(
+    "player_resume_checkpoint",
+    async (payload = {}) => {
+      const roomId = String(payload.roomId || "").trim();
+      const room = realtimeRooms.get(roomId);
+      const active = activeRooms.get(socket.id);
+      const playerId = active?.playerId || roomParticipants(room).find((item) => item.socketId === socket.id)?.playerId;
+      const participant = getParticipant(room, playerId);
+      if (!room || !participant || room.resolved || participant.isBot || participant.finishedAt) return;
+      if (!(await socketHasActiveGameplaySession(socket, participant.playerId, "match_error"))) return;
+      if (Number(payload.roundIndex ?? room.roundIndex) !== room.roundIndex) return;
+
+      const gameKey = normalizeBaseGameKey(payload.gameKey || room.gameKey);
+      if (gameKey !== normalizeBaseGameKey(room.gameKey)) return;
+      const board = payload && typeof payload.board === "object" && payload.board ? payload.board : null;
+      if (!board || !Array.isArray(board.numberSlots) || !Array.isArray(board.operatorSlots)) return;
+      if (board.numberSlots.length > 2048 || board.operatorSlots.length > 256) {
+        socket.emit("match_error", { code: "RESUME_CHECKPOINT_TOO_LARGE", message: "Yeniden bağlanma checkpoint'i çok büyük." });
+        return;
+      }
+
+      const numberSlots = [];
+      for (const value of board.numberSlots) {
+        if (value == null) {
+          numberSlots.push(null);
+          continue;
+        }
+        const parsed = Number(value);
+        if (!Number.isSafeInteger(parsed) || parsed < -2_147_483_648 || parsed > 2_147_483_647) return;
+        numberSlots.push(parsed);
+      }
+      const operatorSlots = [];
+      for (const value of board.operatorSlots) {
+        if (value == null) {
+          operatorSlots.push(null);
+          continue;
+        }
+        if (typeof value !== "string" || value.length > 32) return;
+        operatorSlots.push(value);
+      }
+
+      const checkpoint = {
+        roundIndex: room.roundIndex,
+        gameKey,
+        updatedAtMillis: Date.now(),
+        board: { numberSlots, operatorSlots },
+      };
+      if (Buffer.byteLength(JSON.stringify(checkpoint), "utf8") > 64 * 1024) {
+        socket.emit("match_error", { code: "RESUME_CHECKPOINT_TOO_LARGE", message: "Yeniden bağlanma checkpoint'i çok büyük." });
+        return;
+      }
+
+      // Assignment intentionally replaces the previous checkpoint. We keep one latest state,
+      // not a growing list of moves or historical snapshots.
+      participant.resumeCheckpoint = checkpoint;
     }
   );
 
