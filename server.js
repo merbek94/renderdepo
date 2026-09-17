@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "per-game-score50-task-routing-v23-20260914";
+const SERVER_BUILD_ID = "infinite-record-xp-v24-20260917";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -844,10 +844,76 @@ async function initDatabase() {
 
     ALTER TABLE player_game_progress ALTER COLUMN general_score TYPE BIGINT USING general_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN general_score SET DEFAULT 50;
+
+    -- v24: v22 geçişinde daha önce 0 ile oluşmuş fakat hiç oynanmamış oyun satırlarına
+    -- olması gereken oyun-başı 50 puanı bir kez uygula. Gerçekten oynanmış/istatistikli
+    -- satırlara dokunulmaz; böylece maç kaybederek 0'a inmiş puanlar geri şişirilmez.
+    DO $per_game_initial50_v24$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE migration_id = 'per_game_initial50_v24_20260917'
+      ) THEN
+        UPDATE player_game_progress
+        SET general_score = 50,
+            monthly_general_score = CASE WHEN monthly_general_score = 0 THEN 50 ELSE monthly_general_score END,
+            updated_at = NOW()
+        WHERE general_score = 0
+          AND infinite_score = 0
+          AND infinite_run_score = 0
+          AND infinite_next_stage = 1
+          AND tournament_stage = 1
+          AND tournament_bank = 0
+          AND tournament_completed = FALSE
+          AND tournament_entry_active = FALSE
+          AND hundred_active = FALSE
+          AND hundred_stage = 0
+          AND two_player_finish_count = 0
+          AND two_player_score_count = 0
+          AND stats = '{}'::jsonb;
+
+        INSERT INTO schema_migrations (migration_id)
+        VALUES ('per_game_initial50_v24_20260917')
+        ON CONFLICT (migration_id) DO NOTHING;
+      END IF;
+    END
+    $per_game_initial50_v24$;
+
     ALTER TABLE player_game_progress ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN monthly_general_score TYPE BIGINT USING monthly_general_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN monthly_infinite_score TYPE BIGINT USING monthly_infinite_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
+
+    -- v24: Eski normal sonsuz sistemindeki 5*(1+...+n) yüksek skorlarını doğrudan
+    -- "en yüksek aşama = n" biçimine çevir. 729 (üs) ve Rakam Avı (ham skor)
+    -- zaten oyun-özel semantik kullandığı için dönüşüm dışında tutulur.
+    DO $infinite_high_stage_v24$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM schema_migrations WHERE migration_id = 'infinite_high_stage_v24_20260917'
+      ) THEN
+        UPDATE player_game_progress
+        SET infinite_score = CASE
+              WHEN infinite_score <= 0 THEN 0
+              ELSE FLOOR((SQRT(1::numeric + (8::numeric * infinite_score::numeric / 5::numeric)) - 1::numeric) / 2::numeric)::bigint
+            END,
+            monthly_infinite_score = CASE
+              WHEN monthly_infinite_score <= 0 THEN 0
+              ELSE FLOOR((SQRT(1::numeric + (8::numeric * monthly_infinite_score::numeric / 5::numeric)) - 1::numeric) / 2::numeric)::bigint
+            END,
+            infinite_run_score = CASE
+              WHEN infinite_run_score <= 0 THEN 0
+              ELSE FLOOR((SQRT(1::numeric + (8::numeric * infinite_run_score::numeric / 5::numeric)) - 1::numeric) / 2::numeric)::bigint
+            END,
+            updated_at = NOW()
+        WHERE game_key NOT IN ('merge_5120', 'digit_hunt');
+
+        INSERT INTO schema_migrations (migration_id)
+        VALUES ('infinite_high_stage_v24_20260917')
+        ON CONFLICT (migration_id) DO NOTHING;
+      END IF;
+    END
+    $infinite_high_stage_v24$;
+
     ALTER TABLE player_game_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
     ALTER TABLE player_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
     ALTER TABLE player_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
@@ -3265,15 +3331,16 @@ function generateSecurePuzzle(difficultyValue) {
 function challengeRewards(mode, stage) {
   const safeStage = Math.max(1, Math.min(Number(stage || 1), 1000));
   if (mode === "infinite") {
-    const points = Math.min(MAX_SAFE_SCORE, safeStage * 5);
-    const stageSum = safeStage * (safeStage + 1) / 2;
-    // Sonsuz mod puanı ayrı tutulur; normal oyun puanını artırmaz.
-    return { generalDelta: 0, infiniteDelta: points, xpDelta: Math.min(2_000_000_000, stageSum * 5) };
+    // 729 ve Rakam Avı aşağıdaki oyun-özel dallarda ele alınır.
+    // Diğer oyunlarda sonsuz puan artık ulaşılan en yüksek aşamadır; XP ise
+    // yalnız kişisel rekor aşaması geçildiğinde sabit 20 verilir.
+    return { generalDelta: 0, infiniteDelta: safeStage, xpDelta: 20 };
   }
   return { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 };
 }
 
 const TOURNAMENT_STAGE_REWARDS = [50, 150, 350, 1000, 2500, 7000, 18000, 50000];
+const TOURNAMENT_STAGE_XP_REWARDS = [50, 100, 150, 200, 250, 300, 350, 400];
 const TOURNAMENT_ENTRY_TICKET_COST = 0;
 const TOURNAMENT_TICKET_MAX = 9999;
 const TOURNAMENT_REWARDED_TICKETS_PER_AD = 5;
@@ -3293,6 +3360,11 @@ function nextUtcDayStartMillis() {
 function tournamentStageReward(stageValue) {
   const stage = Math.max(1, Math.min(Number(stageValue || 1), TOURNAMENT_STAGE_REWARDS.length));
   return TOURNAMENT_STAGE_REWARDS[stage - 1];
+}
+
+function tournamentStageXpReward(stageValue) {
+  const stage = Math.max(1, Math.min(Number(stageValue || 1), TOURNAMENT_STAGE_XP_REWARDS.length));
+  return TOURNAMENT_STAGE_XP_REWARDS[stage - 1];
 }
 
 const GAME_RIGHT_MAX = 10;
@@ -4289,7 +4361,7 @@ async function applyTournamentOutcomeInTransaction(
   if (won === true) {
     const stageReward = tournamentStageReward(currentStage);
     nextBank = Math.min(MAX_SAFE_SCORE, bank + stageReward);
-    xpDelta = stageReward;
+    xpDelta = tournamentStageXpReward(currentStage);
     completed = currentStage >= 8;
     nextStage = completed ? 8 : currentStage + 1;
     if (completed) { awardedScore = nextBank; nextEntryActive = false; }
@@ -7181,7 +7253,12 @@ async function ensureAuthenticatedPlayer(client, playerId) {
      LIMIT 1`,
     [playerId]
   );
-  if (existing.rowCount > 0) return false;
+  if (existing.rowCount > 0) {
+    // Eski hesaplarda bazı oyun satırları v22/v23 geçişinden önce hiç oluşmamış olabilir.
+    // Her girişte tek UNNEST INSERT ile eksik oyunları 50 başlangıç puanıyla tamamla.
+    await ensureAllPlayerGameProgress(client, playerId);
+    return false;
+  }
 
   const fallbackUsername = `Oyuncu_${String(playerId).slice(-8)}`;
   await client.query(
@@ -8732,14 +8809,46 @@ app.post("/game/challenges/progress", requireAuth, challengeMutationRateLimit, r
     }
 
     const checkpointPayload = merge5120InfiniteCheckpointPayload(state);
+    await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
+    const progressBefore = await client.query(
+      `SELECT infinite_score FROM player_game_progress
+       WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
+      [req.auth.sub, gameKey]
+    );
+    // 729'da infinite_score gerçek skor değil, en yüksek 3^n taşının n üssüdür.
+    // Bu hem Long/BIGINT taşmasını önler hem de sıralama düzenini aynen korur.
+    const oldHighExponent = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
+    const newHighExponent = Math.max(oldHighExponent, Number(state.maxTileEver || 0));
+    const newlyPassedPowers = Math.max(0, newHighExponent - oldHighExponent);
+    const xpDelta = Math.min(2_000_000_000, newlyPassedPowers * 20);
+
+    if (newHighExponent > oldHighExponent) {
+      await applyGameInfiniteHighScoreInTransaction(client, req.auth.sub, gameKey, newHighExponent);
+    }
+    if (xpDelta > 0) {
+      await client.query(
+        `UPDATE player_progress
+         SET total_xp = LEAST(total_xp + $2, 2000000000), updated_at = NOW()
+         WHERE player_id = $1`,
+        [req.auth.sub, xpDelta]
+      );
+    }
+
     await client.query(
       `UPDATE secure_game_challenges
        SET progress_state = $2::jsonb
        WHERE challenge_id = $1`,
       [challengeId, JSON.stringify(checkpointPayload)]
     );
+    const stateAfter = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
     await client.query("COMMIT");
-    res.json({ ok: true, ...checkpointPayload });
+    res.json({
+      ok: true,
+      ...checkpointPayload,
+      xpDelta,
+      infiniteScore: stateAfter.gameInfiniteScore ?? stateAfter.infiniteScore,
+      totalXp: stateAfter.totalXp,
+    });
   } catch (error) {
     await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "729 sonsuz ilerlemesi kaydedilemedi.", "729 checkpoint error:");
@@ -8843,17 +8952,17 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     let outcomeReason = null;
     let rewards = challengeRewards(challenge.mode, challenge.stage);
     if (mergeInfiniteSingleRun) {
-      // 729 sonsuz modunda skor/sonsuz-puan/XP üretimi yoktur; amaç yalnız en yüksek taşı büyütmektir.
+      // 729'da klasik skor hesabı yoktur. Sonsuz değer en yüksek 3^n taşının üssü,
+      // XP ise yalnız daha önce görülmemiş yeni üsler için 20'şer puandır.
       rewards = { generalDelta: 0, infiniteDelta: 0, xpDelta: 0 };
       won = true;
       outcomeReason = "top_overflow";
     }
     if (digitHuntInfiniteSingleRun) {
       const gameScore = safeScoreNumber(req.body?.answer?.score);
-      const earnedInfinite = gameScore;
-      // Yalnız sonsuz skor artık ham oyun skorudur. XP ekonomisi önceki /20 oranını korur.
-      const earnedXp = Math.floor(gameScore / 20);
-      rewards = { generalDelta: 0, infiniteDelta: earnedInfinite, xpDelta: earnedXp };
+      // Rakam Avı sonsuz puanı doğrudan kişisel en yüksek oyun skorudur.
+      // XP aşağıda eski kişisel rekorla karşılaştırılarak yalnız yeni 1000'lik eşikler için verilir.
+      rewards = { generalDelta: 0, infiniteDelta: gameScore, xpDelta: 0 };
       won = true;
       outcomeReason = "no_legal_move";
     }
@@ -8956,8 +9065,26 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     }
     if (challenge.mode === "infinite") {
       await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
+      const progressBefore = await client.query(
+        `SELECT infinite_score, infinite_run_score FROM player_game_progress
+         WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
+        [req.auth.sub, gameKey]
+      );
+      const oldHighScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
+      let awardedXp = 0;
+
       if (mergeInfiniteSingleRun) {
-        // 729 sonsuz modu skor/high-score/XP yazmaz. Eski run-score alanı yalnız uyumluluk için 0 tutulur.
+        // Son checkpoint'ten sonra kalan birkaç hamle yeni bir en-yüksek taş üretmiş olabilir.
+        // Bitişte de aynı rekor kontrolünü yaparak hiçbir 3^n kilometre taşını kaçırma.
+        const finalHighExponent = Math.max(0, Number(replayedMergeState?.maxTileEver || 0));
+        const newHighExponent = Math.max(oldHighScore, finalHighExponent);
+        const newlyPassedPowers = Math.max(0, newHighExponent - oldHighScore);
+        awardedXp = Math.min(2_000_000_000, newlyPassedPowers * 20);
+        if (newHighExponent > oldHighScore) {
+          await applyGameInfiniteHighScoreInTransaction(
+            client, req.auth.sub, gameKey, newHighExponent
+          );
+        }
         await client.query(
           `UPDATE player_game_progress
            SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
@@ -8965,57 +9092,69 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
           [req.auth.sub, gameKey]
         );
         infiniteRunScore = 0;
-      } else {
-        const progressBefore = await client.query(
-          `SELECT infinite_score, infinite_run_score FROM player_game_progress
-           WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
-          [req.auth.sub, gameKey]
-        );
-        const oldHighScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
-        const oldRunScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_run_score || 0));
-        infiniteRunScore = digitHuntInfiniteSingleRun
-          ? Math.max(0, Number(rewards.infiniteDelta || 0))
-          : Math.min(MAX_SAFE_SCORE, oldRunScore + Math.max(0, Number(rewards.infiniteDelta || 0)));
-        const newHighScore = Math.max(oldHighScore, infiniteRunScore);
-        const highScoreDelta = Math.max(0, newHighScore - oldHighScore);
-
-        if (digitHuntInfiniteSingleRun) {
-          await client.query(
-            `UPDATE player_game_progress
-             SET infinite_score = $3,
-                 infinite_run_score = $4,
-                 infinite_next_stage = 1,
-                 updated_at = NOW()
-             WHERE player_id = $1 AND game_key = $2`,
-            [req.auth.sub, gameKey, newHighScore, infiniteRunScore]
-          );
-        } else {
-          await client.query(
-            `UPDATE player_game_progress
-             SET infinite_score = $3,
-                 infinite_run_score = $4,
-                 infinite_next_stage = GREATEST(infinite_next_stage, $5 + 1),
-                 updated_at = NOW()
-             WHERE player_id = $1 AND game_key = $2`,
-            [req.auth.sub, gameKey, newHighScore, infiniteRunScore, Number(challenge.stage)]
-          );
-        }
-        await client.query(
-          `UPDATE player_progress
-           SET total_xp = LEAST(total_xp + $2, 2000000000), updated_at = NOW()
-           WHERE player_id = $1`,
-          [req.auth.sub, rewards.xpDelta]
-        );
-        if (highScoreDelta > 0) {
+      } else if (digitHuntInfiniteSingleRun) {
+        const gameScore = Math.max(0, Number(rewards.infiniteDelta || 0));
+        const newHighScore = Math.max(oldHighScore, gameScore);
+        // Her yeni 1000'lik kişisel-rekor eşiği yalnız bir kez 20 XP verir.
+        // Eski rekor aşılmazsa veya yeni bir 1000 eşiği geçilmezse XP yoktur.
+        const oldMilestone = Math.floor(oldHighScore / 1000);
+        const newMilestone = Math.floor(newHighScore / 1000);
+        awardedXp = gameScore > oldHighScore
+          ? Math.max(0, newMilestone - oldMilestone) * 20
+          : 0;
+        if (newHighScore > oldHighScore) {
           await applyGameInfiniteHighScoreInTransaction(
             client, req.auth.sub, gameKey, newHighScore
           );
         }
-        if (Number(rewards.generalDelta || 0) !== 0) {
-          await applyGameGeneralScoreDeltaInTransaction(
-            client, req.auth.sub, gameKey, Number(rewards.generalDelta || 0)
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_run_score = $3,
+               infinite_next_stage = 1,
+               updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey, gameScore]
+        );
+        infiniteRunScore = gameScore;
+      } else {
+        const completedStage = Math.max(1, Math.min(Number(challenge.stage || 1), 1000));
+        const newHighStage = Math.max(oldHighScore, completedStage);
+        // Normal sonsuz oyunlarda sonsuz puan = gelinen en yüksek aşama.
+        // Aynı/alt aşamalar tekrar oynanırsa XP verilmez; yeni rekor aşamasında sabit 20 XP verilir.
+        awardedXp = completedStage > oldHighScore ? 20 : 0;
+        if (newHighStage > oldHighScore) {
+          await applyGameInfiniteHighScoreInTransaction(
+            client, req.auth.sub, gameKey, newHighStage
           );
         }
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_run_score = $3,
+               infinite_next_stage = GREATEST(infinite_next_stage, $4 + 1),
+               updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey, completedStage, completedStage]
+        );
+        infiniteRunScore = completedStage;
+      }
+
+      rewards = {
+        ...rewards,
+        infiniteDelta: mergeInfiniteSingleRun ? 0 : infiniteRunScore,
+        xpDelta: awardedXp,
+      };
+      if (awardedXp > 0) {
+        await client.query(
+          `UPDATE player_progress
+           SET total_xp = LEAST(total_xp + $2, 2000000000), updated_at = NOW()
+           WHERE player_id = $1`,
+          [req.auth.sub, awardedXp]
+        );
+      }
+      if (Number(rewards.generalDelta || 0) !== 0) {
+        await applyGameGeneralScoreDeltaInTransaction(
+          client, req.auth.sub, gameKey, Number(rewards.generalDelta || 0)
+        );
       }
       state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
       await recordTaskEventInTransaction(client, {
