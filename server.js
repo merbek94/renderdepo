@@ -9750,22 +9750,35 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       throw error;
     }
     const elapsedServerMs = Math.max(0, Date.now() - new Date(challenge.created_at).getTime());
+
+    // Kullanıcı reconnect ekranındayken botun doğal sonucu zaten oluşmuş olabilir.
+    // Özellikle leaveMs geçmişse veya bot 3 yanlış/terminal hata ile kaybetmişse,
+    // sonradan "Hayır" denmesi bu mevcut kullanıcı galibiyetini mağlubiyete çeviremez.
+    const naturalOutcome = botOutcomeForElapsed(
+      challenge.result?.plan || {},
+      elapsedServerMs,
+      false
+    );
+    const botAlreadyLost = naturalOutcome.resolvable === true && naturalOutcome.won === true;
+    const effectiveWon = botAlreadyLost ? true : false;
+    const effectiveReason = botAlreadyLost ? naturalOutcome.reason : "player_forfeit";
+
     await markGamePlayedInTransaction(client, req.auth.sub, gameKey);
     let response;
     if (challenge.mode === "tournament_bot") {
       const tournamentResult = await applyTournamentOutcomeInTransaction(
-        client, req.auth.sub, false, Number(challenge.stage), gameKey
+        client, req.auth.sub, effectiveWon, Number(challenge.stage), gameKey
       );
       response = {
         ok: true,
         ...tournamentResult,
         runScore: tournamentResult.runScore || 0,
-        won: false,
-        outcomeReason: "player_forfeit",
+        won: effectiveWon,
+        outcomeReason: effectiveReason,
         elapsedServerMs: botGameplayElapsedMs(challenge.result?.plan || {}, elapsedServerMs),
       };
     } else {
-      const rewards = twoPlayerBotRewards(challenge.difficulty, false, challenge.wager_points);
+      const rewards = twoPlayerBotRewards(challenge.difficulty, effectiveWon, challenge.wager_points);
       const state = await applyTwoPlayerBotRewardsInTransaction(client, req.auth.sub, rewards, { gameKey });
       response = {
         ok: true,
@@ -9773,8 +9786,8 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
         generalDelta: rewards.generalDelta,
         infiniteDelta: 0,
         xpDelta: rewards.xpDelta,
-        won: false,
-        outcomeReason: "player_forfeit",
+        won: effectiveWon,
+        outcomeReason: effectiveReason,
         elapsedServerMs,
       };
     }
@@ -9784,7 +9797,7 @@ app.post("/game/bot/forfeit", requireAuth, async (req, res) => {
       eventType: "game",
       gameKey,
       multiplayer: true,
-      won: false,
+      won: effectiveWon,
     });
     await client.query(
       `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
@@ -11258,11 +11271,18 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
       String(room.gameKey || "").endsWith("_tournament") ? "tournament" : "two_player"
     );
     room.activeBotPlan = botPlan;
-    const botElapsedMs = botPlan.finishMs == null
-      ? Math.max(1, roundLimitMs - 1)
-      : Math.min(botPlan.finishMs, Math.max(1, roundLimitMs - 1));
+    const botLeaveMs = botPlanTimeMs(botPlan.leaveMs);
+    const botElapsedMs = botLeaveMs !== null
+      ? Math.min(botLeaveMs, Math.max(1, roundLimitMs - 1))
+      : (botPlan.finishMs == null
+          ? Math.max(1, roundLimitMs - 1)
+          : Math.min(botPlan.finishMs, Math.max(1, roundLimitMs - 1)));
     room.botFinishHandle = setTimeout(() => {
-      if (botPlan.wrongRoute === true || botPlan.forcedLoss === true) {
+      if (botLeaveMs !== null) {
+        // Bot kullanıcı reconnect ekranındayken ayrılmışsa bu gerçek bir rakip kaybıdır.
+        // registerRealtimeRoundLoss ayrıca reconnectNoPenaltyPlayerIds korumasını işaretler.
+        registerRealtimeRoundLoss(room, botParticipant, botElapsedMs, "bot_left");
+      } else if (botPlan.wrongRoute === true || botPlan.forcedLoss === true) {
         registerRealtimeRoundLoss(
           room, botParticipant,
           botElapsedMs,
@@ -11347,6 +11367,24 @@ function registerRealtimeRoundLoss(room, loser, elapsedMs, reason = "wrong_answe
   clearParticipantAwayState(room, loser.playerId);
 
   winner.wonRoundBecauseOpponentWrongAnswer = true;
+
+  // Reconnect sırasında kullanıcı oyunda değilken rakip 3 yanlış hakkını doldurup
+  // kaybetmişse (veya realtime bot ayrılmışsa), sonraki "Yeniden bağlan: Hayır"
+  // cevabı kullanıcıyı yeniden mağlup edemez. Çok elli maçta bu bilgi round değişse
+  // bile oda sonuçlanana kadar korunur.
+  const reconnectProtectedLossReasons = new Set([
+    "three_mistakes",
+    "bot_three_mistakes",
+    "digit_attack_away_three_mistakes",
+    "bot_left",
+  ]);
+  if (reconnectProtectedLossReasons.has(String(reason || ""))) {
+    if (!(room.reconnectNoPenaltyPlayerIds instanceof Set)) {
+      room.reconnectNoPenaltyPlayerIds = new Set();
+    }
+    room.reconnectNoPenaltyPlayerIds.add(winner.playerId);
+  }
+
   if (winner.finishedRoundIndex !== room.roundIndex) {
     winner.finishedAt = Date.now();
     winner.elapsedMs = safeElapsedMs;
@@ -11490,6 +11528,10 @@ function createRealtimeRoom(
     awardedAt: null,
     deadlineHandle: null,
     botFinishHandle: null,
+    // Kullanıcı reconnect ekranındayken rakip zaten oyundan ayrılmış veya
+    // 3 yanlış/benzeri terminal kayıpla eli kaybetmişse, daha sonra "Hayır"
+    // denildiğinde kullanıcıya hükmen mağlubiyet yazılmaması için korunur.
+    reconnectNoPenaltyPlayerIds: new Set(),
     // Hazır oda botlarında oyun-bazlı bitiriş ortalaması ve bot oyun sayacı profile taşınır.
     // 729/Rakam Avı bu ikisini kullanır; diğer oyunların mevcut oyun puanı tabanlı sistemi korunur.
     botFinishProfile: opponentPlayer.isBot === true
@@ -11863,15 +11905,39 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
           opponentSocket.emit("opponent_left", { roomId: room.roomId, reason: "prestart_cancelled" });
         }
       } else {
-        // Oyun başladıktan sonra finishedAt bayrağına bakma. Oyuncu uygulamayı kapattığı
-        // sırada bir el sonuçlanmış olabilir; maç henüz resolved değilse "Hayır" tüm maçı
-        // anında hükmen kayıp olarak kesinleştirmelidir.
-        markRoomResolved(room, "reconnect_declined", opponent.playerId, participant.playerId);
-        const settled = await awardRealtimeRoom(room, opponent, participant);
-        state = settled?.loserState || null;
-        const opponentSocket = opponent.socketId ? io.sockets.sockets.get(opponent.socketId) : null;
-        if (opponentSocket) {
-          opponentSocket.emit("opponent_left", { roomId: room.roomId, reason: "reconnect_declined" });
+        // Kullanıcı yeniden bağlanma ekranına gelene kadar rakip de oyundan ayrılmışsa
+        // kullanıcıya hükmen mağlubiyet yazma. Socket kopması henüz 60 sn timeout ile
+        // kesin mağlubiyete dönüşmemiş olsa bile burada iki taraflı terk olarak nötr sonuçlanır.
+        const opponentAlreadyAway = opponent.isBot !== true && (
+          opponent.connected === false ||
+          opponent.awaySince != null ||
+          opponent.backgrounded === true
+        );
+        const protectedByOpponentTerminalLoss =
+          room.reconnectNoPenaltyPlayerIds instanceof Set &&
+          room.reconnectNoPenaltyPlayerIds.has(participant.playerId);
+
+        if (opponentAlreadyAway || protectedByOpponentTerminalLoss) {
+          // Rakip daha önce ayrıldıysa veya 3 yanlışla kaybettiyse kullanıcının puanı
+          // düşmez. Tek elli maç zaten çoğunlukla burada gelmeden kullanıcı lehine
+          // resolved olur; bu dal özellikle çok elli/yarış durumundaki açık odayı nötr kapatır.
+          finishRealtimeDraw(
+            room,
+            opponentAlreadyAway
+              ? "reconnect_declined_opponent_already_away"
+              : "reconnect_declined_after_opponent_terminal_loss"
+          );
+          state = await readAuthoritativePlayerStateReadMostly(participant.playerId, gameKey);
+        } else {
+          // Rakip hâlâ aktif ve kullanıcıdan önce terminal olarak kaybetmemişse "Hayır"
+          // kullanıcının o anda hükmen mağlubiyeti olarak kesinleştirilir.
+          markRoomResolved(room, "reconnect_declined", opponent.playerId, participant.playerId);
+          const settled = await awardRealtimeRoom(room, opponent, participant);
+          state = settled?.loserState || null;
+          const opponentSocket = opponent.socketId ? io.sockets.sockets.get(opponent.socketId) : null;
+          if (opponentSocket) {
+            opponentSocket.emit("opponent_left", { roomId: room.roomId, reason: "reconnect_declined" });
+          }
         }
       }
     } else if (room.awardPromise) {
