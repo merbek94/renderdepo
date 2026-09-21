@@ -7346,6 +7346,707 @@ function digitHuntAnswerFinishedFiniteRun(puzzle, answer = {}) {
   return digitHuntStateFinishedFiniteRun(puzzle, replayDigitHunt(puzzle, answer));
 }
 
+
+// ============================================================================
+// SONSUZ MOD: AŞAMAYA GÖRE OYUNA ÖZEL BULMACA ÜRETİMİ
+// Bu üreticiler yalnız /game/challenges/start (mode=infinite) tarafından kullanılır.
+// İkili oyun / turnuva / 100 kişilik / arkadaşınla oyna eski createPuzzle akışında kalır.
+// Aşama sınırları: 1-20, 21-40, 41-60, 61-80, 81-100, 101+.
+// ============================================================================
+function infiniteStageBand(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 20) return 0;
+  if (stage <= 40) return 1;
+  if (stage <= 60) return 2;
+  if (stage <= 80) return 3;
+  if (stage <= 100) return 4;
+  return 5;
+}
+
+function randomInclusive(minValue, maxValue) {
+  const min = Math.ceil(Number(minValue));
+  const max = Math.floor(Number(maxValue));
+  if (max < min) throw new Error(`Geçersiz aralık: ${min}..${max}`);
+  return secureRandomInt(min, max + 1);
+}
+
+function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const band = infiniteStageBand(stage);
+  const configs = [
+    { count: 3, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 65, operatorMode: "single" },
+    { count: 4, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 100, operatorMode: "balanced3" },
+    { count: 5, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 200, operatorMode: "mixed" },
+    { count: 6, numberMin: 2, numberMax: 20, targetMin: 2, targetMax: 400, operatorMode: "mixed" },
+    { count: 7, numberMin: 2, numberMax: 20, targetMin: 2, targetMax: 600, operatorMode: "mixed" },
+    { count: 8, numberMin: 2, numberMax: 50, targetMin: 2, targetMax: 2000, operatorMode: "mixed" },
+  ];
+  const cfg = configs[band];
+  const allOps = ["+", "−", "×", "÷"];
+  for (let attempt = 0; attempt < 20000; attempt += 1) {
+    const numbers = Array.from({ length: cfg.count }, () => randomInclusive(cfg.numberMin, cfg.numberMax));
+    let operators;
+    if (cfg.operatorMode === "single") {
+      const op = allOps[secureRandomInt(0, allOps.length)];
+      operators = Array(cfg.count - 1).fill(op);
+    } else if (cfg.operatorMode === "balanced3") {
+      operators = shuffled([
+        ["×", "÷"][secureRandomInt(0, 2)],
+        ["+", "−"][secureRandomInt(0, 2)],
+        allOps[secureRandomInt(0, allOps.length)],
+      ]);
+    } else {
+      operators = Array.from({ length: cfg.count - 1 }, () => allOps[secureRandomInt(0, allOps.length)]);
+    }
+    const orderedNumbers = shuffled(numbers);
+    const result = evaluateExpression(orderedNumbers, operators);
+    if (result === null || !Number.isFinite(result)) continue;
+    const rounded = Math.round(result);
+    if (Math.abs(result - rounded) > 0.0001) continue;
+    if (rounded < cfg.targetMin || rounded > cfg.targetMax) continue;
+    return {
+      gameKey: "target_number",
+      difficulty: secureDifficulty(difficultyValue),
+      target: rounded,
+      numbers: orderedNumbers,
+      initialGrid: [],
+      infiniteStage: stage,
+    };
+  }
+  throw new Error("Sonsuz Hedef Sayıyı Bul bulmacası üretilemedi.");
+}
+
+function infiniteEqualSumConfig(stageValue) {
+  return [
+    { size: 3, minTarget: 10, maxTarget: 20 },
+    { size: 4, minTarget: 12, maxTarget: 30 },
+    { size: 5, minTarget: 24, maxTarget: 48 },
+    { size: 6, minTarget: 30, maxTarget: 60 },
+    { size: 7, minTarget: 40, maxTarget: 80 },
+    { size: 8, minTarget: 50, maxTarget: 200 },
+  ][infiniteStageBand(stageValue)];
+}
+
+function equalSumInfiniteBaseValues(size, target) {
+  const minimum = size * (size + 1) / 2;
+  if (target < minimum) return null;
+  const extra = target - minimum;
+  const quotient = Math.floor(extra / size);
+  const remainder = extra % size;
+  const values = Array.from({ length: size }, (_, index) => index + 1 + quotient);
+  for (let i = size - remainder; i < size; i += 1) {
+    if (i >= 0 && i < size) values[i] += 1;
+  }
+  return shuffled(values);
+}
+
+function equalSumInfiniteStepForSize(size) {
+  if (size === 3) return 2;
+  if (size === 4) return 3;
+  if (size === 5) return 2;
+  if (size === 6) return 5;
+  if (size === 7) return 2;
+  return 3; // 8x8
+}
+
+function buildInfiniteEqualSumSolution(size, target) {
+  const base = equalSumInfiniteBaseValues(size, target);
+  if (!base) return null;
+  const step = equalSumInfiniteStepForSize(size);
+  const grid = Array.from({ length: size }, (_, row) =>
+    Array.from({ length: size }, (_, col) => base[(row + step * col) % size])
+  );
+  const lines = [];
+  for (let row = 0; row < size; row += 1) lines.push([...grid[row]]);
+  for (let col = 0; col < size; col += 1) lines.push(grid.map((row) => row[col]));
+  if (!lines.every((line) => line.reduce((a, b) => a + b, 0) === target && new Set(line).size === size)) return null;
+  if (new Set(lines.map((line) => line.join(","))).size !== lines.length) return null;
+  return grid.flat();
+}
+
+function chooseInfiniteEqualSumFixedIndices(size, fixedCount) {
+  const total = size * size;
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const selected = shuffled(Array.from({ length: total }, (_, index) => index)).slice(0, fixedCount);
+    const rows = Array(size).fill(0);
+    const cols = Array(size).fill(0);
+    selected.forEach((index) => { rows[Math.floor(index / size)] += 1; cols[index % size] += 1; });
+    if (rows.every((count) => count < size) && cols.every((count) => count < size)) return new Set(selected);
+  }
+  return new Set(Array.from({ length: fixedCount }, (_, index) => index));
+}
+
+function generateInfiniteEqualSumPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteEqualSumConfig(stage);
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const target = randomInclusive(cfg.minTarget, cfg.maxTarget);
+    const solution = buildInfiniteEqualSumSolution(cfg.size, target);
+    if (!solution) continue;
+    const fixedCount = Math.floor((cfg.size * cfg.size) / 2);
+    const fixed = chooseInfiniteEqualSumFixedIndices(cfg.size, fixedCount);
+    const initialGrid = solution.map((value, index) => fixed.has(index) ? value : null);
+    const numbers = shuffled(solution.filter((_, index) => !fixed.has(index)));
+    return { gameKey: "equal_sum", difficulty: "Standard", target, numbers, initialGrid, infiniteStage: stage };
+  }
+  throw new Error("Sonsuz Eşit Toplam bulmacası üretilemedi.");
+}
+
+function validateInfiniteEqualSumAnswer(puzzle, numberSlotsRaw) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteEqualSumConfig(stage);
+  const size = cfg.size;
+  const total = size * size;
+  const target = Number(puzzle?.target);
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  const pool = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const slots = Array.isArray(numberSlotsRaw) ? numberSlotsRaw.map(Number) : [];
+  if (!Number.isInteger(stage) || stage <= 0 || !Number.isInteger(target) || target < cfg.minTarget || target > cfg.maxTarget) return false;
+  if (initialGrid.length !== total || pool.length !== total - Math.floor(total / 2) || slots.length !== total) return false;
+  if (!slots.every(Number.isInteger)) return false;
+  for (let i = 0; i < total; i += 1) {
+    if (initialGrid[i] != null && slots[i] !== Number(initialGrid[i])) return false;
+  }
+  const expectedMovable = [...pool].sort((a, b) => a - b);
+  const actualMovable = slots.filter((_, index) => initialGrid[index] == null).sort((a, b) => a - b);
+  if (expectedMovable.length !== actualMovable.length || !expectedMovable.every((v, i) => v === actualMovable[i])) return false;
+  const lines = [];
+  for (let row = 0; row < size; row += 1) lines.push(slots.slice(row * size, row * size + size));
+  for (let col = 0; col < size; col += 1) lines.push(Array.from({ length: size }, (_, row) => slots[row * size + col]));
+  if (!lines.every((line) => line.reduce((a, b) => a + b, 0) === target && new Set(line).size === size)) return false;
+  return new Set(lines.map((line) => line.join(","))).size === lines.length;
+}
+
+function infiniteArithmeticConfig(stageValue) {
+  const band = infiniteStageBand(stageValue);
+  const configs = [
+    { targetCount: 3, perTarget: 2, valueMin: 2, valueMax: 10, targetMin: 2, targetMax: 7 },
+    { targetCount: 3, perTarget: 3, valueMin: 2, valueMax: 34, targetMin: 11, targetMax: 25 },
+    { targetCount: 4, perTarget: 4, valueMin: 4, valueMax: 48, targetMin: 16, targetMax: 36 },
+    { targetCount: 5, perTarget: 5, valueMin: 6, valueMax: 72, targetMin: 24, targetMax: 54 },
+    { targetCount: 6, perTarget: 6, valueMin: 8, valueMax: 100, targetMin: 30, targetMax: 72 },
+    { targetCount: 6, perTarget: 6, valueMin: 8, valueMax: 100, targetMin: 30, targetMax: 72 },
+  ];
+  const cfg = { ...configs[band] };
+  cfg.fixedCount = ({ 2: 2, 3: 3, 4: 5, 5: 8, 6: 12 })[cfg.targetCount] || cfg.targetCount;
+  return cfg;
+}
+
+function makeInfiniteArithmeticGroup(target, count, minValue, maxValue) {
+  const values = Array(count).fill(target);
+  for (let step = 0; step < 40; step += 1) {
+    const a = secureRandomInt(0, count);
+    let b = secureRandomInt(0, count);
+    if (a === b) b = (b + 1) % count;
+    const maxUp = Math.min(maxValue - values[a], values[b] - minValue);
+    if (maxUp <= 0) continue;
+    const delta = randomInclusive(1, maxUp);
+    values[a] += delta;
+    values[b] -= delta;
+  }
+  return shuffled(values);
+}
+
+function generateInfiniteTotalEqualsPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteArithmeticConfig(stage);
+  const targetPool = Array.from({ length: cfg.targetMax - cfg.targetMin + 1 }, (_, i) => i + cfg.targetMin);
+  const targets = shuffled(targetPool).slice(0, cfg.targetCount);
+  while (targets.length < cfg.targetCount) targets.push(randomInclusive(cfg.targetMin, cfg.targetMax));
+  const groups = targets.map((target) => makeInfiniteArithmeticGroup(target, cfg.perTarget, cfg.valueMin, cfg.valueMax));
+  const values = groups.flat();
+  const fixed = new Set(shuffled(Array.from({ length: values.length }, (_, i) => i)).slice(0, cfg.fixedCount));
+  const initialGrid = values.map((value, index) => fixed.has(index) ? value : null);
+  return {
+    gameKey: "total_equals", difficulty: "Standard", target: targets[0],
+    numbers: [...targets, ...values], initialGrid, infiniteStage: stage,
+  };
+}
+
+function validateInfiniteTotalEqualsAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteArithmeticConfig(stage);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  const targets = numbers.slice(0, cfg.targetCount);
+  const values = numbers.slice(cfg.targetCount);
+  const rawSlots = Array.isArray(answer?.slots) ? answer.slots : (Array.isArray(answer?.numberSlots) ? answer.numberSlots : []);
+  const slots = rawSlots.map(Number);
+  if (!Number.isInteger(stage) || stage <= 0 || targets.length !== cfg.targetCount || values.length !== cfg.targetCount * cfg.perTarget) return false;
+  if (initialGrid.length !== values.length || slots.length !== values.length || !slots.every(Number.isInteger)) return false;
+  if (!targets.every((v) => Number.isInteger(v) && v >= cfg.targetMin && v <= cfg.targetMax)) return false;
+  if (!values.every((v) => Number.isInteger(v) && v >= cfg.valueMin && v <= cfg.valueMax)) return false;
+  if (initialGrid.filter((v) => v != null).length !== cfg.fixedCount) return false;
+  if (integerMultisetKey(slots) !== integerMultisetKey(values)) return false;
+  for (let i = 0; i < slots.length; i += 1) if (initialGrid[i] != null && slots[i] !== Number(initialGrid[i])) return false;
+  for (let group = 0; group < cfg.targetCount; group += 1) {
+    const groupValues = slots.slice(group * cfg.perTarget, (group + 1) * cfg.perTarget);
+    if (groupValues.reduce((a, b) => a + b, 0) !== targets[group] * cfg.perTarget) return false;
+  }
+  return true;
+}
+
+const INFINITE_RATIO_BASES_STANDARD = Object.freeze([
+  [1,2],[2,3],[1,4],[1,3],[1,5],[2,1],[3,2],[4,1],[3,1],[5,1],
+]);
+const INFINITE_RATIO_BASES_ADVANCED = Object.freeze([
+  [1,2],[2,3],[3,4],[4,5],[5,6],[2,5],[3,5],[1,6],[1,4],[1,3],[1,5],
+  [2,1],[3,2],[4,1],[3,1],[5,1],[4,3],[5,4],[6,5],[5,2],[5,3],[6,1],
+]);
+
+function infiniteRatioConfig(stageValue) {
+  const configs = [
+    { pairCount: 2, maxValue: 12, bases: [[1,2],[2,1],[1,3],[3,1]] },
+    { pairCount: 3, maxValue: 20, bases: INFINITE_RATIO_BASES_STANDARD },
+    { pairCount: 4, maxValue: 30, bases: INFINITE_RATIO_BASES_STANDARD },
+    { pairCount: 5, maxValue: 60, bases: INFINITE_RATIO_BASES_STANDARD },
+    { pairCount: 6, maxValue: 100, bases: INFINITE_RATIO_BASES_STANDARD },
+    { pairCount: 7, maxValue: 500, bases: INFINITE_RATIO_BASES_ADVANCED },
+  ];
+  return configs[infiniteStageBand(stageValue)];
+}
+
+function generateInfiniteRatioPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteRatioConfig(stage);
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const [n, d] = cfg.bases[secureRandomInt(0, cfg.bases.length)];
+    const maxMultiplier = Math.floor(cfg.maxValue / Math.max(n, d));
+    if (maxMultiplier < cfg.pairCount) continue;
+    const multipliers = shuffled(Array.from({ length: maxMultiplier }, (_, i) => i + 1)).slice(0, cfg.pairCount);
+    const numbers = multipliers.flatMap((m) => [n * m, d * m]);
+    const fixedCount = cfg.pairCount - 1;
+    const fixed = new Set(shuffled(Array.from({ length: numbers.length }, (_, i) => i)).slice(0, fixedCount));
+    const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
+    return { gameKey: "ratio_proportion", difficulty: "Standard", target: cfg.pairCount, numbers, initialGrid, infiniteStage: stage };
+  }
+  throw new Error("Sonsuz Oran Orantı bulmacası üretilemedi.");
+}
+
+function validateInfiniteRatioAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteRatioConfig(stage);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  const count = cfg.pairCount * 2;
+  if (!Number.isInteger(stage) || stage <= 0 || Number(puzzle?.target) !== cfg.pairCount || numbers.length !== count || initialGrid.length !== count || grid.length !== count) return false;
+  if (![...numbers, ...grid].every((v) => Number.isInteger(v) && v >= 1 && v <= cfg.maxValue)) return false;
+  if (initialGrid.filter((v) => v != null).length !== cfg.pairCount - 1) return false;
+  if (integerMultisetKey(grid) !== integerMultisetKey(numbers)) return false;
+  for (let i = 0; i < count; i += 1) if (initialGrid[i] != null && grid[i] !== Number(initialGrid[i])) return false;
+  const n0 = grid[0], d0 = grid[1];
+  if (!(d0 > 0)) return false;
+  for (let pair = 0; pair < cfg.pairCount; pair += 1) {
+    if (grid[pair * 2] * d0 !== n0 * grid[pair * 2 + 1]) return false;
+  }
+  const gcd = gcdPositive(n0, d0);
+  const baseN = n0 / gcd, baseD = d0 / gcd;
+  return cfg.bases.some(([n, d]) => n === baseN && d === baseD);
+}
+
+function infiniteTripleBalanceConfig(stageValue) {
+  const configs = [
+    { containers: 2, perContainer: 4, minValue: 1, maxValue: 15 },
+    { containers: 3, perContainer: 5, minValue: 1, maxValue: 20 },
+    { containers: 4, perContainer: 6, minValue: 1, maxValue: 40 },
+    { containers: 5, perContainer: 7, minValue: 1, maxValue: 60 },
+    { containers: 6, perContainer: 8, minValue: 1, maxValue: 100 },
+    { containers: 6, perContainer: 8, minValue: 1, maxValue: 100 },
+  ];
+  return configs[infiniteStageBand(stageValue)];
+}
+
+function makeBalancedInfiniteValues(count, minValue, maxValue, center) {
+  const values = Array(count).fill(center);
+  for (let step = 0; step < 50; step += 1) {
+    const a = secureRandomInt(0, count);
+    let b = secureRandomInt(0, count);
+    if (a === b) b = (b + 1) % count;
+    const room = Math.min(maxValue - values[a], values[b] - minValue);
+    if (room <= 0) continue;
+    const delta = randomInclusive(1, room);
+    values[a] += delta;
+    values[b] -= delta;
+  }
+  return values;
+}
+
+function generateInfiniteTripleBalancePuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteTripleBalanceConfig(stage);
+  const center = randomInclusive(Math.max(cfg.minValue, Math.ceil((cfg.minValue + cfg.maxValue) * 0.35)), Math.min(cfg.maxValue, Math.floor((cfg.minValue + cfg.maxValue) * 0.65)));
+  const target = center * cfg.perContainer;
+  const solved = Array.from({ length: cfg.containers }, () => makeBalancedInfiniteValues(cfg.perContainer, cfg.minValue, cfg.maxValue, center)).flat();
+  let numbers = shuffled(solved);
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (Array.from({ length: cfg.containers }, (_, group) =>
+      numbers.slice(group * cfg.perContainer, (group + 1) * cfg.perContainer).reduce((a, b) => a + b, 0)
+    ).every((sum) => sum !== target)) break;
+    numbers = shuffled(solved);
+  }
+  return { gameKey: "triple_balance", difficulty: "Standard", target, numbers, initialGrid: [], infiniteStage: stage };
+}
+
+function validateInfiniteTripleBalanceAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteTripleBalanceConfig(stage);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  const total = cfg.containers * cfg.perContainer;
+  if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== total || grid.length !== total) return false;
+  if (![...numbers, ...grid].every((v) => Number.isInteger(v) && v >= cfg.minValue && v <= cfg.maxValue)) return false;
+  if (integerMultisetKey(grid) !== integerMultisetKey(numbers)) return false;
+  return Array.from({ length: cfg.containers }, (_, group) =>
+    grid.slice(group * cfg.perContainer, (group + 1) * cfg.perContainer).reduce((a, b) => a + b, 0)
+  ).every((sum) => sum === Number(puzzle.target));
+}
+
+function infiniteSortConfig(stageValue) {
+  const configs = [
+    { count: 6, operands: 2, resultMin: 1, resultMax: 15, valueMin: 1, valueMax: 30 },
+    { count: 8, operands: 2, resultMin: 10, resultMax: 40, valueMin: 3, valueMax: 60 },
+    { count: 10, operands: 2, resultMin: 40, resultMax: 80, valueMin: 5, valueMax: 120 },
+    { count: 12, operands: 2, resultMin: 60, resultMax: 120, valueMin: 6, valueMax: 200 },
+    { count: 14, operands: 2, resultMin: 90, resultMax: 180, valueMin: 7, valueMax: 300 },
+    { count: 16, operands: 3, resultMin: 500, resultMax: 1000, valueMin: 8, valueMax: 500 },
+  ];
+  return configs[infiniteStageBand(stageValue)];
+}
+
+function dynamicArithmeticResult(valuesRaw, opsRaw) {
+  const values = valuesRaw.map(Number);
+  const ops = opsRaw.map(Number);
+  if (values.length !== ops.length + 1 || !values.every(Number.isFinite) || !ops.every((op) => Number.isInteger(op) && op >= 0 && op <= 3)) return null;
+  const workValues = [values[0]], workOps = [];
+  for (let i = 0; i < ops.length; i += 1) {
+    const op = ops[i], right = values[i + 1];
+    if (op === 2 || op === 3) {
+      const left = workValues.pop();
+      if (op === 3 && Math.abs(right) < 1e-12) return null;
+      workValues.push(op === 2 ? left * right : left / right);
+    } else {
+      workOps.push(op); workValues.push(right);
+    }
+  }
+  let result = workValues[0];
+  for (let i = 0; i < workOps.length; i += 1) result = workOps[i] === 0 ? result + workValues[i + 1] : result - workValues[i + 1];
+  return Number.isFinite(result) ? result : null;
+}
+
+function generateInfiniteSortTwoOperandExpression(cfg, preferredOp, usedResults) {
+  for (let attempt = 0; attempt < 12000; attempt += 1) {
+    const op = attempt < 4000 ? preferredOp : secureRandomInt(0, 4);
+    const a = randomInclusive(cfg.valueMin, cfg.valueMax);
+    const b = randomInclusive(cfg.valueMin, cfg.valueMax);
+    const result = dynamicArithmeticResult([a, b], [op]);
+    if (!Number.isInteger(result) || result < cfg.resultMin || result > cfg.resultMax || usedResults.has(result)) continue;
+    return [a, op, b, result];
+  }
+  return null;
+}
+
+function generateInfiniteSortThreeOperandExpression(patternIndex, cfg, usedResults) {
+  for (let attempt = 0; attempt < 15000; attempt += 1) {
+    let values, ops;
+    const pattern = patternIndex % 4;
+    if (pattern === 0) { // × sonra ÷: bölmeyi düzenli olarak oyuna sokar.
+      const factor = randomInclusive(2, 10);
+      const c = randomInclusive(cfg.valueMin, Math.min(50, cfg.valueMax));
+      const b = c * factor;
+      if (b > cfg.valueMax) continue;
+      const aMin = Math.max(cfg.valueMin, Math.ceil(cfg.resultMin / factor));
+      const aMax = Math.min(cfg.valueMax, Math.floor(cfg.resultMax / factor));
+      if (aMax < aMin) continue;
+      const a = randomInclusive(aMin, aMax);
+      values = [a, b, c]; ops = [2, 3];
+    } else if (pattern === 1) { // × +
+      values = [randomInclusive(8, 45), randomInclusive(8, 45), randomInclusive(cfg.valueMin, cfg.valueMax)]; ops = [2, 0];
+    } else if (pattern === 2) { // × -
+      values = [randomInclusive(20, 50), randomInclusive(20, 50), randomInclusive(cfg.valueMin, cfg.valueMax)]; ops = [2, 1];
+    } else { // + +
+      values = [randomInclusive(100, 450), randomInclusive(30, 300), randomInclusive(cfg.valueMin, 250)]; ops = [0, 0];
+    }
+    if (values.some((v) => v < cfg.valueMin || v > cfg.valueMax)) continue;
+    const result = dynamicArithmeticResult(values, ops);
+    if (!Number.isInteger(result) || result < cfg.resultMin || result > cfg.resultMax || usedResults.has(result)) continue;
+    return [...values.slice(0,1), ops[0], values[1], ops[1], values[2], result];
+  }
+  return null;
+}
+
+function generateInfiniteSortOrderPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteSortConfig(stage);
+  const usedResults = new Set();
+  const expressions = [];
+  for (let index = 0; index < cfg.count; index += 1) {
+    const expression = cfg.operands === 2
+      ? generateInfiniteSortTwoOperandExpression(cfg, index % 4, usedResults)
+      : generateInfiniteSortThreeOperandExpression(index, cfg, usedResults);
+    if (!expression) throw new Error("Sonsuz Sırala ifadesi üretilemedi.");
+    const result = expression[expression.length - 1];
+    usedResults.add(result);
+    expressions.push(expression.slice(0, -1));
+  }
+  return { gameKey: "sort_order", difficulty: "Standard", target: cfg.count, numbers: shuffled(expressions).flat(), initialGrid: [], infiniteStage: stage };
+}
+
+function infiniteSortExpressionResult(puzzle, expressionIndex) {
+  const cfg = infiniteSortConfig(Number(puzzle?.infiniteStage || 1));
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const stride = cfg.operands === 2 ? 3 : 5;
+  const base = expressionIndex * stride;
+  if (base + stride > numbers.length) return null;
+  if (stride === 3) return dynamicArithmeticResult([numbers[base], numbers[base + 2]], [numbers[base + 1]]);
+  return dynamicArithmeticResult([numbers[base], numbers[base + 2], numbers[base + 4]], [numbers[base + 1], numbers[base + 3]]);
+}
+
+function validateInfiniteSortOrderAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteSortConfig(stage);
+  const stride = cfg.operands === 2 ? 3 : 5;
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const order = Array.isArray(answer?.order) ? answer.order.map(Number) : [];
+  if (!Number.isInteger(stage) || stage <= 0 || Number(puzzle?.target) !== cfg.count || numbers.length !== cfg.count * stride) return false;
+  const results = [];
+  const ops = [];
+  for (let i = 0; i < cfg.count; i += 1) {
+    const base = i * stride;
+    const values = stride === 3 ? [numbers[base], numbers[base + 2]] : [numbers[base], numbers[base + 2], numbers[base + 4]];
+    const localOps = stride === 3 ? [numbers[base + 1]] : [numbers[base + 1], numbers[base + 3]];
+    if (!values.every((v) => Number.isInteger(v) && v >= cfg.valueMin && v <= cfg.valueMax)) return false;
+    if (!localOps.every((op) => Number.isInteger(op) && op >= 0 && op <= 3)) return false;
+    const result = infiniteSortExpressionResult(puzzle, i);
+    if (!Number.isInteger(result) || result < cfg.resultMin || result > cfg.resultMax) return false;
+    results.push(result); ops.push(...localOps);
+  }
+  if (new Set(results).size !== cfg.count) return false;
+  if (cfg.operands === 3 && ![0,1,2,3].every((op) => ops.includes(op))) return false;
+  if (order.length !== cfg.count || order.some((v) => !Number.isInteger(v) || v < 0 || v >= cfg.count) || new Set(order).size !== cfg.count) return false;
+  const orderedResults = order.map((index) => results[index]);
+  return orderedResults.every((value, index) => index === 0 || orderedResults[index - 1] < value);
+}
+
+function infiniteDualPyramidConfig(stageValue) {
+  const configs = [
+    { layers: 3, bottomMin: 1, bottomMax: 7 },
+    { layers: 4, bottomMin: 1, bottomMax: 10 },
+    { layers: 5, bottomMin: 1, bottomMax: 20 },
+    { layers: 6, bottomMin: 10, bottomMax: 30 },
+    { layers: 7, bottomMin: 20, bottomMax: 50 },
+    { layers: 8, bottomMin: 50, bottomMax: 100 },
+  ];
+  return configs[infiniteStageBand(stageValue)];
+}
+
+function buildPyramidDynamic(bottomRaw) {
+  const bottom = bottomRaw.map(Number);
+  const rows = [bottom];
+  for (let size = bottom.length - 1; size >= 1; size -= 1) {
+    const lower = rows[0];
+    rows.unshift(Array.from({ length: size }, (_, i) => lower[i] + lower[i + 1]));
+  }
+  return rows.flat();
+}
+
+function uniqueRandomValues(count, minValue, maxValue) {
+  const pool = Array.from({ length: maxValue - minValue + 1 }, (_, i) => i + minValue);
+  if (pool.length >= count) return shuffled(pool).slice(0, count);
+  return Array.from({ length: count }, () => randomInclusive(minValue, maxValue));
+}
+
+function generateInfiniteDualPyramidPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteDualPyramidConfig(stage);
+  const first = buildPyramidDynamic(uniqueRandomValues(cfg.layers, cfg.bottomMin, cfg.bottomMax));
+  const second = buildPyramidDynamic(uniqueRandomValues(cfg.layers, cfg.bottomMin, cfg.bottomMax));
+  const numbers = [...first, ...second];
+  const perPyramid = first.length;
+  const fixedPerPyramid = Math.max(1, Math.floor(perPyramid * 0.4));
+  const fixed = new Set([
+    ...shuffled(Array.from({ length: perPyramid }, (_, i) => i)).slice(0, fixedPerPyramid),
+    ...shuffled(Array.from({ length: perPyramid }, (_, i) => i + perPyramid)).slice(0, fixedPerPyramid),
+  ]);
+  const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
+  return { gameKey: "dual_pyramid", difficulty: "Standard", target: numbers.length, numbers, initialGrid, infiniteStage: stage };
+}
+
+function validateInfiniteDualPyramidAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteDualPyramidConfig(stage);
+  const perPyramid = cfg.layers * (cfg.layers + 1) / 2;
+  const total = perPyramid * 2;
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== total || initialGrid.length !== total || grid.length !== total) return false;
+  if (!grid.every((v, i) => Number.isInteger(v) && v === numbers[i])) return false;
+  for (let i = 0; i < total; i += 1) if (initialGrid[i] != null && Number(initialGrid[i]) !== numbers[i]) return false;
+  for (let pyramid = 0; pyramid < 2; pyramid += 1) {
+    const offset = pyramid * perPyramid;
+    const bottomStart = offset + perPyramid - cfg.layers;
+    const bottom = numbers.slice(bottomStart, bottomStart + cfg.layers);
+    if (bottom.some((v) => v < cfg.bottomMin || v > cfg.bottomMax)) return false;
+    for (let row = 0; row < cfg.layers - 1; row += 1) {
+      const start = row * (row + 1) / 2;
+      const lowerStart = (row + 1) * (row + 2) / 2;
+      for (let col = 0; col <= row; col += 1) {
+        if (numbers[offset + start + col] !== numbers[offset + lowerStart + col] + numbers[offset + lowerStart + col + 1]) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function infiniteNextNumberConfig(stageValue) {
+  const band = infiniteStageBand(stageValue);
+  return [
+    { firstMin: 1, firstMax: 10, xMin: 2, xMax: 2, yMin: 1, yMax: 3, rules: ["multiply_plus","multiply_minus"], variableAllowed: false, parenthesizedMustFixed: true },
+    { firstMin: 1, firstMax: 20, xMin: 2, xMax: 3, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus"], variableAllowed: true, parenthesizedMustFixed: true },
+    { firstMin: 1, firstMax: 30, xMin: 2, xMax: 3, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: true, parenthesizedYMax: 2 },
+    { firstMin: 10, firstMax: 40, xMin: 2, xMax: 4, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false },
+    { firstMin: 20, firstMax: 50, xMin: 2, xMax: 5, yMin: 5, yMax: 10, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false },
+    { firstMin: 50, firstMax: 100, xMin: 2, xMax: 6, yMin: 5, yMax: 30, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false },
+  ][band];
+}
+
+function infiniteNextOffsets(cfg, ruleType) {
+  const parenthesized = ruleType === "plus_then_multiply" || ruleType === "minus_then_multiply";
+  const yMax = parenthesized && cfg.parenthesizedYMax ? cfg.parenthesizedYMax : cfg.yMax;
+  const base = randomInclusive(cfg.yMin, yMax);
+  const mustFixed = !cfg.variableAllowed || (parenthesized && cfg.parenthesizedMustFixed);
+  if (mustFixed || secureRandomInt(0, 2) === 0) return [base, base, base];
+  return secureRandomInt(0, 2) === 0 ? [base, base * 2, base * 3] : [base * 3, base * 2, base];
+}
+
+function generateInfiniteNextNumberPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteNextNumberConfig(stage);
+  for (let attempt = 0; attempt < 10000; attempt += 1) {
+    const first = randomInclusive(cfg.firstMin, cfg.firstMax);
+    const x = randomInclusive(cfg.xMin, cfg.xMax);
+    const rule = cfg.rules[secureRandomInt(0, cfg.rules.length)];
+    const offsets = infiniteNextOffsets(cfg, rule);
+    const sequence = [first];
+    for (let i = 0; i < 3; i += 1) {
+      const next = nextNumberStep(sequence[sequence.length - 1], x, offsets[i], rule);
+      if (!Number.isSafeInteger(next) || next <= 0) break;
+      sequence.push(next);
+    }
+    if (sequence.length !== 4 || new Set(sequence).size !== 4) continue;
+    return { gameKey: "next_number", difficulty: "Standard", target: sequence[3], numbers: sequence.slice(0,3), initialGrid: [], infiniteStage: stage };
+  }
+  throw new Error("Sonsuz Sonraki Sayı bulmacası üretilemedi.");
+}
+
+function validateInfiniteNextNumberAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteNextNumberConfig(stage);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const target = Number(puzzle?.target);
+  const submitted = Number(answer?.nextNumber);
+  if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== 3) return false;
+  if (![...numbers, target].every((v) => Number.isSafeInteger(v) && v > 0)) return false;
+  if (numbers[0] < cfg.firstMin || numbers[0] > cfg.firstMax) return false;
+  return Number.isSafeInteger(submitted) && submitted === target;
+}
+
+function infiniteWrongNumbersConfig(stageValue) {
+  return [
+    { count: 3, valueMin: 1, valueMax: 8, targetMin: 1, targetMax: 100, parentheses: false },
+    { count: 4, valueMin: 2, valueMax: 10, targetMin: 1, targetMax: 100, parentheses: false },
+    { count: 5, valueMin: 2, valueMax: 20, targetMin: 1, targetMax: 200, parentheses: true },
+    { count: 6, valueMin: 2, valueMax: 30, targetMin: 1, targetMax: 300, parentheses: true },
+    { count: 7, valueMin: 2, valueMax: 30, targetMin: 1, targetMax: 500, parentheses: true },
+    { count: 10, valueMin: 3, valueMax: 100, targetMin: 1, targetMax: 2000, parentheses: true },
+  ][infiniteStageBand(stageValue)];
+}
+
+function evaluateInfiniteWrongNumbers(values, operators, parenStart) {
+  if (!Array.isArray(values) || !Array.isArray(operators) || operators.length !== values.length - 1) return null;
+  if (parenStart < 0) return dynamicArithmeticResult(values, operators);
+  if (!Number.isInteger(parenStart) || parenStart >= values.length - 1) return null;
+  const inner = dynamicArithmeticResult([values[parenStart], values[parenStart + 1]], [operators[parenStart]]);
+  if (!Number.isFinite(inner)) return null;
+  const collapsedValues = [];
+  const collapsedOps = [];
+  for (let i = 0; i < values.length; i += 1) {
+    if (i === parenStart) { collapsedValues.push(inner); i += 1; }
+    else collapsedValues.push(values[i]);
+  }
+  for (let i = 0; i < operators.length; i += 1) if (i !== parenStart) collapsedOps.push(operators[i]);
+  return dynamicArithmeticResult(collapsedValues, collapsedOps);
+}
+
+function generateInfiniteWrongNumbersPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteWrongNumbersConfig(stage);
+  for (let attempt = 0; attempt < 40000; attempt += 1) {
+    const values = Array.from({ length: cfg.count }, () => randomInclusive(cfg.valueMin, cfg.valueMax));
+    const operators = Array.from({ length: cfg.count - 1 }, () => {
+      const weighted = [0,0,1,1,2,3];
+      return weighted[secureRandomInt(0, weighted.length)];
+    });
+    let parenStart = -1;
+    if (cfg.parentheses) {
+      const candidates = Array.from({ length: cfg.count - 1 }, (_, i) => i).filter((i) => !(cfg.count > 5 && i === 4));
+      parenStart = candidates[secureRandomInt(0, candidates.length)];
+    }
+    const result = evaluateInfiniteWrongNumbers(values, operators, parenStart);
+    if (!Number.isFinite(result) || Math.abs(result - Math.round(result)) > 1e-8) continue;
+    const target = Math.round(result);
+    if (target < cfg.targetMin || target > cfg.targetMax) continue;
+    const missingIndex = secureRandomInt(0, cfg.count);
+    const initialGrid = values.map((value, index) => index === missingIndex ? null : value);
+    return {
+      gameKey: "wrong_numbers", difficulty: "Standard", target,
+      numbers: [...values, ...operators, parenStart], initialGrid, infiniteStage: stage,
+    };
+  }
+  throw new Error("Sonsuz Yanlış Sayıları Bul bulmacası üretilemedi.");
+}
+
+function validateInfiniteWrongNumbersAnswer(puzzle, answer = {}) {
+  const stage = Number(puzzle?.infiniteStage || 0);
+  const cfg = infiniteWrongNumbersConfig(stage);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  const expectedLength = cfg.count + (cfg.count - 1) + 1;
+  if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== expectedLength || initialGrid.length !== cfg.count) return false;
+  const values = numbers.slice(0, cfg.count);
+  const operators = numbers.slice(cfg.count, cfg.count + cfg.count - 1);
+  const parenStart = numbers[numbers.length - 1];
+  if (!values.every((v) => Number.isInteger(v) && v >= cfg.valueMin && v <= cfg.valueMax)) return false;
+  if (!operators.every((op) => Number.isInteger(op) && op >= 0 && op <= 3)) return false;
+  if (cfg.parentheses ? !(Number.isInteger(parenStart) && parenStart >= 0 && parenStart < cfg.count - 1) : parenStart !== -1) return false;
+  if (initialGrid.filter((v) => v == null).length !== 1) return false;
+  for (let i = 0; i < cfg.count; i += 1) if (initialGrid[i] != null && Number(initialGrid[i]) !== values[i]) return false;
+  const result = evaluateInfiniteWrongNumbers(values, operators, parenStart);
+  if (!Number.isFinite(result) || Math.abs(result - Number(puzzle.target)) > 1e-8 || result < cfg.targetMin || result > cfg.targetMax) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  return grid.length === cfg.count && grid.every((value, index) => Number.isInteger(value) && value === values[index]);
+}
+
+function generateInfinitePuzzleForGame(gameKey, difficultyValue, stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  switch (normalizeBaseGameKey(gameKey)) {
+    case "target_number": return generateInfiniteTargetNumberPuzzle(difficultyValue, stage);
+    case "equal_sum": return generateInfiniteEqualSumPuzzle(stage);
+    case "total_equals": return generateInfiniteTotalEqualsPuzzle(stage);
+    case "ratio_proportion": return generateInfiniteRatioPuzzle(stage);
+    case "triple_balance": return generateInfiniteTripleBalancePuzzle(stage);
+    case "sort_order": return generateInfiniteSortOrderPuzzle(stage);
+    case "dual_pyramid": return generateInfiniteDualPyramidPuzzle(stage);
+    case "next_number": return generateInfiniteNextNumberPuzzle(stage);
+    case "wrong_numbers": return generateInfiniteWrongNumbersPuzzle(stage);
+    default: {
+      const puzzle = generatePuzzleForGame(gameKey, difficultyValue);
+      return { ...puzzle, infiniteStage: stage };
+    }
+  }
+}
+
 const GAME_HANDLERS = Object.freeze({
   target_number: Object.freeze({
     key: "target_number",
@@ -7359,18 +8060,23 @@ const GAME_HANDLERS = Object.freeze({
   equal_sum: Object.freeze({
     key: "equal_sum",
     createPuzzle: () => generateEqualSumPuzzle(),
-    validateAnswer: (puzzle, answer) =>
-      validateEqualSumChallengeAnswer(puzzle, Array.isArray(answer?.numberSlots) ? answer.numberSlots : []),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteEqualSumAnswer(puzzle, Array.isArray(answer?.numberSlots) ? answer.numberSlots : [])
+      : validateEqualSumChallengeAnswer(puzzle, Array.isArray(answer?.numberSlots) ? answer.numberSlots : []),
   }),
   total_equals: Object.freeze({
     key: "total_equals",
     createPuzzle: () => generateTotalEqualsPuzzle(),
-    validateAnswer: (puzzle, answer) => validateTotalEqualsChallengeAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteTotalEqualsAnswer(puzzle, answer)
+      : validateTotalEqualsChallengeAnswer(puzzle, answer),
   }),
   ratio_proportion: Object.freeze({
     key: "ratio_proportion",
     createPuzzle: () => generateRatioProportionPuzzle(),
-    validateAnswer: (puzzle, answer) => validateRatioProportionAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteRatioAnswer(puzzle, answer)
+      : validateRatioProportionAnswer(puzzle, answer),
   }),
   total_match: Object.freeze({
     key: "total_match",
@@ -7380,22 +8086,30 @@ const GAME_HANDLERS = Object.freeze({
   triple_balance: Object.freeze({
     key: "triple_balance",
     createPuzzle: () => generateTripleBalancePuzzle(),
-    validateAnswer: (puzzle, answer) => validateTripleBalanceAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteTripleBalanceAnswer(puzzle, answer)
+      : validateTripleBalanceAnswer(puzzle, answer),
   }),
   sort_order: Object.freeze({
     key: "sort_order",
     createPuzzle: () => generateSortOrderPuzzle(),
-    validateAnswer: (puzzle, answer) => validateSortOrderAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteSortOrderAnswer(puzzle, answer)
+      : validateSortOrderAnswer(puzzle, answer),
   }),
   dual_pyramid: Object.freeze({
     key: "dual_pyramid",
     createPuzzle: () => generateDualPyramidPuzzle(),
-    validateAnswer: (puzzle, answer) => validateDualPyramidAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteDualPyramidAnswer(puzzle, answer)
+      : validateDualPyramidAnswer(puzzle, answer),
   }),
   wrong_numbers: Object.freeze({
     key: "wrong_numbers",
     createPuzzle: () => generateWrongNumbersPuzzle(),
-    validateAnswer: (puzzle, answer) => validateWrongNumbersAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteWrongNumbersAnswer(puzzle, answer)
+      : validateWrongNumbersAnswer(puzzle, answer),
   }),
   digit_hunt: Object.freeze({
     key: "digit_hunt",
@@ -7406,7 +8120,9 @@ const GAME_HANDLERS = Object.freeze({
   next_number: Object.freeze({
     key: "next_number",
     createPuzzle: () => generateNextNumberPuzzle(),
-    validateAnswer: (puzzle, answer) => validateNextNumberChallengeAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteNextNumberAnswer(puzzle, answer)
+      : validateNextNumberChallengeAnswer(puzzle, answer),
   }),
   equation_hunt: Object.freeze({
     key: "equation_hunt",
@@ -8989,7 +9705,7 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
     const difficulty = typeof difficultyResolver === "function"
       ? secureDifficulty(difficultyResolver(stage, requestedDifficulty))
       : requestedDifficulty;
-    const puzzle = generatePuzzleForGame(gameKey, difficulty);
+    const puzzle = generateInfinitePuzzleForGame(gameKey, difficulty, stage);
     if (gameKey === "merge_5120") {
       // 729 sonsuz modu tek ve süresiz bir koşudur; hedef skor/aşama yoktur.
       // Bitiş, oyuncunun dolu sütunun üstüne yeni taş bırakmaya çalışmasıdır.
