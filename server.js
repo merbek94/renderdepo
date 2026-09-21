@@ -9667,6 +9667,16 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
   const gameKey = normalizeBaseGameKey(req.body.gameKey);
   const requestedDifficulty = secureDifficulty(req.body.difficulty);
   const freshInfiniteRun = req.body.fresh === true;
+  const forceStage = req.body.forceStage === true;
+  const requestedStageRaw = Number(req.body.stage);
+  const requestedStage = Number.isSafeInteger(requestedStageRaw)
+    ? Math.max(1, Math.min(2_000_000_000, requestedStageRaw))
+    : 1;
+  const stageJumpBlocked = gameKey === "merge_5120" || gameKey === "digit_hunt" || gameKey === "digit_attack";
+  if (forceStage && stageJumpBlocked) {
+    res.status(400).json({ ok: false, message: "Bu oyunda aşamaya git testi kullanılamaz." });
+    return;
+  }
   const challengeId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
   const lifetimeMs = isUntimedSingleRunGameKey(gameKey)
     ? 10 * 365 * 24 * 60 * 60 * 1000
@@ -9676,8 +9686,9 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
     await client.query("BEGIN");
     await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
 
-    if (freshInfiniteRun || gameKey === "merge_5120") {
-      // 729 sonsuz modunda skor/run-score sistemi yoktur. Eski koşudan kalmış runScore da taşınmaz.
+    if (!forceStage && (freshInfiniteRun || gameKey === "merge_5120")) {
+      // Normal yeni sonsuz koşuda ilerleme 1. aşamaya döner. Aşamaya Git ise yalnız test
+      // challenge'ı üretir; oyuncunun gerçek sonsuz ilerlemesini/rekoresini değiştirmez.
       await client.query(
         `UPDATE player_game_progress
          SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
@@ -9693,8 +9704,10 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
       [req.auth.sub, gameKey]
     );
     const storedStage = Math.max(1, Math.min(Number(progressResult.rows[0]?.infinite_next_stage || 1), 1000));
-    const stage = isUntimedSingleRunGameKey(gameKey) ? 1 : storedStage;
-    if (isUntimedSingleRunGameKey(gameKey) && storedStage !== 1) {
+    const stage = forceStage
+      ? requestedStage
+      : (isUntimedSingleRunGameKey(gameKey) ? 1 : storedStage);
+    if (!forceStage && isUntimedSingleRunGameKey(gameKey) && storedStage !== 1) {
       await client.query(
         `UPDATE player_game_progress SET infinite_next_stage = 1, updated_at = NOW()
          WHERE player_id = $1 AND game_key = $2`,
@@ -9725,12 +9738,18 @@ app.post("/game/challenges/start", requireAuth, challengeMutationRateLimit, requ
          UPDATE secure_game_challenges
          SET completed_at = NOW(), result = '{"status":"superseded"}'::jsonb
          WHERE player_id = $2 AND game_key = $3 AND mode = $4 AND completed_at IS NULL
+           AND (NOT $10::boolean OR COALESCE((result->>'testStageJump')::boolean, FALSE) = TRUE)
          RETURNING challenge_id
        )
        INSERT INTO secure_game_challenges
-         (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW() + ($8 * INTERVAL '1 millisecond'))`,
-      [challengeId, req.auth.sub, gameKey, mode, difficulty, stage, JSON.stringify(puzzle), lifetimeMs]
+         (challenge_id, player_id, game_key, mode, difficulty, stage, puzzle, expires_at, result)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW() + ($8 * INTERVAL '1 millisecond'), $9::jsonb)`,
+      [
+        challengeId, req.auth.sub, gameKey, mode, difficulty, stage,
+        JSON.stringify(puzzle), lifetimeMs,
+        JSON.stringify(forceStage ? { status: "active", testStageJump: true } : { status: "active" }),
+        forceStage
+      ]
     );
     await client.query("COMMIT");
     res.json({
@@ -9939,6 +9958,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     }
     const mergeInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "merge_5120";
     const digitHuntInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "digit_hunt";
+    const infiniteStageJumpTest = challenge.mode === "infinite" && challenge.result?.testStageJump === true;
     let replayedMergeState = null;
     let replayedDigitHuntState = null;
 
@@ -10121,9 +10141,35 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       return;
     }
 
-    await markGamePlayedInTransaction(client, req.auth.sub, gameKey);
+    // Aşamaya Git yalnız geliştirme/test akışıdır. Test challenge'ları gerçek oynanmış oyun,
+    // görev ilerlemesi, sonsuz rekoru, XP veya kalıcı next-stage state'i üretmez.
+    if (!infiniteStageJumpTest) {
+      await markGamePlayedInTransaction(client, req.auth.sub, gameKey);
+    }
     let infiniteRunScore = 0;
     let state;
+
+    if (infiniteStageJumpTest) {
+      const completedStage = Math.max(1, Math.min(Number(challenge.stage || 1), 2_000_000_000));
+      state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
+      const response = {
+        ok: true, gameKey, ...state,
+        generalDelta: 0, infiniteDelta: 0, xpDelta: 0,
+        runScore: completedStage,
+        won: answerWon === true,
+        outcomeReason: answerWon === true ? null : wrongAnswerReason,
+        elapsedServerMs,
+        testStageJump: true,
+      };
+      await client.query(
+        `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
+        [challengeId, JSON.stringify(compactChallengeResult(response))]
+      );
+      await client.query("COMMIT");
+      res.json(response);
+      return;
+    }
+
     if (challenge.mode === "infinite" && !answerWon) {
       await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
       await client.query(
