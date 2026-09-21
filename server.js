@@ -7374,7 +7374,7 @@ function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
   const band = infiniteStageBand(stage);
   const configs = [
-    { count: 3, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 65, operatorMode: "single" },
+    { count: 3, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 65, operatorMode: "stage1to20" },
     { count: 4, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 100, operatorMode: "balanced3" },
     { count: 5, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 200, operatorMode: "mixed" },
     { count: 6, numberMin: 2, numberMax: 20, targetMin: 2, targetMax: 400, operatorMode: "mixed" },
@@ -7386,9 +7386,15 @@ function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
   for (let attempt = 0; attempt < 20000; attempt += 1) {
     const numbers = Array.from({ length: cfg.count }, () => randomInclusive(cfg.numberMin, cfg.numberMax));
     let operators;
-    if (cfg.operatorMode === "single") {
-      const op = allOps[secureRandomInt(0, allOps.length)];
-      operators = Array(cfg.count - 1).fill(op);
+    if (cfg.operatorMode === "stage1to20") {
+      // 1-15: iki işlem tam olarak bir toplama + bir çıkarma.
+      // 16-20: işlemlerden biri çarpma/bölme, diğeri toplama/çıkarma.
+      operators = stage <= 15
+        ? shuffled(["+", "−"])
+        : shuffled([
+            ["×", "÷"][secureRandomInt(0, 2)],
+            ["+", "−"][secureRandomInt(0, 2)],
+          ]);
     } else if (cfg.operatorMode === "balanced3") {
       operators = shuffled([
         ["×", "÷"][secureRandomInt(0, 2)],
@@ -7615,8 +7621,10 @@ function generateInfiniteRatioPuzzle(stageValue) {
     if (maxMultiplier < cfg.pairCount) continue;
     const multipliers = shuffled(Array.from({ length: maxMultiplier }, (_, i) => i + 1)).slice(0, cfg.pairCount);
     const numbers = multipliers.flatMap((m) => [n * m, d * m]);
-    const fixedCount = cfg.pairCount - 1;
-    const fixed = new Set(shuffled(Array.from({ length: numbers.length }, (_, i) => i)).slice(0, fixedCount));
+    // Sonsuz Oran Orantı'da her aşamada tam 2 hazır taş bulunur.
+    // İki taş farklı oran çiftlerine dağıtılır; böylece aynı çiftte iki hazır taş oluşmaz.
+    const fixedPairs = shuffled(Array.from({ length: cfg.pairCount }, (_, i) => i)).slice(0, 2);
+    const fixed = new Set(fixedPairs.map((pairIndex) => pairIndex * 2 + secureRandomInt(0, 2)));
     const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
     return { gameKey: "ratio_proportion", difficulty: "Standard", target: cfg.pairCount, numbers, initialGrid, infiniteStage: stage };
   }
@@ -7632,7 +7640,11 @@ function validateInfiniteRatioAnswer(puzzle, answer = {}) {
   const count = cfg.pairCount * 2;
   if (!Number.isInteger(stage) || stage <= 0 || Number(puzzle?.target) !== cfg.pairCount || numbers.length !== count || initialGrid.length !== count || grid.length !== count) return false;
   if (![...numbers, ...grid].every((v) => Number.isInteger(v) && v >= 1 && v <= cfg.maxValue)) return false;
-  if (initialGrid.filter((v) => v != null).length !== cfg.pairCount - 1) return false;
+  if (initialGrid.filter((v) => v != null).length !== 2) return false;
+  const fixedPairIndexes = initialGrid
+    .map((value, index) => value != null ? Math.floor(index / 2) : -1)
+    .filter((value) => value >= 0);
+  if (new Set(fixedPairIndexes).size !== 2) return false;
   if (integerMultisetKey(grid) !== integerMultisetKey(numbers)) return false;
   for (let i = 0; i < count; i += 1) if (initialGrid[i] != null && grid[i] !== Number(initialGrid[i])) return false;
   const n0 = grid[0], d0 = grid[1];
@@ -7963,37 +7975,118 @@ function infiniteWrongNumbersConfig(stageValue) {
   ][infiniteStageBand(stageValue)];
 }
 
-function evaluateInfiniteWrongNumbers(values, operators, parenStart) {
+function normalizeInfiniteWrongParenStarts(raw) {
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list.map(Number).filter((value) => Number.isInteger(value) && value >= 0).sort((a, b) => a - b);
+}
+
+function evaluateInfiniteWrongNumbers(values, operators, parenStartsRaw) {
   if (!Array.isArray(values) || !Array.isArray(operators) || operators.length !== values.length - 1) return null;
-  if (parenStart < 0) return dynamicArithmeticResult(values, operators);
-  if (!Number.isInteger(parenStart) || parenStart >= values.length - 1) return null;
-  const inner = dynamicArithmeticResult([values[parenStart], values[parenStart + 1]], [operators[parenStart]]);
-  if (!Number.isFinite(inner)) return null;
-  const collapsedValues = [];
-  const collapsedOps = [];
-  for (let i = 0; i < values.length; i += 1) {
-    if (i === parenStart) { collapsedValues.push(inner); i += 1; }
-    else collapsedValues.push(values[i]);
+  const parenStarts = normalizeInfiniteWrongParenStarts(parenStartsRaw);
+  if (parenStarts.length === 0) return dynamicArithmeticResult(values, operators);
+  if (new Set(parenStarts).size !== parenStarts.length) return null;
+  if (parenStarts.some((start) => start < 0 || start >= values.length - 1)) return null;
+  for (let i = 1; i < parenStarts.length; i += 1) {
+    if (parenStarts[i] <= parenStarts[i - 1] + 1) return null;
   }
-  for (let i = 0; i < operators.length; i += 1) if (i !== parenStart) collapsedOps.push(operators[i]);
+
+  const parenSet = new Set(parenStarts);
+  const innerByStart = new Map();
+  for (const start of parenStarts) {
+    const inner = dynamicArithmeticResult([values[start], values[start + 1]], [operators[start]]);
+    if (!Number.isFinite(inner)) return null;
+    innerByStart.set(start, inner);
+  }
+
+  const collapsedValues = [];
+  for (let i = 0; i < values.length; i += 1) {
+    if (parenSet.has(i)) {
+      collapsedValues.push(innerByStart.get(i));
+      i += 1;
+    } else {
+      collapsedValues.push(values[i]);
+    }
+  }
+  const collapsedOps = operators.filter((_, index) => !parenSet.has(index));
   return dynamicArithmeticResult(collapsedValues, collapsedOps);
+}
+
+function infiniteWrongParenConnectorIndex(start, parenStarts, valueCount) {
+  const occupied = new Set();
+  for (const p of parenStarts) { occupied.add(p); occupied.add(p + 1); }
+  const rightExternal = start + 2;
+  if (rightExternal < valueCount && !occupied.has(rightExternal)) return start + 1;
+  const leftExternal = start - 1;
+  if (leftExternal >= 0 && !occupied.has(leftExternal)) return start - 1;
+  return -1;
+}
+
+function infiniteWrongParenLayoutValid(count, operators, parenStarts) {
+  if (parenStarts.length === 0) return true;
+  if (new Set(parenStarts).size !== parenStarts.length) return false;
+  if (parenStarts.some((start) => start < 0 || start >= count - 1)) return false;
+  for (let i = 1; i < parenStarts.length; i += 1) {
+    if (parenStarts[i] <= parenStarts[i - 1] + 1) return false;
+  }
+  // 5. sayı (index 4) hiçbir zaman parantezin içinde olamaz.
+  if (parenStarts.some((start) => start === 3 || start === 4)) return false;
+  const externalIndexes = [];
+  for (const start of parenStarts) {
+    const connectorIndex = infiniteWrongParenConnectorIndex(start, parenStarts, count);
+    if (connectorIndex < 0) return false;
+    const connectorOp = Number(operators[connectorIndex]);
+    if (connectorOp !== WRONG_NUMBERS_MULTIPLY && connectorOp !== WRONG_NUMBERS_DIVIDE) return false;
+    externalIndexes.push(connectorIndex === start + 1 ? start + 2 : start - 1);
+  }
+  if (new Set(externalIndexes).size !== externalIndexes.length) return false;
+  return true;
 }
 
 function generateInfiniteWrongNumbersPuzzle(stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
   const cfg = infiniteWrongNumbersConfig(stage);
-  for (let attempt = 0; attempt < 40000; attempt += 1) {
+  for (let attempt = 0; attempt < 60000; attempt += 1) {
     const values = Array.from({ length: cfg.count }, () => randomInclusive(cfg.valueMin, cfg.valueMax));
     const operators = Array.from({ length: cfg.count - 1 }, () => {
       const weighted = [0,0,1,1,2,3];
       return weighted[secureRandomInt(0, weighted.length)];
     });
-    let parenStart = -1;
+
+    let parenStarts = [];
     if (cfg.parentheses) {
-      const candidates = Array.from({ length: cfg.count - 1 }, (_, i) => i).filter((i) => !(cfg.count > 5 && i === 4));
-      parenStart = candidates[secureRandomInt(0, candidates.length)];
+      if (cfg.count >= 8) {
+        // 8+ sayıda iki ayrı parantezli işlem. 5. sayı (index 4) paranteze alınmaz.
+        const candidates = [0,1,2,5,6,7,8].filter((start) => start < cfg.count - 1);
+        const possiblePairs = [];
+        for (let a = 0; a < candidates.length; a += 1) {
+          for (let b = a + 1; b < candidates.length; b += 1) {
+            const first = candidates[a], second = candidates[b];
+            if (second <= first + 1) continue;
+            const pair = [first, second];
+            if (infiniteWrongParenConnectorIndex(first, pair, cfg.count) < 0) continue;
+            if (infiniteWrongParenConnectorIndex(second, pair, cfg.count) < 0) continue;
+            possiblePairs.push(pair);
+          }
+        }
+        if (possiblePairs.length === 0) continue;
+        parenStarts = possiblePairs[secureRandomInt(0, possiblePairs.length)];
+      } else {
+        const candidates = Array.from({ length: cfg.count - 1 }, (_, i) => i)
+          .filter((i) => !(cfg.count > 5 && (i === 3 || i === 4)));
+        parenStarts = [candidates[secureRandomInt(0, candidates.length)]];
+      }
+
+      // Her parantezli grubun dışındaki bir sayı ile bağlantısı kesinlikle × veya ÷ olur.
+      for (const start of parenStarts) {
+        const connectorIndex = infiniteWrongParenConnectorIndex(start, parenStarts, cfg.count);
+        if (connectorIndex < 0) { parenStarts = []; break; }
+        operators[connectorIndex] = secureRandomInt(2, 4);
+      }
+      if (cfg.parentheses && parenStarts.length === 0) continue;
     }
-    const result = evaluateInfiniteWrongNumbers(values, operators, parenStart);
+
+    if (!infiniteWrongParenLayoutValid(cfg.count, operators, parenStarts)) continue;
+    const result = evaluateInfiniteWrongNumbers(values, operators, parenStarts);
     if (!Number.isFinite(result) || Math.abs(result - Math.round(result)) > 1e-8) continue;
     const target = Math.round(result);
     if (target < cfg.targetMin || target > cfg.targetMax) continue;
@@ -8001,7 +8094,7 @@ function generateInfiniteWrongNumbersPuzzle(stageValue) {
     const initialGrid = values.map((value, index) => index === missingIndex ? null : value);
     return {
       gameKey: "wrong_numbers", difficulty: "Standard", target,
-      numbers: [...values, ...operators, parenStart], initialGrid, infiniteStage: stage,
+      numbers: [...values, ...operators, ...(parenStarts.length ? parenStarts : [-1])], initialGrid, infiniteStage: stage,
     };
   }
   throw new Error("Sonsuz Yanlış Sayıları Bul bulmacası üretilemedi.");
@@ -8012,17 +8105,20 @@ function validateInfiniteWrongNumbersAnswer(puzzle, answer = {}) {
   const cfg = infiniteWrongNumbersConfig(stage);
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
-  const expectedLength = cfg.count + (cfg.count - 1) + 1;
+  const parenCount = cfg.parentheses ? (cfg.count >= 8 ? 2 : 1) : 1; // parantezsizde -1 sentinel tutulur.
+  const expectedLength = cfg.count + (cfg.count - 1) + parenCount;
   if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== expectedLength || initialGrid.length !== cfg.count) return false;
   const values = numbers.slice(0, cfg.count);
   const operators = numbers.slice(cfg.count, cfg.count + cfg.count - 1);
-  const parenStart = numbers[numbers.length - 1];
+  const rawParens = numbers.slice(cfg.count + cfg.count - 1);
+  const parenStarts = cfg.parentheses ? rawParens : [];
   if (!values.every((v) => Number.isInteger(v) && v >= cfg.valueMin && v <= cfg.valueMax)) return false;
   if (!operators.every((op) => Number.isInteger(op) && op >= 0 && op <= 3)) return false;
-  if (cfg.parentheses ? !(Number.isInteger(parenStart) && parenStart >= 0 && parenStart < cfg.count - 1) : parenStart !== -1) return false;
+  if (!cfg.parentheses && !(rawParens.length === 1 && rawParens[0] === -1)) return false;
+  if (cfg.parentheses && !infiniteWrongParenLayoutValid(cfg.count, operators, parenStarts)) return false;
   if (initialGrid.filter((v) => v == null).length !== 1) return false;
   for (let i = 0; i < cfg.count; i += 1) if (initialGrid[i] != null && Number(initialGrid[i]) !== values[i]) return false;
-  const result = evaluateInfiniteWrongNumbers(values, operators, parenStart);
+  const result = evaluateInfiniteWrongNumbers(values, operators, parenStarts);
   if (!Number.isFinite(result) || Math.abs(result - Number(puzzle.target)) > 1e-8 || result < cfg.targetMin || result > cfg.targetMax) return false;
   const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
   return grid.length === cfg.count && grid.every((value, index) => Number.isInteger(value) && value === values[index]);
