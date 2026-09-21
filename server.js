@@ -7621,10 +7621,22 @@ function generateInfiniteRatioPuzzle(stageValue) {
     if (maxMultiplier < cfg.pairCount) continue;
     const multipliers = shuffled(Array.from({ length: maxMultiplier }, (_, i) => i + 1)).slice(0, cfg.pairCount);
     const numbers = multipliers.flatMap((m) => [n * m, d * m]);
-    // Sonsuz Oran Orantı'da her aşamada tam 2 hazır taş bulunur.
-    // İki taş farklı oran çiftlerine dağıtılır; böylece aynı çiftte iki hazır taş oluşmaz.
-    const fixedPairs = shuffled(Array.from({ length: cfg.pairCount }, (_, i) => i)).slice(0, 2);
-    const fixed = new Set(fixedPairs.map((pairIndex) => pairIndex * 2 + secureRandomInt(0, 2)));
+    let fixed;
+    if (stage <= 20) {
+      // 1-20: her oran çiftinde rastgele tam bir sayı hazırdır.
+      fixed = new Set(
+        Array.from({ length: cfg.pairCount }, (_, pairIndex) =>
+          pairIndex * 2 + secureRandomInt(0, 2)
+        )
+      );
+    } else {
+      // 21+: eski sonsuz kuralı: toplam hücrelerin yarısının bir eksiği hazırdır.
+      // 2*pairCount hücre olduğundan bu sayı pairCount - 1'dir.
+      fixed = new Set(
+        shuffled(Array.from({ length: cfg.pairCount * 2 }, (_, i) => i))
+          .slice(0, Math.max(0, cfg.pairCount - 1))
+      );
+    }
     const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
     return { gameKey: "ratio_proportion", difficulty: "Standard", target: cfg.pairCount, numbers, initialGrid, infiniteStage: stage };
   }
@@ -7640,11 +7652,16 @@ function validateInfiniteRatioAnswer(puzzle, answer = {}) {
   const count = cfg.pairCount * 2;
   if (!Number.isInteger(stage) || stage <= 0 || Number(puzzle?.target) !== cfg.pairCount || numbers.length !== count || initialGrid.length !== count || grid.length !== count) return false;
   if (![...numbers, ...grid].every((v) => Number.isInteger(v) && v >= 1 && v <= cfg.maxValue)) return false;
-  if (initialGrid.filter((v) => v != null).length !== 2) return false;
-  const fixedPairIndexes = initialGrid
-    .map((value, index) => value != null ? Math.floor(index / 2) : -1)
+  const fixedIndexes = initialGrid
+    .map((value, index) => value != null ? index : -1)
     .filter((value) => value >= 0);
-  if (new Set(fixedPairIndexes).size !== 2) return false;
+  if (stage <= 20) {
+    if (fixedIndexes.length !== cfg.pairCount) return false;
+    const fixedPairIndexes = fixedIndexes.map((index) => Math.floor(index / 2));
+    if (new Set(fixedPairIndexes).size !== cfg.pairCount) return false;
+  } else if (fixedIndexes.length !== Math.max(0, cfg.pairCount - 1)) {
+    return false;
+  }
   if (integerMultisetKey(grid) !== integerMultisetKey(numbers)) return false;
   for (let i = 0; i < count; i += 1) if (initialGrid[i] != null && grid[i] !== Number(initialGrid[i])) return false;
   const n0 = grid[0], d0 = grid[1];
@@ -8011,14 +8028,24 @@ function evaluateInfiniteWrongNumbers(values, operators, parenStartsRaw) {
   return dynamicArithmeticResult(collapsedValues, collapsedOps);
 }
 
-function infiniteWrongParenConnectorIndex(start, parenStarts, valueCount) {
+function infiniteWrongParenExternalConnections(start, parenStarts, valueCount) {
   const occupied = new Set();
   for (const p of parenStarts) { occupied.add(p); occupied.add(p + 1); }
-  const rightExternal = start + 2;
-  if (rightExternal < valueCount && !occupied.has(rightExternal)) return start + 1;
+  const connections = [];
   const leftExternal = start - 1;
-  if (leftExternal >= 0 && !occupied.has(leftExternal)) return start - 1;
-  return -1;
+  if (leftExternal >= 0 && !occupied.has(leftExternal)) {
+    connections.push({ operatorIndex: start - 1, externalValueIndex: leftExternal });
+  }
+  const rightExternal = start + 2;
+  if (rightExternal < valueCount && !occupied.has(rightExternal)) {
+    connections.push({ operatorIndex: start + 1, externalValueIndex: rightExternal });
+  }
+  return connections;
+}
+
+function infiniteWrongParenConnectorIndex(start, parenStarts, valueCount) {
+  const connections = infiniteWrongParenExternalConnections(start, parenStarts, valueCount);
+  return connections.length === 1 ? connections[0].operatorIndex : -1;
 }
 
 function infiniteWrongParenLayoutValid(count, operators, parenStarts) {
@@ -8032,11 +8059,14 @@ function infiniteWrongParenLayoutValid(count, operators, parenStarts) {
   if (parenStarts.some((start) => start === 3 || start === 4)) return false;
   const externalIndexes = [];
   for (const start of parenStarts) {
-    const connectorIndex = infiniteWrongParenConnectorIndex(start, parenStarts, count);
-    if (connectorIndex < 0) return false;
+    // Bir parantez grubunun dışında yalnızca TEK komşu sayı bulunabilir.
+    // Böylece parantez iki ayrı dış sayıya/işleme birden bağlanmaz.
+    const connections = infiniteWrongParenExternalConnections(start, parenStarts, count);
+    if (connections.length !== 1) return false;
+    const connectorIndex = connections[0].operatorIndex;
     const connectorOp = Number(operators[connectorIndex]);
     if (connectorOp !== WRONG_NUMBERS_MULTIPLY && connectorOp !== WRONG_NUMBERS_DIVIDE) return false;
-    externalIndexes.push(connectorIndex === start + 1 ? start + 2 : start - 1);
+    externalIndexes.push(connections[0].externalValueIndex);
   }
   if (new Set(externalIndexes).size !== externalIndexes.length) return false;
   return true;
@@ -8055,25 +8085,18 @@ function generateInfiniteWrongNumbersPuzzle(stageValue) {
     let parenStarts = [];
     if (cfg.parentheses) {
       if (cfg.count >= 8) {
-        // 8+ sayıda iki ayrı parantezli işlem. 5. sayı (index 4) paranteze alınmaz.
-        const candidates = [0,1,2,5,6,7,8].filter((start) => start < cfg.count - 1);
-        const possiblePairs = [];
-        for (let a = 0; a < candidates.length; a += 1) {
-          for (let b = a + 1; b < candidates.length; b += 1) {
-            const first = candidates[a], second = candidates[b];
-            if (second <= first + 1) continue;
-            const pair = [first, second];
-            if (infiniteWrongParenConnectorIndex(first, pair, cfg.count) < 0) continue;
-            if (infiniteWrongParenConnectorIndex(second, pair, cfg.count) < 0) continue;
-            possiblePairs.push(pair);
-          }
-        }
-        if (possiblePairs.length === 0) continue;
-        parenStarts = possiblePairs[secureRandomInt(0, possiblePairs.length)];
+        // 8+ sayıda iki parantez vardır. Her parantez yalnız bir dış sayıya bağlanabilsin
+        // diye gruplar ifadenin iki ucuna yerleştirilir. 5. sayı da doğal olarak dışarıda kalır.
+        parenStarts = [0, cfg.count - 2];
       } else {
-        const candidates = Array.from({ length: cfg.count - 1 }, (_, i) => i)
-          .filter((i) => !(cfg.count > 5 && (i === 3 || i === 4)));
-        parenStarts = [candidates[secureRandomInt(0, candidates.length)]];
+        // Tek parantezli aşamalarda da parantezin yalnız bir dış bağlantısı olsun:
+        // ifade başındaki veya (5. sayıyı içine almıyorsa) sonundaki ikili seçilir.
+        const edgeCandidates = [0, cfg.count - 2]
+          .filter((i, pos, arr) => arr.indexOf(i) === pos)
+          .filter((i) => i >= 0 && i < cfg.count - 1)
+          .filter((i) => !(i === 3 || i === 4));
+        if (edgeCandidates.length === 0) continue;
+        parenStarts = [edgeCandidates[secureRandomInt(0, edgeCandidates.length)]];
       }
 
       // Her parantezli grubun dışındaki bir sayı ile bağlantısı kesinlikle × veya ÷ olur.
