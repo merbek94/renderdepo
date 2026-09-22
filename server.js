@@ -3055,6 +3055,98 @@ function validateConsecutiveChallengeAnswer(puzzle, answer = {}) {
   return consecutiveGridSolved(grid);
 }
 
+
+function infiniteConsecutiveConfig(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 40) return { size: 5, startMin: 1, startMax: 9, stepMin: 1, stepMax: 10 };
+  if (stage <= 80) return { size: 6, startMin: 1, startMax: 20, stepMin: 10, stepMax: 20 };
+  if (stage <= 120) return { size: 7, startMin: 1, startMax: 30, stepMin: 10, stepMax: 30 };
+  return { size: 8, startMin: 20, startMax: 50, stepMin: 50, stepMax: 100 };
+}
+
+function infiniteConsecutiveGridSolved(gridRaw, cfg) {
+  const size = cfg.size;
+  if (!Array.isArray(gridRaw) || gridRaw.length !== size * size) return false;
+  const grid = gridRaw.map(Number);
+  if (!grid.every((value) => Number.isInteger(value) && value > 0 && value <= 9999)) return false;
+  const rowSteps = [];
+  const colSteps = [];
+  for (let row = 0; row < size; row += 1) {
+    const first = grid[row * size];
+    const step = grid[row * size + 1] - first;
+    if (row === 0 && (first < cfg.startMin || first > cfg.startMax)) return false;
+    if (step < cfg.stepMin || step > cfg.stepMax) return false;
+    for (let col = 2; col < size; col += 1) if (grid[row * size + col] - grid[row * size + col - 1] !== step) return false;
+    rowSteps.push(step);
+  }
+  for (let col = 0; col < size; col += 1) {
+    const step = grid[size + col] - grid[col];
+    if (step < cfg.stepMin || step > cfg.stepMax) return false;
+    for (let row = 2; row < size; row += 1) if (grid[row * size + col] - grid[(row - 1) * size + col] !== step) return false;
+    colSteps.push(step);
+  }
+  return new Set(rowSteps).size === size && new Set(colSteps).size === size;
+}
+
+function infiniteConsecutiveInitialIndices(size) {
+  const first = shuffled(Array.from({ length: size }, (_, i) => i));
+  let second = null;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const candidate = shuffled(Array.from({ length: size }, (_, i) => i));
+    if (candidate.every((col, row) => col !== first[row])) { second = candidate; break; }
+  }
+  if (!second) second = first.map((col) => (col + 1) % size);
+  return first.flatMap((col, row) => [row * size + col, row * size + second[row]]);
+}
+
+function generateInfiniteConsecutivePuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteConsecutiveConfig(stage);
+  const size = cfg.size;
+  for (let attempt = 0; attempt < 2000; attempt += 1) {
+    let delta, horizontalBase, verticalBase;
+    if (stage <= 40) {
+      // İlk 40 aşama eski 5x5 Ardışık üretimini korur; yalnız ilk sayı 1-9'a genişler.
+      delta = secureRandomInt(1, 3);
+      horizontalBase = secureRandomInt(1, 3);
+      verticalBase = secureRandomInt(1, 3);
+      if (horizontalBase + 4 * delta > 10 || verticalBase + 4 * delta > 10) continue;
+    } else {
+      const maxDelta = Math.max(1, Math.floor((cfg.stepMax - cfg.stepMin) / Math.max(1, size - 1)));
+      delta = secureRandomInt(1, maxDelta + 1);
+      const maxBase = cfg.stepMax - delta * (size - 1);
+      if (maxBase < cfg.stepMin) continue;
+      horizontalBase = secureRandomInt(cfg.stepMin, maxBase + 1);
+      verticalBase = secureRandomInt(cfg.stepMin, maxBase + 1);
+    }
+    const start = secureRandomInt(cfg.startMin, cfg.startMax + 1);
+    const solution = Array.from({ length: size * size }, (_, index) => {
+      const row = Math.floor(index / size), col = index % size;
+      return start + verticalBase * row + horizontalBase * col + delta * row * col;
+    });
+    if (!infiniteConsecutiveGridSolved(solution, cfg)) continue;
+    const fixedIndices = stage <= 40 ? consecutiveChooseInitialIndices() : infiniteConsecutiveInitialIndices(size);
+    const fixed = new Set(fixedIndices);
+    const initialGrid = solution.map((value, index) => fixed.has(index) ? value : null);
+    return { gameKey: "consecutive", difficulty: "Standard", target: size, numbers: solution, initialGrid, infiniteStage: stage };
+  }
+  throw new Error("Sonsuz Ardışık bulmacası üretilemedi.");
+}
+
+function validateInfiniteConsecutiveAnswer(puzzle, answer = {}) {
+  const cfg = infiniteConsecutiveConfig(puzzle?.infiniteStage);
+  if (Number(puzzle?.target) !== cfg.size || !infiniteConsecutiveGridSolved(puzzle?.numbers, cfg)) return false;
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (initialGrid.length !== cfg.size * cfg.size || initialGrid.filter((v) => v != null).length !== cfg.size * 2) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (grid.length !== cfg.size * cfg.size || !infiniteConsecutiveGridSolved(grid, cfg)) return false;
+  for (let i = 0; i < grid.length; i += 1) {
+    if (initialGrid[i] != null && Number(initialGrid[i]) !== grid[i]) return false;
+    if (grid[i] !== Number(puzzle.numbers[i])) return false;
+  }
+  return true;
+}
+
 const EQUATION_HUNT_MAX_LINEAR_SOLUTION = 20;
 const EQUATION_HUNT_MAX_QUADRATIC_SOLUTION = 10;
 
@@ -3092,11 +3184,13 @@ function equationHuntQuadraticParams(solution) {
   return [1, k, 0];
 }
 
-function generateEquationHuntPuzzle() {
+function generateEquationHuntPuzzle(forcedFamily = null) {
   // Önce aileyi seçip o aile içinde geçerli parametre bulunana kadar tekrar dene.
   // Böylece üretimi daha kolay olan bir denklem tipi diğer tipleri istatistiksel olarak ezmez;
   // yedi aile uzun vadede yaklaşık eşit olasılıkla gelir.
-  const family = secureRandomInt(1, 8);
+  const family = Number.isInteger(forcedFamily) && forcedFamily >= 1 && forcedFamily <= 7
+    ? forcedFamily
+    : secureRandomInt(1, 8);
   const pairIndex = secureRandomInt(0, 3);
   const maxSolution = family === 7
     ? EQUATION_HUNT_MAX_QUADRATIC_SOLUTION
@@ -3212,7 +3306,30 @@ function generateEquationHuntPuzzle() {
     if (isEquationHuntPuzzleEncodingValid(puzzle)) return puzzle;
   }
 
-  // Güvenli fallback: 2x + 5 = 11, 3y - 4 = 8 => x=3, y=4.
+  // Zorlanmış aile kullanılıyorsa fallback de aynı ailede kalır; böylece Sonsuz Mod
+  // aşama kuralı nadir üretim başarısızlığında bile bozulmaz.
+  if (family === 3) {
+    // 5x - 3 = 2x + 15 => x=6; 4y + 1 = y + 13 => y=4.
+    return {
+      gameKey: "equation_hunt",
+      difficulty: "Standard",
+      target: 6,
+      numbers: [3, 0, 4, 5, -3, 2, 15, 4, 1, 1, 13],
+      initialGrid: [],
+    };
+  }
+  if (family === 7) {
+    // x² + 1 = 10 => x=3; y² + 2 = 18 => y=4.
+    return {
+      gameKey: "equation_hunt",
+      difficulty: "Standard",
+      target: 3,
+      numbers: [7, 0, 4, 0, 1, 1, 0, 1, 2],
+      initialGrid: [],
+    };
+  }
+
+  // Varsayılan güvenli fallback: 2x + 5 = 11, 3y - 4 = 8 => x=3, y=4.
   return {
     gameKey: "equation_hunt",
     difficulty: "Standard",
@@ -3220,6 +3337,66 @@ function generateEquationHuntPuzzle() {
     numbers: [2, 0, 4, 2, 1, 5, 3, -1, 4],
     initialGrid: [],
   };
+}
+
+
+function generateInfiniteEquationSystemPuzzle(variableCount, independentOneSide = false) {
+  const n = Math.max(2, Math.min(4, Math.floor(Number(variableCount || 2))));
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
+    const solutions = Array.from({ length: n }, () => secureRandomInt(1, EQUATION_HUNT_MAX_LINEAR_SOLUTION + 1));
+    const equations = [];
+    let leftProduct = 1;
+    let rightProduct = 1;
+    for (let i = 0; i < n; i += 1) {
+      const leftVar = independentOneSide ? i : i;
+      const rightVar = independentOneSide ? -1 : (i + 1) % n;
+      const leftCoeff = secureRandomInt(1, 7);
+      const rightCoeff = independentOneSide ? 0 : secureRandomInt(1, 7);
+      const leftConst = equationHuntRandomSignedNonZero(12);
+      const leftValue = leftCoeff * solutions[leftVar] + leftConst;
+      if (leftValue <= 0) { equations.length = 0; break; }
+      const rightConst = independentOneSide
+        ? leftValue
+        : leftValue - rightCoeff * solutions[rightVar];
+      if (!Number.isInteger(rightConst) || Math.abs(rightConst) > 80) { equations.length = 0; break; }
+      if (!independentOneSide && rightCoeff * solutions[rightVar] + rightConst <= 0) { equations.length = 0; break; }
+      equations.push(leftVar, leftCoeff, leftConst, rightVar, rightCoeff, rightConst);
+      leftProduct *= leftCoeff;
+      if (!independentOneSide) rightProduct *= rightCoeff;
+    }
+    if (equations.length !== n * 6) continue;
+    // Döngüsel sistemde katsayı matrisi tekil olmasın. Bağımsız tek-taraflı sistem zaten tekildir değildir.
+    if (!independentOneSide && leftProduct === rightProduct) continue;
+    return {
+      gameKey: "equation_hunt",
+      difficulty: "Standard",
+      target: solutions[0],
+      // Aile 8: [8, n, çözüm2..n, her denklem için leftVar,leftCoeff,leftConst,rightVar,rightCoeff,rightConst]
+      numbers: [8, n, ...solutions.slice(1), ...equations],
+      initialGrid: [],
+    };
+  }
+  throw new Error("Sonsuz Denklem Avı çok bilinmeyenli sistem üretilemedi.");
+}
+
+function generateInfiniteEquationHuntPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  // 1-10: tek bilinmeyenli, bilinmeyen yalnız bir tarafta (ax ± b = c).
+  // 11-20: tek bilinmeyenli, bilinmeyen eşitliğin iki tarafında (ax ± b = cx ± d).
+  // 21-40: mevcut ikinci derece Denklem Avı ailesi.
+  // 41-60: iki bağımsız, tek taraflı lineer denklem (x ve y ayrı ayrı).
+  // 61-80: iki bilinmeyenli, iki taraflı 2x2 lineer sistem.
+  // 81-100: üç bilinmeyenli üç denklem.
+  // 101+: dört bilinmeyenli dört denklem.
+  let puzzle;
+  if (stage <= 10) puzzle = generateEquationHuntPuzzle(2);
+  else if (stage <= 20) puzzle = generateEquationHuntPuzzle(3);
+  else if (stage <= 40) puzzle = generateEquationHuntPuzzle(7);
+  else if (stage <= 60) puzzle = generateInfiniteEquationSystemPuzzle(2, true);
+  else if (stage <= 80) puzzle = generateInfiniteEquationSystemPuzzle(2, false);
+  else if (stage <= 100) puzzle = generateInfiniteEquationSystemPuzzle(3, false);
+  else puzzle = generateInfiniteEquationSystemPuzzle(4, false);
+  return { ...puzzle, infiniteStage: stage };
 }
 
 function isEquationHuntPuzzleEncodingValid(puzzle) {
@@ -3230,13 +3407,14 @@ function isEquationHuntPuzzleEncodingValid(puzzle) {
   const family = numbers[0];
   const pairIndex = numbers[1];
   const secondSolution = numbers[2];
-  if (family < 1 || family > 7 || pairIndex < 0 || pairIndex > 2) return false;
+  if (family < 1 || family > 8) return false;
+  if (family !== 8 && (pairIndex < 0 || pairIndex > 2)) return false;
 
   const maxSolution = family === 7
     ? EQUATION_HUNT_MAX_QUADRATIC_SOLUTION
     : EQUATION_HUNT_MAX_LINEAR_SOLUTION;
   if (firstSolution < 1 || firstSolution > maxSolution) return false;
-  if (secondSolution < 1 || secondSolution > maxSolution) return false;
+  if (family !== 8 && (secondSolution < 1 || secondSolution > maxSolution)) return false;
 
   const coefficient = (value, max = 5) => Number.isInteger(value) && value >= 1 && value <= max;
   const sign = (value) => value === -1 || value === 1;
@@ -3331,14 +3509,64 @@ function isEquationHuntPuzzleEncodingValid(puzzle) {
       validQuadratic(secondSolution, numbers[6], numbers[7], numbers[8]);
   }
 
+
+  if (family === 8) {
+    const variableCount = numbers[1];
+    if (!Number.isInteger(variableCount) || variableCount < 2 || variableCount > 4) return false;
+    const expectedLength = 7 * variableCount + 1;
+    if (numbers.length !== expectedLength) return false;
+    const solutions = [firstSolution, ...numbers.slice(2, 2 + variableCount - 1)];
+    if (solutions.length !== variableCount || solutions.some((value) => !Number.isInteger(value) || value < 1 || value > EQUATION_HUNT_MAX_LINEAR_SOLUTION)) return false;
+    const start = variableCount + 1;
+    for (let equation = 0; equation < variableCount; equation += 1) {
+      const offset = start + equation * 6;
+      const leftVar = numbers[offset];
+      const leftCoeff = numbers[offset + 1];
+      const leftConst = numbers[offset + 2];
+      const rightVar = numbers[offset + 3];
+      const rightCoeff = numbers[offset + 4];
+      const rightConst = numbers[offset + 5];
+      if (!Number.isInteger(leftVar) || leftVar < 0 || leftVar >= variableCount) return false;
+      if (!Number.isInteger(leftCoeff) || leftCoeff < 1 || leftCoeff > 6) return false;
+      if (!Number.isInteger(leftConst) || Math.abs(leftConst) > 80) return false;
+      if (rightVar === -1) {
+        if (rightCoeff !== 0 || !Number.isInteger(rightConst) || rightConst <= 0) return false;
+        if (leftCoeff * solutions[leftVar] + leftConst !== rightConst) return false;
+      } else {
+        if (!Number.isInteger(rightVar) || rightVar < 0 || rightVar >= variableCount || rightVar === leftVar) return false;
+        if (!Number.isInteger(rightCoeff) || rightCoeff < 1 || rightCoeff > 6) return false;
+        if (!Number.isInteger(rightConst) || Math.abs(rightConst) > 80) return false;
+        if (leftCoeff * solutions[leftVar] + leftConst !== rightCoeff * solutions[rightVar] + rightConst) return false;
+      }
+    }
+    return true;
+  }
+
   return false;
 }
 
 function validateEquationHuntChallengeAnswer(puzzle, answer = {}) {
   if (!isEquationHuntPuzzleEncodingValid(puzzle)) return false;
+  const family = Number(puzzle?.numbers?.[0]);
+  if (family === 8) {
+    const variableCount = Number(puzzle.numbers[1]);
+    const expected = [Number(puzzle.target), ...puzzle.numbers.slice(2, 2 + variableCount - 1).map(Number)];
+    const values = Array.isArray(answer?.values) ? answer.values.map(Number) : [];
+    return values.length === variableCount && values.every((value, index) => Number.isInteger(value) && value === expected[index]);
+  }
+
   const firstValue = Number(answer?.firstValue);
+  if (!Number.isInteger(firstValue)) return false;
+
+  // Sonsuz Mod 1-20. aşamalar tek bilinmeyenli/tek denklemlidir. İkinci gizli
+  // parametre yalnız ortak puzzle codec uyumluluğu için taşınır ve cevapta aranmaz.
+  const infiniteStage = Math.max(0, Math.floor(Number(puzzle?.infiniteStage || 0)));
+  if (infiniteStage >= 1 && infiniteStage <= 20) {
+    return firstValue === Number(puzzle.target);
+  }
+
   const secondValue = Number(answer?.secondValue);
-  if (!Number.isInteger(firstValue) || !Number.isInteger(secondValue)) return false;
+  if (!Number.isInteger(secondValue)) return false;
   return firstValue === Number(puzzle.target) &&
     secondValue === Number(puzzle.numbers[2]);
 }
@@ -4993,7 +5221,7 @@ function isRealtimeScoreBasedGameKey(gameKey) {
 
 function isUntimedSingleRunGameKey(gameKey) {
   const base = normalizeBaseGameKey(gameKey);
-  return base === "merge_5120" || base === "digit_hunt";
+  return base === "merge_5120" || base === "digit_hunt" || base === "digit_attack";
 }
 
 function isFirstFinishRaceGameKey(gameKey) {
@@ -5412,7 +5640,7 @@ function digitAttackApply(baseValue, operationValue, operandValue) {
 
 function digitAttackDecodeWaves(numbersRaw) {
   const numbers = Array.isArray(numbersRaw) ? numbersRaw.map(Number) : [];
-  if (numbers.length !== DIGIT_ATTACK_WAVE_COUNT * DIGIT_ATTACK_WAVE_STRIDE) return null;
+  if (numbers.length < DIGIT_ATTACK_WAVE_STRIDE || numbers.length % DIGIT_ATTACK_WAVE_STRIDE !== 0) return null;
   const waves = [];
   for (let offset = 0; offset < numbers.length; offset += DIGIT_ATTACK_WAVE_STRIDE) {
     waves.push({
@@ -5434,37 +5662,32 @@ function digitAttackCorrectLane(wave) {
 }
 
 function isDigitAttackPuzzleEncodingValid(puzzle) {
-  if (Number(puzzle?.target) !== DIGIT_ATTACK_REQUIRED_HITS) return false;
   const waves = digitAttackDecodeWaves(puzzle?.numbers);
   if (!waves) return false;
-  const operationCounts = [0, 0, 0, 0];
-  let previousTarget = null;
-  for (let index = 0; index < waves.length; index += 1) {
-    const wave = waves[index];
-    // İlk alt sayı 4-10 arasındadır. Sonraki her dalganın alt sayısı bir önceki
-    // hedefe eşittir ve zincirin hiçbir aşamasında 4'ün altına düşmez.
-    if (!Number.isInteger(wave.base) || wave.base < 4 || wave.base >= 100) return false;
-    if (index === 0 && wave.base > 10) return false;
-    if (index > 0 && wave.base !== previousTarget) return false;
-    if (!Number.isInteger(wave.target) || wave.target < 4 || wave.target >= 100) return false;
-    if (wave.target === wave.base) return false;
-    if (!Number.isInteger(wave.operation) || wave.operation < 0 || wave.operation > 3) return false;
-    if (!Array.isArray(wave.operands) || wave.operands.length !== 3) return false;
-    if (!wave.operands.every((value) => Number.isInteger(value) && value >= 1 && value <= 40)) return false;
-    if (new Set(wave.operands).size !== 3) return false;
-    const correctLane = digitAttackCorrectLane(wave);
-    if (correctLane < 0) return false;
-    const correctOperand = wave.operands[correctLane];
-    const correctOperandAllowed = wave.operation === 0 || wave.operation === 1
-      ? correctOperand >= 9 && correctOperand <= 25
-      : correctOperand >= 2 && correctOperand <= 5;
-    if (!correctOperandAllowed) return false;
-    if (wave.operands.some((operand, lane) => lane !== correctLane &&
-        (Math.abs(operand - correctOperand) < 1 || Math.abs(operand - correctOperand) > 2))) return false;
-    previousTarget = wave.target;
-    operationCounts[wave.operation] += 1;
+  const infiniteRun = waves.length > DIGIT_ATTACK_WAVE_COUNT;
+  if (Number(puzzle?.target) !== (infiniteRun ? waves.length : DIGIT_ATTACK_REQUIRED_HITS)) return false;
+  const operationCounts = [0,0,0,0];
+  let previousTarget=null;
+  for (let index=0; index<waves.length; index+=1) {
+    const wave=waves[index];
+    if (!Number.isInteger(wave.base) || wave.base < 2 || wave.base > 1000000) return false;
+    if (index===0 && (wave.base<4 || wave.base>10)) return false;
+    if (index>0 && wave.base!==previousTarget && !(infiniteRun && previousTarget>500000 && wave.base===360)) return false;
+    if (!Number.isInteger(wave.target) || wave.target<2 || wave.target>1000000 || wave.target===wave.base) return false;
+    if (!Number.isInteger(wave.operation) || wave.operation<0 || wave.operation>3) return false;
+    if (!Array.isArray(wave.operands) || wave.operands.length!==3 || new Set(wave.operands).size!==3) return false;
+    const correctLane=digitAttackCorrectLane(wave); if (correctLane<0) return false;
+    const correct=wave.operands[correctLane];
+    const advanced=infiniteRun && index>=100;
+    const correctAllowed=wave.operation<=1 ? (correct>=9 && correct<=(advanced?50:25)) : (correct>=2 && correct<=(advanced?8:5));
+    if (!correctAllowed) return false;
+    const radius=advanced ? (wave.operation<=1?10:5) : 2;
+    const minimum=advanced ? (wave.operation<=1?5:2) : 1;
+    if (wave.operands.some((operand,lane)=> lane!==correctLane && (!Number.isInteger(operand) || operand<minimum || Math.abs(operand-correct)<1 || Math.abs(operand-correct)>radius))) return false;
+    if (!advanced && (wave.base<4 || wave.base>=100 || wave.target<4 || wave.target>=100)) return false;
+    previousTarget=wave.target; operationCounts[wave.operation]+=1;
   }
-  return operationCounts.every((count) => count === DIGIT_ATTACK_WAVE_COUNT / 4);
+  return infiniteRun ? waves.length>=101 : operationCounts.every((count)=>count===DIGIT_ATTACK_WAVE_COUNT/4);
 }
 
 function digitAttackNearbyOperands(base, operation, correctOperand, target) {
@@ -5531,6 +5754,60 @@ function generateDigitAttackWaveFromBase(base, operation, nextOperation = null) 
   return null;
 }
 
+
+function digitAttackAdvancedNearbyOperands(base, operation, correctOperand, target) {
+  const radius = operation === 0 || operation === 1 ? 10 : 5;
+  const minimum = operation === 0 || operation === 1 ? 5 : 2;
+  const candidates = shuffled(Array.from({ length: radius * 2 + 1 }, (_,i)=>i-radius).filter((d)=>d!==0));
+  const result=[correctOperand];
+  for (const delta of candidates) {
+    const candidate=correctOperand+delta;
+    if (candidate < minimum || result.includes(candidate)) continue;
+    if (digitAttackApply(base, operation, candidate) === target) continue;
+    result.push(candidate);
+    if (result.length===3) break;
+  }
+  return result.length===3 ? shuffled(result) : null;
+}
+function generateInfiniteDigitAttackWave(base, advanced) {
+  const operations = shuffled([0,1,2,3]);
+  for (const operation of operations) {
+    const minCorrect = operation <= 1 ? 9 : 2;
+    const maxCorrect = advanced ? (operation <= 1 ? 50 : 8) : (operation <= 1 ? 25 : 5);
+    const candidates = shuffled(Array.from({ length:maxCorrect-minCorrect+1 },(_,i)=>minCorrect+i));
+    for (const correctOperand of candidates) {
+      const target=digitAttackApply(base,operation,correctOperand);
+      if (!Number.isInteger(target) || target < 2 || target > 1000000 || target===base) continue;
+      if (operation===3 && base%correctOperand!==0) continue;
+      if (!advanced && (target < 4 || target >= 100)) continue;
+      const operands=advanced
+        ? digitAttackAdvancedNearbyOperands(base,operation,correctOperand,target)
+        : digitAttackNearbyOperands(base,operation,correctOperand,target);
+      if (!operands) continue;
+      return {base,target,operation,operands};
+    }
+  }
+  return null;
+}
+function generateInfiniteDigitAttackPuzzle() {
+  const waveCount = 1000; // Tek uzun koşu; 100. dalgadan sonrası yeni zorluk kurallarıyla devam eder.
+  for (let attempt=0; attempt<200; attempt+=1) {
+    let base=secureRandomInt(4,11);
+    const waves=[];
+    let failed=false;
+    for (let index=0; index<waveCount; index+=1) {
+      const wave=generateInfiniteDigitAttackWave(base,index>=100);
+      if (!wave) { failed=true; break; }
+      waves.push(wave); base=wave.target;
+      // Çok büyüyen zinciri bölme/çıkarma için yeniden yönetilebilir banda çek.
+      if (base > 500000) base = 360;
+    }
+    if (failed) continue;
+    return {difficulty:"Standard",target:waveCount,numbers:waves.flatMap((w)=>[w.base,w.target,w.operation,...w.operands]),gameKey:"digit_attack",initialGrid:[],infiniteStage:1};
+  }
+  throw new Error("Sonsuz Rakam Saldırısı üretilemedi.");
+}
+
 function generateDigitAttackPuzzle() {
   // Dört işlemin her biri tam 5 kez bulunur. İşlem sırası rastgele kalır; fakat
   // hedef bir sonraki dalganın alt sayısı olduğundan zincirin tamamı birlikte üretilir.
@@ -5570,19 +5847,20 @@ function generateDigitAttackPuzzle() {
   throw new Error("Rakam Saldırısı zincir bulmacası üretilemedi.");
 }
 
-function normalizeDigitAttackChoices(answer = {}) {
+function normalizeDigitAttackChoices(answer = {}, maxCount = DIGIT_ATTACK_WAVE_COUNT) {
   if (!Array.isArray(answer.choices)) return null;
   const choices = answer.choices.map(Number);
-  if (choices.length < 1 || choices.length > DIGIT_ATTACK_WAVE_COUNT) return null;
+  if (choices.length < 1 || choices.length > maxCount) return null;
   if (!choices.every((lane) => Number.isInteger(lane) && lane >= 0 && lane <= 2)) return null;
   return choices;
 }
 
 function digitAttackEvaluateAnswer(puzzle, answer = {}) {
   if (!isDigitAttackPuzzleEncodingValid(puzzle)) return null;
-  const choices = normalizeDigitAttackChoices(answer);
-  if (!choices) return null;
   const waves = digitAttackDecodeWaves(puzzle.numbers);
+  if (!waves) return null;
+  const choices = normalizeDigitAttackChoices(answer, waves.length);
+  if (!choices) return null;
   let correct = 0;
   let mistakes = 0;
   for (let index = 0; index < choices.length; index += 1) {
@@ -5595,7 +5873,7 @@ function digitAttackEvaluateAnswer(puzzle, answer = {}) {
       return { terminal: true, won: false, correct, mistakes };
     }
   }
-  const completedAllWaves = choices.length >= DIGIT_ATTACK_WAVE_COUNT;
+  const completedAllWaves = choices.length >= waves.length;
   return {
     terminal: completedAllWaves,
     won: completedAllWaves && mistakes < DIGIT_ATTACK_MAX_MISTAKES,
@@ -5717,6 +5995,79 @@ function shortestPathAnswerIsWinning(puzzle, answer = {}) {
   const route = normalizeShortestPathRoute(answer);
   return route !== null && isShortestPathPuzzleEncodingValid(puzzle) &&
     shortestPathRouteTotal(puzzle.numbers, route) === Number(puzzle.target);
+}
+
+
+function infiniteShortestPathDimensions(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 40) return { rows: 3, cols: 3 };
+  if (stage <= 80) return { rows: 3, cols: 4 };
+  if (stage <= 120) return { rows: 4, cols: 4 };
+  return { rows: 5, cols: 5 };
+}
+
+function shortestPathDynamicEdgeCount(rows, cols) { return rows * (cols - 1) + (rows - 1) * cols; }
+function shortestPathDynamicHorizontalIndex(rows, cols, row, col) { return row * (cols - 1) + col; }
+function shortestPathDynamicVerticalIndex(rows, cols, row, col) { return rows * (cols - 1) + row * cols + col; }
+function shortestPathDynamicEdgeWeight(numbers, rows, cols, a, b) {
+  const ar = Math.floor(a / cols), ac = a % cols, br = Math.floor(b / cols), bc = b % cols;
+  let index = -1;
+  if (ar === br && Math.abs(ac - bc) === 1) index = shortestPathDynamicHorizontalIndex(rows, cols, ar, Math.min(ac, bc));
+  else if (ac === bc && Math.abs(ar - br) === 1) index = shortestPathDynamicVerticalIndex(rows, cols, Math.min(ar, br), ac);
+  return index >= 0 ? Number(numbers[index]) : null;
+}
+function shortestPathDynamicRoutes(rows, cols) {
+  const end = rows * cols - 1, out = [];
+  function walk(node, path) {
+    if (node === end) { out.push(path); return; }
+    const row = Math.floor(node / cols), col = node % cols;
+    if (col + 1 < cols) walk(node + 1, [...path, node + 1]);
+    if (row + 1 < rows) walk(node + cols, [...path, node + cols]);
+  }
+  walk(0, [0]);
+  return out;
+}
+function shortestPathDynamicTotal(numbers, rows, cols, route) {
+  const expectedLength = rows + cols - 1;
+  if (!Array.isArray(route) || route.length !== expectedLength || route[0] !== 0 || route[route.length - 1] !== rows * cols - 1) return null;
+  let total = 0;
+  for (let i = 0; i < route.length - 1; i += 1) {
+    const a = route[i], b = route[i + 1];
+    const ar = Math.floor(a / cols), ac = a % cols, br = Math.floor(b / cols), bc = b % cols;
+    if (!((br === ar && bc === ac + 1) || (br === ar + 1 && bc === ac))) return null;
+    const weight = shortestPathDynamicEdgeWeight(numbers, rows, cols, a, b);
+    if (!Number.isInteger(weight)) return null;
+    total += weight;
+  }
+  return total;
+}
+function generateInfiniteShortestPathPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const { rows, cols } = infiniteShortestPathDimensions(stage);
+  const edgeCount = shortestPathDynamicEdgeCount(rows, cols);
+  const routes = shortestPathDynamicRoutes(rows, cols);
+  const base = Array.from({ length: edgeCount }, (_, i) => i + 1);
+  for (let attempt = 0; attempt < 1500; attempt += 1) {
+    const numbers = shuffled(base);
+    const totals = routes.map((route) => ({ route, total: shortestPathDynamicTotal(numbers, rows, cols, route) }));
+    const minimum = Math.min(...totals.map((item) => item.total));
+    if (totals.filter((item) => item.total === minimum).length !== 1) continue;
+    return { difficulty: "Standard", target: minimum, numbers, gameKey: "shortest_path", initialGrid: [], infiniteStage: stage };
+  }
+  throw new Error("Sonsuz En Kısa Yol bulmacası üretilemedi.");
+}
+function validateInfiniteShortestPathAnswer(puzzle, answer = {}) {
+  const { rows, cols } = infiniteShortestPathDimensions(puzzle?.infiniteStage);
+  const edgeCount = shortestPathDynamicEdgeCount(rows, cols);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (numbers.length !== edgeCount || [...numbers].sort((a,b)=>a-b).some((v,i)=>v !== i+1)) return false;
+  const route = Array.isArray(answer?.route) ? answer.route.map(Number) : [];
+  return shortestPathDynamicTotal(numbers, rows, cols, route) !== null;
+}
+function infiniteShortestPathAnswerIsWinning(puzzle, answer = {}) {
+  const { rows, cols } = infiniteShortestPathDimensions(puzzle?.infiniteStage);
+  const route = Array.isArray(answer?.route) ? answer.route.map(Number) : [];
+  return shortestPathDynamicTotal(puzzle?.numbers, rows, cols, route) === Number(puzzle?.target);
 }
 
 // ============================================================================
@@ -6202,6 +6553,17 @@ function generateNumberPuzzle() {
   return { difficulty: "Standard", target: equationCount, numbers: solution, gameKey: "number_puzzle", initialGrid };
 }
 
+
+function generateInfiniteNumberPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const fixedCount = stage <= 40 ? 8 : stage <= 80 ? 6 : stage <= 120 ? 4 : 2;
+  const puzzle = generateNumberPuzzle();
+  const numberCells = puzzle.numbers.map((value, index) => value > 0 ? index : -1).filter((index) => index >= 0);
+  const fixed = new Set(shuffled(numberCells).slice(0, Math.min(fixedCount, numberCells.length)));
+  const initialGrid = puzzle.numbers.map((value, index) => value > 0 ? (fixed.has(index) ? value : null) : value);
+  return { ...puzzle, initialGrid, infiniteStage: stage };
+}
+
 function validateNumberPuzzleAnswer(puzzle, answer = {}) {
   const solution = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const grid = Array.isArray(answer?.grid) ? answer.grid.map((value) => value == null ? null : Number(value)) : [];
@@ -6396,6 +6758,71 @@ function validateSudokuAnswer(puzzle, answer = {}) {
   }
   // Üretilen puzzle tek çözümlüdür; yine de authoritative çözümle birebir eşleşmeyi koruyoruz.
   return puzzle.numbers.every((value, index) => grid[index] === Number(value));
+}
+
+
+function sudoku9Pattern(row, col) { return (row * 3 + Math.floor(row / 3) + col) % 9; }
+function generateSudoku9Solution() {
+  const groups = (groupSize, groupCount) => shuffled(Array.from({ length: groupCount }, (_, i) => i)).flatMap((group) =>
+    shuffled(Array.from({ length: groupSize }, (_, i) => i)).map((inner) => group * groupSize + inner));
+  const rows = groups(3, 3), cols = groups(3, 3), digits = shuffled(Array.from({ length: 9 }, (_, i) => i + 1));
+  return rows.flatMap((r) => cols.map((c) => digits[sudoku9Pattern(r, c)]));
+}
+function sudoku9SolutionIsValid(solution) {
+  if (!Array.isArray(solution) || solution.length !== 81) return false;
+  const validSet = (arr) => arr.length === 9 && arr.every((v) => Number.isInteger(Number(v)) && Number(v) >= 1 && Number(v) <= 9) && new Set(arr.map(Number)).size === 9;
+  for (let r = 0; r < 9; r += 1) if (!validSet(solution.slice(r * 9, r * 9 + 9))) return false;
+  for (let c = 0; c < 9; c += 1) if (!validSet(Array.from({ length: 9 }, (_, r) => solution[r * 9 + c]))) return false;
+  for (let br = 0; br < 3; br += 1) for (let bc = 0; bc < 3; bc += 1) {
+    const vals = [];
+    for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) vals.push(solution[(br * 3 + r) * 9 + bc * 3 + c]);
+    if (!validSet(vals)) return false;
+  }
+  return true;
+}
+function sudoku9ClueSpec(stageValue) {
+  const stage = Math.max(41, Math.floor(Number(stageValue || 41)));
+  if (stage <= 80) return { clues: 35, maxPerLine: 4 };
+  if (stage <= 120) return { clues: 26, maxPerLine: 3 };
+  return { clues: 18, maxPerLine: 2 };
+}
+function sudoku9CluePositions(clues, maxPerLine) {
+  const offsets = shuffled([0,1,2,3,4,5,6,7,8]).slice(0, maxPerLine);
+  const positions = [];
+  for (let layer = 0; layer < maxPerLine; layer += 1) {
+    for (let row = 0; row < 9; row += 1) positions.push(row * 9 + ((row + offsets[layer]) % 9));
+  }
+  while (positions.length > clues) positions.splice(secureRandomInt(0, positions.length), 1);
+  return positions;
+}
+function generateInfiniteSudokuPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 40) return { ...generateSudokuPuzzle(), infiniteStage: stage };
+  const spec = sudoku9ClueSpec(stage);
+  const solution = generateSudoku9Solution();
+  const fixed = new Set(sudoku9CluePositions(spec.clues, spec.maxPerLine));
+  const initialGrid = solution.map((value, index) => fixed.has(index) ? value : null);
+  return { difficulty: "Standard", target: 81, numbers: solution, gameKey: "sudoku", initialGrid, infiniteStage: stage };
+}
+function validateInfiniteSudokuAnswer(puzzle, answer = {}) {
+  const stage = Math.max(1, Math.floor(Number(puzzle?.infiniteStage || 1)));
+  if (stage <= 40) return validateSudokuAnswer(puzzle, answer);
+  const spec = sudoku9ClueSpec(stage);
+  const solution = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
+  if (Number(puzzle?.target) !== 81 || !sudoku9SolutionIsValid(solution) || initialGrid.length !== 81) return false;
+  const fixedIndices = initialGrid.map((v,i)=>v==null?-1:i).filter((i)=>i>=0);
+  if (fixedIndices.length !== spec.clues) return false;
+  const rowCounts = Array(9).fill(0), colCounts = Array(9).fill(0);
+  for (const i of fixedIndices) {
+    if (Number(initialGrid[i]) !== solution[i]) return false;
+    rowCounts[Math.floor(i/9)] += 1; colCounts[i%9] += 1;
+  }
+  if (rowCounts.some((c)=>c>spec.maxPerLine) || colCounts.some((c)=>c>spec.maxPerLine)) return false;
+  const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
+  if (!sudoku9SolutionIsValid(grid)) return false;
+  for (const i of fixedIndices) if (grid[i] !== Number(initialGrid[i])) return false;
+  return true;
 }
 
 const NONOGRAM_SIZE = 5;
@@ -6616,6 +7043,85 @@ function generateResultFindPuzzle() {
   return { difficulty: "Standard", target: 35, numbers: [8,6,4,3,2,5,2,8,4,0,2,1,0,1,0,1,0,1,6,7], gameKey: "result_find", initialGrid: [] };
 }
 
+
+function infiniteResultFindConfig(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 20) return { count: 3, valueMax: 10, resultMax: 99, parens: 0, parenMulMax: 0, outsideMulMax: 999 };
+  if (stage <= 40) return { count: 5, valueMax: 15, resultMax: 99, parens: 0, parenMulMax: 0, outsideMulMax: 999 };
+  if (stage <= 60) return { count: 7, valueMax: 20, resultMax: 199, parens: 1, parenMulMax: 5, outsideMulMax: 12 };
+  if (stage <= 80) return { count: 9, valueMax: 30, resultMax: 299, parens: 2, parenMulMax: 7, outsideMulMax: 16 };
+  if (stage <= 100) return { count: 11, valueMax: 40, resultMax: 399, parens: 2, parenMulMax: 9, outsideMulMax: 20 };
+  return { count: 13, valueMax: 50, resultMax: 499, parens: 3, parenMulMax: 12, outsideMulMax: 30 };
+}
+function resultFindRangesValidForConfig(nums, ops, ranges, cfg) {
+  if (ranges.length !== cfg.parens) return false;
+  const used = new Set();
+  for (const [start,end] of ranges) {
+    if (end !== start + 1 || start < 0 || end >= nums.length || used.has(start) || used.has(end)) return false;
+    used.add(start); used.add(end);
+    if (![0,1].includes(ops[start])) return false;
+    const outerCandidates = [];
+    if (start > 0) outerCandidates.push({ opIndex:start-1, numberIndex:start-1 });
+    if (end < nums.length-1) outerCandidates.push({ opIndex:end, numberIndex:end+1 });
+    const high = outerCandidates.filter(({opIndex}) => ops[opIndex] === 2 || ops[opIndex] === 3);
+    if (high.length !== 1) return false;
+    const link = high[0];
+    if (ops[link.opIndex] === 2 && nums[link.numberIndex] > cfg.parenMulMax) return false;
+  }
+  for (let i = 0; i < ops.length; i += 1) {
+    if (ops[i] !== 2) continue;
+    const touchesParen = ranges.some(([a,b]) => i === a-1 || i === b);
+    if (!touchesParen && (nums[i] > cfg.outsideMulMax || nums[i+1] > cfg.outsideMulMax)) return false;
+  }
+  return true;
+}
+function generateInfiniteResultFindPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const cfg = infiniteResultFindConfig(stage);
+  for (let attempt = 0; attempt < 12000; attempt += 1) {
+    const nums = Array.from({ length: cfg.count }, () => secureRandomInt(2, cfg.valueMax + 1));
+    const ops = Array.from({ length: cfg.count - 1 }, () => secureRandomInt(0, 4));
+    const ranges = [];
+    if (cfg.parens > 0) {
+      const starts = shuffled(Array.from({ length: cfg.count - 1 }, (_,i)=>i)).filter((start) => start !== 4);
+      for (const start of starts) {
+        if (ranges.length >= cfg.parens) break;
+        if (ranges.some(([a,b]) => Math.abs(start-a) <= 2 || Math.abs(start-b) <= 1)) continue;
+        ranges.push([start,start+1]);
+      }
+      if (ranges.length !== cfg.parens) continue;
+      ranges.sort((a,b)=>a[0]-b[0]);
+      for (const [start,end] of ranges) {
+        ops[start] = secureRandomInt(0,2); // parantez içi + veya -
+        if (ops[start] === 1 && nums[start] <= nums[end]) [nums[start], nums[end]] = [nums[end], nums[start]];
+        const useLeft = start > 0 && (end === cfg.count-1 || secureRandomInt(0,2)===0);
+        if (useLeft) {
+          ops[start-1] = secureRandomInt(2,4);
+          if (start < ops.length && (ops[start]===2 || ops[start]===3)) ops[start] = secureRandomInt(0,2);
+          if (ops[start-1]===2 && nums[start-1] > cfg.parenMulMax) nums[start-1] = secureRandomInt(2, cfg.parenMulMax+1);
+        } else {
+          ops[end] = secureRandomInt(2,4);
+          if (end+1 < nums.length && ops[end]===2 && nums[end+1] > cfg.parenMulMax) nums[end+1] = secureRandomInt(2, cfg.parenMulMax+1);
+          if (start > 0 && (ops[start-1]===2 || ops[start-1]===3)) ops[start-1] = secureRandomInt(0,2);
+        }
+      }
+    }
+    for (let i = 0; i < ops.length; i += 1) {
+      const touchesParen = ranges.some(([a,b]) => i === a-1 || i === b);
+      if (!touchesParen && ops[i]===2 && (nums[i] > cfg.outsideMulMax || nums[i+1] > cfg.outsideMulMax)) {
+        if (nums[i] > cfg.outsideMulMax) nums[i] = secureRandomInt(2, cfg.outsideMulMax+1);
+        if (nums[i+1] > cfg.outsideMulMax) nums[i+1] = secureRandomInt(2, cfg.outsideMulMax+1);
+      }
+    }
+    if (!resultFindRangesValidForConfig(nums, ops, ranges, cfg)) continue;
+    const exact = evaluateResultFindExact(nums, ops, ranges);
+    if (!exact || exact.d !== 1n || exact.n <= 0n || exact.n > BigInt(cfg.resultMax)) continue;
+    const encoding = [cfg.count, ...nums, ...ops, cfg.parens, ...ranges.flat()];
+    return { difficulty:"Standard", target:Number(exact.n), numbers:encoding, gameKey:"result_find", initialGrid:[], infiniteStage:stage };
+  }
+  throw new Error("Sonsuz Sonucu Bul bulmacası üretilemedi.");
+}
+
 function validateResultFindAnswer(puzzle, answer = {}) {
   const result = Number(answer?.result);
   return Number.isInteger(result) && result === Number(puzzle?.target);
@@ -6743,6 +7249,42 @@ function generateTotalMatchPuzzle() {
   }
   const numbers = shuffled(values);
   return { difficulty: "Standard", target, numbers, gameKey: "total_match", initialGrid: [] };
+}
+
+
+function infiniteTotalMatchTargetRange(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 40) return [6,20];
+  if (stage <= 80) return [20,40];
+  if (stage <= 120) return [40,60];
+  return [50,100];
+}
+function generateInfiniteTotalMatchPuzzle(stageValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const [minTarget,maxTarget] = infiniteTotalMatchTargetRange(stage);
+  const target = secureRandomInt(minTarget, maxTarget + 1);
+  const values = [];
+  for (let pair=0; pair<28; pair+=1) {
+    const left = secureRandomInt(1, target);
+    values.push(left, target-left);
+  }
+  return { difficulty:"Standard", target, numbers:shuffled(values), gameKey:"total_match", initialGrid:[], infiniteStage:stage };
+}
+function validateInfiniteTotalMatchAnswer(puzzle, answer = {}) {
+  const [minTarget,maxTarget] = infiniteTotalMatchTargetRange(puzzle?.infiniteStage);
+  const target = Number(puzzle?.target), numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  if (!Number.isInteger(target) || target < minTarget || target > maxTarget || numbers.length !== 56) return false;
+  const counts = new Map();
+  for (const value of numbers) {
+    if (!Number.isInteger(value) || value <= 0 || value >= target) return false;
+    counts.set(value,(counts.get(value)||0)+1);
+  }
+  for (const [value,count] of counts.entries()) {
+    const comp=target-value;
+    if (value===comp ? count%2!==0 : (counts.get(comp)||0)!==count) return false;
+  }
+  const remaining = Array.isArray(answer?.remaining) ? answer.remaining : [];
+  return remaining.length===56 && remaining.every((value)=>value==null);
 }
 
 function validateTotalMatchAnswer(puzzle, answer = {}) {
@@ -8159,6 +8701,14 @@ function generateInfinitePuzzleForGame(gameKey, difficultyValue, stageValue) {
     case "dual_pyramid": return generateInfiniteDualPyramidPuzzle(stage);
     case "next_number": return generateInfiniteNextNumberPuzzle(stage);
     case "wrong_numbers": return generateInfiniteWrongNumbersPuzzle(stage);
+    case "equation_hunt": return generateInfiniteEquationHuntPuzzle(stage);
+    case "consecutive": return generateInfiniteConsecutivePuzzle(stage);
+    case "shortest_path": return generateInfiniteShortestPathPuzzle(stage);
+    case "digit_attack": return generateInfiniteDigitAttackPuzzle();
+    case "total_match": return generateInfiniteTotalMatchPuzzle(stage);
+    case "number_puzzle": return generateInfiniteNumberPuzzle(stage);
+    case "sudoku": return generateInfiniteSudokuPuzzle(stage);
+    case "result_find": return generateInfiniteResultFindPuzzle(stage);
     default: {
       const puzzle = generatePuzzleForGame(gameKey, difficultyValue);
       return { ...puzzle, infiniteStage: stage };
@@ -8200,7 +8750,9 @@ const GAME_HANDLERS = Object.freeze({
   total_match: Object.freeze({
     key: "total_match",
     createPuzzle: () => generateTotalMatchPuzzle(),
-    validateAnswer: (puzzle, answer) => validateTotalMatchAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteTotalMatchAnswer(puzzle, answer)
+      : validateTotalMatchAnswer(puzzle, answer),
   }),
   triple_balance: Object.freeze({
     key: "triple_balance",
@@ -8258,15 +8810,19 @@ const GAME_HANDLERS = Object.freeze({
   shortest_path: Object.freeze({
     key: "shortest_path",
     createPuzzle: () => generateShortestPathPuzzle(),
-    // Yanlış rota da biçimsel olarak geçerli bir "gönderim"dir; kazanıp kazanmadığı
-    // challengeAnswerIsWinning ile ayrıca hesaplanır ve kayıp olarak işlenir.
-    validateAnswer: (puzzle, answer) => validateShortestPathChallengeAnswer(puzzle, answer),
-    isWinningAnswer: (puzzle, answer) => shortestPathAnswerIsWinning(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteShortestPathAnswer(puzzle, answer)
+      : validateShortestPathChallengeAnswer(puzzle, answer),
+    isWinningAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? infiniteShortestPathAnswerIsWinning(puzzle, answer)
+      : shortestPathAnswerIsWinning(puzzle, answer),
   }),
   consecutive: Object.freeze({
     key: "consecutive",
     createPuzzle: () => generateConsecutivePuzzle(),
-    validateAnswer: (puzzle, answer) => validateConsecutiveChallengeAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteConsecutiveAnswer(puzzle, answer)
+      : validateConsecutiveChallengeAnswer(puzzle, answer),
   }),
   merge_5120: Object.freeze({
     key: "merge_5120",
@@ -8282,7 +8838,9 @@ const GAME_HANDLERS = Object.freeze({
   sudoku: Object.freeze({
     key: "sudoku",
     createPuzzle: () => generateSudokuPuzzle(),
-    validateAnswer: (puzzle, answer) => validateSudokuAnswer(puzzle, answer),
+    validateAnswer: (puzzle, answer) => Number(puzzle?.infiniteStage || 0) > 0
+      ? validateInfiniteSudokuAnswer(puzzle, answer)
+      : validateSudokuAnswer(puzzle, answer),
   }),
   nonogram: Object.freeze({
     key: "nonogram",
@@ -10077,6 +10635,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     }
     const mergeInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "merge_5120";
     const digitHuntInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "digit_hunt";
+    const digitAttackInfiniteSingleRun = challenge.mode === "infinite" && gameKey === "digit_attack";
     const infiniteStageJumpTest = challenge.mode === "infinite" && challenge.result?.testStageJump === true;
     let replayedMergeState = null;
     let replayedDigitHuntState = null;
@@ -10372,6 +10931,19 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
           [req.auth.sub, gameKey, gameScore]
         );
         infiniteRunScore = gameScore;
+      } else if (digitAttackInfiniteSingleRun) {
+        // Rakam Saldırısı Sonsuz Mod artık aşamasız tek koşudur. Challenge başarıyla
+        // tamamlanırsa bile kalıcı next-stage state'i 2'ye ilerletilmez.
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_run_score = 0,
+               infinite_next_stage = 1,
+               updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey]
+        );
+        infiniteRunScore = 0;
+        awardedXp = 0;
       } else {
         const completedStage = Math.max(1, Math.min(Number(challenge.stage || 1), 1000));
         const newHighStage = Math.max(oldHighScore, completedStage);
@@ -10396,7 +10968,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
 
       rewards = {
         ...rewards,
-        infiniteDelta: mergeInfiniteSingleRun ? 0 : infiniteRunScore,
+        infiniteDelta: (mergeInfiniteSingleRun || digitAttackInfiniteSingleRun) ? 0 : infiniteRunScore,
         xpDelta: awardedXp,
       };
       if (awardedXp > 0) {
@@ -10452,7 +11024,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       generalDelta: Number(rewards.generalDelta || 0),
       infiniteDelta: Number(rewards.infiniteDelta || 0),
       xpDelta: Number(rewards.xpDelta || 0),
-      runScore: mergeInfiniteSingleRun ? 0 : Number(state.runScore || infiniteRunScore || 0),
+      runScore: (mergeInfiniteSingleRun || digitAttackInfiniteSingleRun) ? 0 : Number(state.runScore || infiniteRunScore || 0),
       won,
       outcomeReason,
       elapsedServerMs,
