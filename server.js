@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v28-20260919";
+const SERVER_BUILD_ID = "shared-game-flow-v29-20260923";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -2345,8 +2345,8 @@ const GAME_DEFINITIONS = Object.freeze({
     roundDurationMs: 5 * 60 * 1000,
     hundredStageDurationMs: 90 * 1000,
     botScoreTimingSeconds: Object.freeze({
-      million70: [7, 30], million30: [9, 40],
-      hundredThousand: [9, 60], tenThousand: [30, 90], thousand: [60, 120],
+      million70: [4, 27], million30: [7, 35],
+      hundredThousand: [7, 45], tenThousand: [15, 80], thousand: [60, 120],
     }),
     infiniteDifficultyForStage: () => "Standard",
   }),
@@ -2665,9 +2665,10 @@ function chooseEqualSumInitialIndices() {
   return [0, 1, 4, 6, 9, 11, 14, 15];
 }
 
-function generateEqualSumPuzzle() {
+function generateEqualSumPuzzle(maxTargetInclusive = 50) {
+  const safeMaxTarget = Math.max(12, Math.min(50, Math.floor(Number(maxTargetInclusive || 50))));
   for (let targetAttempt = 0; targetAttempt < 120; targetAttempt += 1) {
-    const target = secureRandomInt(12, 51);
+    const target = secureRandomInt(12, safeMaxTarget + 1);
     const solution = generateEqualSumSolution(target);
     if (!solution) continue;
     const fixedIndices = new Set(chooseEqualSumInitialIndices());
@@ -2889,13 +2890,46 @@ function generateNextNumberPuzzle() {
   };
 }
 
+function generateTwoPlayerNextNumberPuzzle() {
+  const ruleTypes = ["multiply_plus", "multiply_minus", "plus_then_multiply", "minus_then_multiply"];
+  const maxValue = 200;
+
+  for (let attempt = 0; attempt < 12000; attempt += 1) {
+    const multiplier = secureRandomInt(2, 13);
+    const ruleType = ruleTypes[secureRandomInt(0, ruleTypes.length)];
+    // Normal İkili Oyun'da (sayı ± y) × x ailesinde y kesinlikle 1'dir.
+    const offsets = (ruleType === "plus_then_multiply" || ruleType === "minus_then_multiply")
+      ? [1, 1, 1]
+      : generateNextNumberOffsetSeries(ruleType);
+    const first = secureRandomInt(1, 21);
+    const sequence = [first];
+
+    for (let index = 0; index < 3; index += 1) {
+      const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offsets[index], ruleType);
+      if (!Number.isInteger(next) || next <= 0 || next > maxValue) break;
+      sequence.push(next);
+    }
+    if (sequence.length !== 4 || new Set(sequence).size !== 4) continue;
+    return {
+      gameKey: "next_number", difficulty: "Standard", target: sequence[3],
+      numbers: sequence.slice(0, 3), initialGrid: [], twoPlayerVariant: true,
+    };
+  }
+
+  return {
+    gameKey: "next_number", difficulty: "Standard", target: 38,
+    numbers: [3, 8, 18], initialGrid: [], twoPlayerVariant: true,
+  };
+}
+
 function validateNextNumberChallengeAnswer(puzzle, answer = {}) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const target = Number(puzzle?.target);
   const submitted = Number(answer?.nextNumber);
+  const maxValue = puzzle?.twoPlayerVariant === true ? 200 : NEXT_NUMBER_MAX_VALUE;
   if (numbers.length !== 3 || numbers.some((value) => !Number.isInteger(value))) return false;
-  if (!Number.isInteger(target) || target < NEXT_NUMBER_MIN_VALUE || target > NEXT_NUMBER_MAX_VALUE) return false;
-  if (numbers.some((value) => value <= 0 || value > NEXT_NUMBER_MAX_VALUE) || target <= 0) return false;
+  if (!Number.isInteger(target) || target < NEXT_NUMBER_MIN_VALUE || target > maxValue) return false;
+  if (numbers.some((value) => value <= 0 || value > maxValue) || target <= 0) return false;
   if (new Set([...numbers, target]).size !== 4) return false;
   return Number.isInteger(submitted) && submitted === target;
 }
@@ -3603,6 +3637,14 @@ function validateEquationHuntChallengeAnswer(puzzle, answer = {}) {
 
 function generatePuzzleForGame(gameKey, difficultyValue) {
   return gameHandler(gameKey).createPuzzle(difficultyValue);
+}
+
+function generateTwoPlayerPuzzleForGame(gameKey, difficultyValue) {
+  const baseGameKey = normalizeBaseGameKey(gameKey);
+  if (baseGameKey === "equal_sum") return generateEqualSumPuzzle(40);
+  if (baseGameKey === "ratio_proportion") return generateTwoPlayerRatioProportionPuzzle();
+  if (baseGameKey === "next_number") return generateTwoPlayerNextNumberPuzzle();
+  return generatePuzzleForGame(gameKey, difficultyValue);
 }
 
 function generateSecurePuzzle(difficultyValue) {
@@ -5199,6 +5241,16 @@ function createTwoPlayerBotFinishMs(finishProfile = {}, gameKey = "target_number
   const profile = normalizeTwoPlayerFinishProfile(finishProfile);
   const config = gameDefinition(gameKey);
   const absoluteMaxMs = Math.max(BOT_MIN_FINISH_MS, Number(config.roundDurationMs || 300_000) - 1);
+
+  // Oran Orantı'da kullanıcının puanı 10 bin ve üzerindeyse istenen yeni bantlar
+  // ilk bot maçından itibaren doğrudan geçerlidir. 10 bin altındaki puanlarda ise
+  // mevcut ilk-5 ve eski düşük-puan davranışı aynen korunur.
+  if (normalizeBaseGameKey(gameKey) === "ratio_proportion" && profile.generalScore >= 10_000) {
+    const ratioRange = botScoreTimingRangeSeconds(config, profile.generalScore);
+    if (Array.isArray(ratioRange) && ratioRange.length >= 2) {
+      return secureBotFinishMsFromSecondRange(ratioRange, absoluteMaxMs);
+    }
+  }
 
   // Mevcut oyun-bazlı finishCount yalnız ilk 5 kalibrasyon karşılaşmasını saymak için kullanılır.
   // Oyuncunun averageFinishMs değeri hiçbir koşulda bot süresine etki etmez.
@@ -7062,8 +7114,12 @@ function evaluateResultFindExactNonNegative(nums, ops, ranges) {
   // açıkça kontrol ederek gelecekteki üretici değişikliklerine karşı kuralı sabitliyoruz.
   for (let i = 0; i < operators.length;) {
     if (operators[i] === 2 || operators[i] === 3) {
-      const value = resultFindFractionApply(values[i], operators[i], values[i + 1]);
+      const operation = operators[i];
+      const value = resultFindFractionApply(values[i], operation, values[i + 1]);
       if (!nonNegative(value)) return null;
+      // Sonucu Bul'da bölme hiçbir modda kesirli ara sonuç üretemez.
+      // Bu özellikle parantez ile bağlı ÷ işlemlerini de tam sayıya zorlar.
+      if (operation === 3 && value.d !== 1n) return null;
       values.splice(i, 2, value);
       operators.splice(i, 1);
     } else {
@@ -7083,36 +7139,47 @@ function evaluateResultFindExactNonNegative(nums, ops, ranges) {
 }
 
 function generateResultFindPuzzle() {
-  for (let attempt = 0; attempt < 3000; attempt += 1) {
-    const count = secureRandomInt(8, 11);
-    const nums = Array.from({ length: count }, () => secureRandomInt(2, 31)); // en fazla 30
-    const highPriorityOp = secureRandomInt(0, 2) === 0 ? 2 : 3; // bulmaca genelinde ya × ya ÷
-    const ops = Array.from({ length: count - 1 }, () => [0, 1, highPriorityOp][secureRandomInt(0, 3)]);
+  // Sonsuz dışındaki bütün modlar: tam 7 sayı ve iki parantezli grup.
+  // Her parantezin iç sonucu 1..10, hiçbir standart-öncelik ara sonucu negatif değil
+  // ve tüm bölmeler tam sayı sonuçlu olmak zorundadır.
+  const count = 7;
+  const ranges = [[0, 1], [5, 6]];
+  for (let attempt = 0; attempt < 30000; attempt += 1) {
+    const nums = Array.from({ length: count }, () => secureRandomInt(2, 31));
+    const ops = Array.from({ length: count - 1 }, () => secureRandomInt(0, 4));
 
-    // Parantezleri ifadenin iki ucuna yerleştirerek her parantez grubunun yalnız bir dış işlemi
-    // olmasını garanti ederiz. Böylece tek bir parantezli sayı grubu hem × hem ÷ ile bağlanmaz.
-    const ranges = [[0, 1], [count - 2, count - 1]];
-    ops[0] = 0;                 // ilk parantezin içi +
-    ops[count - 2] = 1;         // ikinci parantezin içi −
-    ops[1] = highPriorityOp;     // ilk parantezin tek dış bağlantısı
-    ops[count - 3] = highPriorityOp; // ikinci parantezin tek dış bağlantısı
+    for (const [start, end] of ranges) {
+      ops[start] = secureRandomInt(0, 2); // parantez içi yalnız + veya -
+      if (ops[start] === 0) {
+        // 1..10 aralığında toplam; sayılar en az 2 olduğundan fiilen 4..10 oluşur.
+        nums[start] = secureRandomInt(2, 9);
+        nums[end] = secureRandomInt(2, 11 - nums[start]);
+      } else {
+        // 1..10 aralığında pozitif çıkarma.
+        nums[end] = secureRandomInt(2, 21);
+        const maxDiff = Math.min(10, 30 - nums[end]);
+        if (maxDiff < 1) { nums[end] = 2; nums[start] = 3; }
+        else nums[start] = nums[end] + secureRandomInt(1, maxDiff + 1);
+      }
+      const inner = resultFindApply(nums[start], ops[start], nums[end]);
+      if (!Number.isInteger(inner) || inner < 1 || inner > 10) continue;
+    }
 
-    // Her iki parantezin iç sonucu da pozitif olmalı. İlk grup toplama olduğu için zaten
-    // pozitiftir; ikinci grup çıkarma olduğundan soldaki sayı sağdakinden büyük olmalıdır.
-    if (nums[count - 2] <= nums[count - 1]) continue;
-    const firstParen = resultFindApply(nums[0], ops[0], nums[1]);
-    const secondParen = resultFindApply(nums[count - 2], ops[count - 2], nums[count - 1]);
-    if (!(firstParen > 0) || !(secondParen > 0)) continue;
-
-    const exactResult = evaluateResultFindExact(nums, ops, ranges);
+    const exactResult = evaluateResultFindExactNonNegative(nums, ops, ranges);
     if (!exactResult || exactResult.d !== 1n) continue;
     if (exactResult.n <= 0n || exactResult.n > 100n) continue;
+
     const integerResult = Number(exactResult.n);
-    const encoding = [count, ...nums, ...ops, ranges[0][0], ranges[0][1], ranges[1][0], ranges[1][1]];
+    const encoding = [count, ...nums, ...ops, 2, ...ranges.flat()];
     return { difficulty: "Standard", target: integerResult, numbers: encoding, gameKey: "result_find", initialGrid: [] };
   }
-  // (6+4) × 3 - 2 + 5 - 2 + (8-4) = 35; sayılar <=30, sonuç <=100, yalnız × kullanılır.
-  return { difficulty: "Standard", target: 35, numbers: [8,6,4,3,2,5,2,8,4,0,2,1,0,1,0,1,0,1,6,7], gameKey: "result_find", initialGrid: [] };
+
+  // (6+4) × 3 + 8 - 2 × (5-2) = 32. Parantez sonuçları 10 ve 3; ara sonuçlar negatife düşmez.
+  return {
+    difficulty: "Standard", target: 32,
+    numbers: [7, 6,4,3,8,2,5,2, 0,2,0,1,2,1, 2,0,1,5,6],
+    gameKey: "result_find", initialGrid: [],
+  };
 }
 
 
@@ -7268,66 +7335,81 @@ function ratioProportionBaseAllowed(numerator, denominator) {
 function ratioPuzzleEncodingValid(puzzle) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
-  if (Number(puzzle?.target) !== 6 || numbers.length !== 12 || initialGrid.length !== 12) return false;
+  const pairCount = Number(puzzle?.target);
+  if (![4, 6].includes(pairCount) || numbers.length !== pairCount * 2 || initialGrid.length !== pairCount * 2) return false;
   if (numbers.some((value) => !Number.isInteger(value) || value <= 0 || value > 100)) return false;
-  if (initialGrid.filter((value) => value !== null && value !== undefined).length !== 5) return false;
-  for (let i = 0; i < 12; i += 1) {
+  if (initialGrid.filter((value) => value !== null && value !== undefined).length !== pairCount - 1) return false;
+  for (let i = 0; i < numbers.length; i += 1) {
     if (initialGrid[i] !== null && initialGrid[i] !== undefined && Number(initialGrid[i]) !== numbers[i]) return false;
   }
   const n0 = numbers[0];
   const d0 = numbers[1];
   if (!ratioProportionBaseAllowed(n0, d0)) return false;
   const numerators = [];
-  for (let pair = 0; pair < 6; pair += 1) {
+  for (let pair = 0; pair < pairCount; pair += 1) {
     const n = numbers[pair * 2];
     const d = numbers[pair * 2 + 1];
     if (n * d0 !== n0 * d) return false;
     numerators.push(n);
   }
-  return new Set(numerators).size === 6;
+  return new Set(numerators).size === pairCount;
 }
 
-function generateRatioProportionPuzzle() {
-  for (let attempt = 0; attempt < 1000; attempt += 1) {
+function generateRatioProportionPuzzle(pairCount = 6, fixedCount = 5, maxValue = 100, twoPlayerVariant = false) {
+  const safePairCount = pairCount === 4 ? 4 : 6;
+  const safeFixedCount = Math.max(0, Math.min(safePairCount * 2, Number(fixedCount) || (safePairCount - 1)));
+  const safeMaxValue = Math.max(12, Math.min(100, Number(maxValue) || 100));
+  for (let attempt = 0; attempt < 2000; attempt += 1) {
     const [numerator, denominator] = RATIO_PROPORTION_ALLOWED_BASES[
       secureRandomInt(0, RATIO_PROPORTION_ALLOWED_BASES.length)
     ];
-    const maxMultiplier = Math.floor(100 / Math.max(numerator, denominator));
-    if (maxMultiplier < 6) continue;
-    const multipliers = shuffled(Array.from({ length: maxMultiplier }, (_, i) => i + 1)).slice(0, 6);
+    const maxMultiplier = Math.floor(safeMaxValue / Math.max(numerator, denominator));
+    if (maxMultiplier < safePairCount) continue;
+    const multipliers = shuffled(Array.from({ length: maxMultiplier }, (_, i) => i + 1)).slice(0, safePairCount);
     const numbers = [];
-    for (const multiplier of multipliers) {
-      numbers.push(numerator * multiplier, denominator * multiplier);
-    }
-    const fixed = new Set(shuffled(Array.from({ length: 12 }, (_, i) => i)).slice(0, 5));
+    for (const multiplier of multipliers) numbers.push(numerator * multiplier, denominator * multiplier);
+    const fixed = new Set(shuffled(Array.from({ length: safePairCount * 2 }, (_, i) => i)).slice(0, safeFixedCount));
     const initialGrid = numbers.map((value, index) => fixed.has(index) ? value : null);
-    const puzzle = { difficulty: "Standard", target: 6, numbers, gameKey: "ratio_proportion", initialGrid };
+    const puzzle = {
+      difficulty: "Standard", target: safePairCount, numbers, gameKey: "ratio_proportion", initialGrid,
+      ...(twoPlayerVariant ? { twoPlayerVariant: true } : {}),
+    };
     if (ratioPuzzleEncodingValid(puzzle)) return puzzle;
   }
+  if (safePairCount === 4) {
+    return {
+      difficulty: "Standard", target: 4, numbers: [1,2,2,4,3,6,4,8], gameKey: "ratio_proportion",
+      initialGrid: [1,null,null,4,3,null,null,null], twoPlayerVariant: true,
+    };
+  }
   return {
-    difficulty: "Standard",
-    target: 6,
-    numbers: [1,2,2,4,3,6,4,8,5,10,6,12],
-    gameKey: "ratio_proportion",
+    difficulty: "Standard", target: 6,
+    numbers: [1,2,2,4,3,6,4,8,5,10,6,12], gameKey: "ratio_proportion",
     initialGrid: [1,null,null,4,3,null,null,8,null,null,6,null],
   };
 }
 
+function generateTwoPlayerRatioProportionPuzzle() {
+  // Normal İkili Oyun: 4 orantı (8 sayı), başlangıçta 3 hazır taş.
+  return generateRatioProportionPuzzle(4, 3, 30, true);
+}
+
 function validateRatioProportionAnswer(puzzle, answer = {}) {
   if (!ratioPuzzleEncodingValid(puzzle)) return false;
+  const pairCount = Number(puzzle?.target);
   const grid = Array.isArray(answer?.grid) ? answer.grid.map(Number) : [];
-  if (grid.length !== 12 || grid.some((value) => !Number.isInteger(value) || value <= 0 || value > 100)) return false;
+  if (grid.length !== pairCount * 2 || grid.some((value) => !Number.isInteger(value) || value <= 0 || value > 100)) return false;
   if (integerMultisetKey(grid) !== integerMultisetKey(puzzle.numbers)) return false;
   const n0 = grid[0];
   const d0 = grid[1];
   const numerators = [];
-  for (let pair = 0; pair < 6; pair += 1) {
+  for (let pair = 0; pair < pairCount; pair += 1) {
     const n = grid[pair * 2];
     const d = grid[pair * 2 + 1];
     if (n * d0 !== n0 * d) return false;
     numerators.push(n);
   }
-  return new Set(numerators).size === 6;
+  return new Set(numerators).size === pairCount;
 }
 
 function totalMatchPuzzleEncodingValid(puzzle) {
@@ -10401,7 +10483,9 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
       };
     }
 
-    const puzzle = generatePuzzleForGame(gameKey, difficulty);
+    const puzzle = tournamentMode
+      ? generatePuzzleForGame(gameKey, difficulty)
+      : generateTwoPlayerPuzzleForGame(gameKey, difficulty);
     const basePlan = tournamentMode
       ? createTournamentBotPlan(gameKey, stage)
       : createGameAwareBotPlan(gameKey, difficulty, finishProfile || {}, "two_player");
@@ -12829,7 +12913,11 @@ function scheduleRealtimeRound(room, prepareMs = 3_000) {
   if (room.deadlineHandle) clearTimeout(room.deadlineHandle);
   if (room.botFinishHandle) clearTimeout(room.botFinishHandle);
 
-  room.puzzle = room.puzzles[room.roundIndex] || generatePuzzleForGame(room.gameKey, room.difficulty);
+  room.puzzle = room.puzzles[room.roundIndex] || (
+    room.isFriend || String(room.gameKey || "").endsWith("_tournament") || String(room.gameKey || "").endsWith("_hundred")
+      ? generatePuzzleForGame(room.gameKey, room.difficulty)
+      : generateTwoPlayerPuzzleForGame(room.gameKey, room.difficulty)
+  );
   const safePrepareMs = Math.max(0, Math.min(Number(prepareMs || 0), 30_000));
   room.startsAtMillis = Date.now() + safePrepareMs;
 
@@ -13115,7 +13203,11 @@ function createRealtimeRoom(
     : normalizeRoundCount(roundCountValue);
   const puzzles = Array.isArray(suppliedPuzzles) && suppliedPuzzles.length >= roundCount
     ? suppliedPuzzles.slice(0, roundCount)
-    : [puzzle, ...Array.from({ length: Math.max(0, roundCount - 1) }, () => generatePuzzleForGame(gameKey, difficulty))];
+    : [puzzle, ...Array.from({ length: Math.max(0, roundCount - 1) }, () =>
+        String(gameKey || "").endsWith("_tournament") || String(gameKey || "").endsWith("_hundred")
+          ? generatePuzzleForGame(gameKey, difficulty)
+          : generateTwoPlayerPuzzleForGame(gameKey, difficulty)
+      )];
   const room = {
     roomId,
     gameKey,
@@ -14031,7 +14123,7 @@ io.on("connection", (socket) => {
       leaveRoomAsCancel(socket);
 
       const listingId = `real:${crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString("hex")}`;
-      const tablePuzzles = Array.from({ length: roundCount }, () => generatePuzzleForGame(gameKey, difficulty));
+      const tablePuzzles = Array.from({ length: roundCount }, () => generateTwoPlayerPuzzleForGame(gameKey, difficulty));
       publicOpenTables.set(listingId, {
         listingId,
         ownerSocketId: socket.id,
@@ -14236,7 +14328,7 @@ io.on("connection", (socket) => {
           return;
         }
         if (!botTable.stateless) generatedLobbyBots.delete(listingId);
-        const botPuzzles = Array.from({ length: botTable.roundCount }, () => generatePuzzleForGame(gameKey, botTable.difficulty));
+        const botPuzzles = Array.from({ length: botTable.roundCount }, () => generateTwoPlayerPuzzleForGame(gameKey, botTable.difficulty));
         const room = createRealtimeRoom(
           socket, player, null, botTable.player, normalizeBaseGameKey(gameKey), botTable.difficulty,
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
@@ -14307,7 +14399,9 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const puzzle = generatePuzzleForGame(gameKey, difficulty);
+      const puzzle = gameKey.endsWith("_tournament")
+        ? generatePuzzleForGame(gameKey, difficulty)
+        : generateTwoPlayerPuzzleForGame(gameKey, difficulty);
       let requestedStake = 0;
       if (!gameKey.endsWith("_tournament")) {
         try {
