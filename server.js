@@ -7042,6 +7042,46 @@ function evaluateResultFindExact(nums, ops, ranges) {
   return result;
 }
 
+function evaluateResultFindExactNonNegative(nums, ops, ranges) {
+  const values = nums.map((value) => ({ n: BigInt(value), d: 1n }));
+  const operators = ops.slice();
+  const groups = ranges.slice().sort((a, b) => b[0] - a[0]);
+  const nonNegative = (value) => value && value.d > 0n && value.n >= 0n;
+
+  // Standart işlem önceliğinde önce parantezler çözülür. Her parantez ara sonucu
+  // sıfırın altında olamaz (parantez içi için mevcut daha sıkı >0 kuralı ayrıca korunur).
+  for (const [start, end] of groups) {
+    if (end !== start + 1 || start < 0 || end >= values.length) return null;
+    const inner = resultFindFractionApply(values[start], operators[start], values[end]);
+    if (!nonNegative(inner)) return null;
+    values.splice(start, 2, inner);
+    operators.splice(start, 1);
+  }
+
+  // Sonra çarpma/bölmeler. Pozitif girdiler normalde negatife düşmez; yine de burada
+  // açıkça kontrol ederek gelecekteki üretici değişikliklerine karşı kuralı sabitliyoruz.
+  for (let i = 0; i < operators.length;) {
+    if (operators[i] === 2 || operators[i] === 3) {
+      const value = resultFindFractionApply(values[i], operators[i], values[i + 1]);
+      if (!nonNegative(value)) return null;
+      values.splice(i, 2, value);
+      operators.splice(i, 1);
+    } else {
+      i += 1;
+    }
+  }
+
+  // En son toplama/çıkarma soldan sağa yürür. Örn. 71 - 27×3 ifadesinde 27×3=81
+  // olduktan sonra 71-81=-10 ara sonucu oluşacağı için bulmaca reddedilir.
+  let result = values[0];
+  if (!nonNegative(result)) return null;
+  for (let i = 0; i < operators.length; i += 1) {
+    result = resultFindFractionApply(result, operators[i], values[i + 1]);
+    if (!nonNegative(result)) return null;
+  }
+  return result;
+}
+
 function generateResultFindPuzzle() {
   for (let attempt = 0; attempt < 3000; attempt += 1) {
     const count = secureRandomInt(8, 11);
@@ -7153,7 +7193,7 @@ function generateInfiniteResultFindPuzzle(stageValue) {
       }
     }
     if (!resultFindRangesValidForConfig(nums, ops, ranges, cfg)) continue;
-    const exact = evaluateResultFindExact(nums, ops, ranges);
+    const exact = evaluateResultFindExactNonNegative(nums, ops, ranges);
     if (!exact || exact.d !== 1n || exact.n <= 0n || exact.n > BigInt(cfg.resultMax)) continue;
     const encoding = [cfg.count, ...nums, ...ops, cfg.parens, ...ranges.flat()];
     return { difficulty:"Standard", target:Number(exact.n), numbers:encoding, gameKey:"result_find", initialGrid:[], infiniteStage:stage };
@@ -10678,6 +10718,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
     const infiniteStageJumpTest = challenge.mode === "infinite" && challenge.result?.testStageJump === true;
     let replayedMergeState = null;
     let replayedDigitHuntState = null;
+    let digitAttackEvaluation = null;
 
     if (gameKey === "merge_5120") {
       const mergeAnswer = req.body?.answer || {};
@@ -10743,6 +10784,12 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         const error = new Error("RAKAM AVI sonsuz oyunu yalnız geçerli hamle kalmadığında tamamlanabilir.");
         error.statusCode = 422;
         throw error;
+      }
+    } else if (gameKey === "digit_attack") {
+      digitAttackEvaluation = digitAttackEvaluateAnswer(challenge.puzzle, req.body?.answer || {});
+      if (!digitAttackEvaluation || !digitAttackEvaluation.terminal ||
+          !validateDigitAttackChallengeAnswer(challenge.puzzle, req.body?.answer || {})) {
+        const error = new Error("Rakam Saldırısı sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
       }
     } else if (!validateChallengeAnswer(challenge.puzzle, req.body.numberSlots, req.body.operators, req.body.answer)) {
       const error = new Error("Oyun sonucu sunucuda doğrulanamadı."); error.statusCode = 422; throw error;
@@ -10889,12 +10936,39 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
 
     if (challenge.mode === "infinite" && !answerWon) {
       await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
-      await client.query(
-        `UPDATE player_game_progress
-         SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey]
-      );
+
+      if (digitAttackInfiniteSingleRun) {
+        // Rakam Saldırısı Sonsuz puanı = oyuncunun bugüne kadar ulaştığı en yüksek dalga.
+        // Üçüncü yanlışın geldiği terminal dalga da ulaşılan dalga olarak sayılır.
+        const reachedWave = Math.max(0, Math.min(
+          Number(digitAttackEvaluation?.correct || 0) + Number(digitAttackEvaluation?.mistakes || 0),
+          Array.isArray(challenge.puzzle?.numbers)
+            ? Math.floor(challenge.puzzle.numbers.length / DIGIT_ATTACK_WAVE_STRIDE)
+            : 0
+        ));
+        const progressBefore = await client.query(
+          `SELECT infinite_score FROM player_game_progress
+           WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
+          [req.auth.sub, gameKey]
+        );
+        const oldHighWave = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
+        if (reachedWave > oldHighWave) {
+          await applyGameInfiniteHighScoreInTransaction(client, req.auth.sub, gameKey, reachedWave);
+        }
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_run_score = $3, infinite_next_stage = 1, updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey, reachedWave]
+        );
+      } else {
+        await client.query(
+          `UPDATE player_game_progress
+           SET infinite_run_score = 0, infinite_next_stage = 1, updated_at = NOW()
+           WHERE player_id = $1 AND game_key = $2`,
+          [req.auth.sub, gameKey]
+        );
+      }
       state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
       await recordTaskEventInTransaction(client, {
         playerId: req.auth.sub,
@@ -10907,7 +10981,10 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       const response = {
         ok: true, gameKey, ...state,
         generalDelta: 0, infiniteDelta: 0, xpDelta: 0,
-        runScore: 0, won: false, outcomeReason: wrongAnswerReason, elapsedServerMs,
+        runScore: digitAttackInfiniteSingleRun
+          ? Math.max(0, Number(digitAttackEvaluation?.correct || 0) + Number(digitAttackEvaluation?.mistakes || 0))
+          : 0,
+        won: false, outcomeReason: wrongAnswerReason, elapsedServerMs,
       };
       await client.query(
         `UPDATE secure_game_challenges SET completed_at = NOW(), result = $2::jsonb WHERE challenge_id = $1`,
@@ -10971,17 +11048,26 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         );
         infiniteRunScore = gameScore;
       } else if (digitAttackInfiniteSingleRun) {
-        // Rakam Saldırısı Sonsuz Mod artık aşamasız tek koşudur. Challenge başarıyla
-        // tamamlanırsa bile kalıcı next-stage state'i 2'ye ilerletilmez.
+        // Rakam Saldırısı aşamasız tek koşudur. Sonsuz puan, bu koşuda ulaşılan dalga
+        // ile kişisel en yüksek dalganın maksimumudur; next-stage her zaman 1 kalır.
+        const reachedWave = Math.max(0, Math.min(
+          Number(digitAttackEvaluation?.correct || 0) + Number(digitAttackEvaluation?.mistakes || 0),
+          Array.isArray(challenge.puzzle?.numbers)
+            ? Math.floor(challenge.puzzle.numbers.length / DIGIT_ATTACK_WAVE_STRIDE)
+            : 0
+        ));
+        if (reachedWave > oldHighScore) {
+          await applyGameInfiniteHighScoreInTransaction(client, req.auth.sub, gameKey, reachedWave);
+        }
         await client.query(
           `UPDATE player_game_progress
-           SET infinite_run_score = 0,
+           SET infinite_run_score = $3,
                infinite_next_stage = 1,
                updated_at = NOW()
            WHERE player_id = $1 AND game_key = $2`,
-          [req.auth.sub, gameKey]
+          [req.auth.sub, gameKey, reachedWave]
         );
-        infiniteRunScore = 0;
+        infiniteRunScore = reachedWave;
         awardedXp = 0;
       } else {
         const completedStage = Math.max(1, Math.min(Number(challenge.stage || 1), 1000));
@@ -11063,7 +11149,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       generalDelta: Number(rewards.generalDelta || 0),
       infiniteDelta: Number(rewards.infiniteDelta || 0),
       xpDelta: Number(rewards.xpDelta || 0),
-      runScore: (mergeInfiniteSingleRun || digitAttackInfiniteSingleRun) ? 0 : Number(state.runScore || infiniteRunScore || 0),
+      runScore: mergeInfiniteSingleRun ? 0 : Number(
+        digitAttackInfiniteSingleRun ? infiniteRunScore : (state.runScore || infiniteRunScore || 0)
+      ),
       won,
       outcomeReason,
       elapsedServerMs,
