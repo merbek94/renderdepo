@@ -7139,45 +7139,97 @@ function evaluateResultFindExactNonNegative(nums, ops, ranges) {
 }
 
 function generateResultFindPuzzle() {
-  // Sonsuz dışındaki bütün modlar: tam 7 sayı ve iki parantezli grup.
-  // Her parantezin iç sonucu 1..10, hiçbir standart-öncelik ara sonucu negatif değil
-  // ve tüm bölmeler tam sayı sonuçlu olmak zorundadır.
+  // Sonsuz dışındaki bütün modlar: tam 7 sayı ve TAM 1 parantezli grup.
+  // Parantez içi yalnız +/− ve sonucu 1..10'dur. Parantezin dışarıyla yalnız bir
+  // ×/÷ bağlantısı vardır; bu bağlantıdaki dış sayı öbür tarafında tekrar ×/÷
+  // bağlantısına giremez. Standart işlem önceliğinin hiçbir ara sonucu negatif
+  // olamaz ve tüm bölmeler tam sayı sonuçlu olmak zorundadır.
   const count = 7;
-  const ranges = [[0, 1], [5, 6]];
-  for (let attempt = 0; attempt < 30000; attempt += 1) {
+
+  for (let attempt = 0; attempt < 40000; attempt += 1) {
     const nums = Array.from({ length: count }, () => secureRandomInt(2, 31));
     const ops = Array.from({ length: count - 1 }, () => secureRandomInt(0, 4));
+    const start = secureRandomInt(0, count - 1);
+    const end = start + 1;
+    const ranges = [[start, end]];
 
-    for (const [start, end] of ranges) {
-      ops[start] = secureRandomInt(0, 2); // parantez içi yalnız + veya -
-      if (ops[start] === 0) {
-        // 1..10 aralığında toplam; sayılar en az 2 olduğundan fiilen 4..10 oluşur.
-        nums[start] = secureRandomInt(2, 9);
-        nums[end] = secureRandomInt(2, 11 - nums[start]);
-      } else {
-        // 1..10 aralığında pozitif çıkarma.
-        nums[end] = secureRandomInt(2, 21);
-        const maxDiff = Math.min(10, 30 - nums[end]);
-        if (maxDiff < 1) { nums[end] = 2; nums[start] = 3; }
-        else nums[start] = nums[end] + secureRandomInt(1, maxDiff + 1);
-      }
-      const inner = resultFindApply(nums[start], ops[start], nums[end]);
-      if (!Number.isInteger(inner) || inner < 1 || inner > 10) continue;
+    // Parantez içini doğrudan 1..10 aralığında üret.
+    ops[start] = secureRandomInt(0, 2); // 0:+, 1:-
+    if (ops[start] === 0) {
+      nums[start] = secureRandomInt(2, 9);
+      nums[end] = secureRandomInt(2, 11 - nums[start]);
+    } else {
+      nums[end] = secureRandomInt(2, 21);
+      const maxDiff = Math.min(10, 30 - nums[end]);
+      if (maxDiff < 1) continue;
+      nums[start] = nums[end] + secureRandomInt(1, maxDiff + 1);
     }
+    const inner = resultFindApply(nums[start], ops[start], nums[end]);
+    if (!Number.isInteger(inner) || inner < 1 || inner > 10) continue;
+
+    // Parantezin yalnız bir tarafında ×/÷ bağlantısı olsun.
+    const canLeft = start > 0;
+    const canRight = end < count - 1;
+    if (!canLeft && !canRight) continue;
+    const useLeft = canLeft && (!canRight || secureRandomInt(0, 2) === 0);
+
+    if (useLeft) {
+      const linkOp = start - 1;
+      ops[linkOp] = secureRandomInt(2, 4); // × veya ÷
+      // Parantezin öbür tarafı yüksek öncelikli olamaz.
+      if (end < ops.length) ops[end] = secureRandomInt(0, 2);
+      // Paranteze bağlı dış sayı (start-1) öbür tarafta tekrar ×/÷ olamaz.
+      if (linkOp - 1 >= 0) ops[linkOp - 1] = secureRandomInt(0, 2);
+
+      // Dış sayı ÷ parantez ise sonuç tam sayı olsun.
+      if (ops[linkOp] === 3) {
+        const multiplier = secureRandomInt(1, Math.max(2, Math.floor(30 / inner) + 1));
+        nums[start - 1] = inner * multiplier;
+        if (nums[start - 1] < 2 || nums[start - 1] > 30) continue;
+      }
+    } else {
+      const linkOp = end;
+      ops[linkOp] = secureRandomInt(2, 4); // × veya ÷
+      if (start - 1 >= 0) ops[start - 1] = secureRandomInt(0, 2);
+      // Paranteze bağlı dış sayı (end+1) öbür tarafta tekrar ×/÷ olamaz.
+      if (linkOp + 1 < ops.length) ops[linkOp + 1] = secureRandomInt(0, 2);
+
+      // Parantez ÷ dış sayı ise tam sayı bölüm üret.
+      if (ops[linkOp] === 3) {
+        const divisors = [];
+        for (let value = 2; value <= Math.min(30, inner); value += 1) {
+          if (inner % value === 0) divisors.push(value);
+        }
+        if (divisors.length === 0) continue;
+        nums[end + 1] = divisors[secureRandomInt(0, divisors.length)];
+      }
+    }
+
+    // Tam olarak tek dış ×/÷ bağlantısı olduğunu ve dış sayının başka bir ×/÷
+    // zincirine girmediğini tekrar doğrula.
+    const outerCandidates = [];
+    if (start > 0) outerCandidates.push({ opIndex: start - 1, numberIndex: start - 1, side: "left" });
+    if (end < count - 1) outerCandidates.push({ opIndex: end, numberIndex: end + 1, side: "right" });
+    const high = outerCandidates.filter(({ opIndex }) => ops[opIndex] === 2 || ops[opIndex] === 3);
+    if (high.length !== 1) continue;
+    const link = high[0];
+    const otherOpIndex = link.side === "left" ? link.opIndex - 1 : link.opIndex + 1;
+    if (otherOpIndex >= 0 && otherOpIndex < ops.length && (ops[otherOpIndex] === 2 || ops[otherOpIndex] === 3)) continue;
 
     const exactResult = evaluateResultFindExactNonNegative(nums, ops, ranges);
     if (!exactResult || exactResult.d !== 1n) continue;
     if (exactResult.n <= 0n || exactResult.n > 100n) continue;
 
     const integerResult = Number(exactResult.n);
-    const encoding = [count, ...nums, ...ops, 2, ...ranges.flat()];
+    const encoding = [count, ...nums, ...ops, 1, start, end];
     return { difficulty: "Standard", target: integerResult, numbers: encoding, gameKey: "result_find", initialGrid: [] };
   }
 
-  // (6+4) × 3 + 8 - 2 × (5-2) = 32. Parantez sonuçları 10 ve 3; ara sonuçlar negatife düşmez.
+  // (6+4) × 3 + 8 - 2 + 5 - 1 = 40. Tek parantez, tek × bağlantısı;
+  // parantez sonucu 10 ve hiçbir ara sonuç negatife/kesre düşmez.
   return {
-    difficulty: "Standard", target: 32,
-    numbers: [7, 6,4,3,8,2,5,2, 0,2,0,1,2,1, 2,0,1,5,6],
+    difficulty: "Standard", target: 40,
+    numbers: [7, 6,4,3,8,2,5,1, 0,2,0,1,0,1, 1,0,1],
     gameKey: "result_find", initialGrid: [],
   };
 }
