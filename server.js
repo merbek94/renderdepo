@@ -7134,10 +7134,11 @@ function resultFindRangesValidForConfig(nums, ops, ranges, cfg) {
     used.add(start); used.add(end);
     if (![0,1].includes(ops[start])) return false;
     const inner = resultFindApply(nums[start], ops[start], nums[end]);
-    if (!Number.isInteger(inner) || inner <= 0) return false;
+    // Parantez içi sonuç HER ZAMAN pozitif ve 30'dan küçük olmalı.
+    if (!Number.isInteger(inner) || inner <= 0 || inner >= 30) return false;
     const outerCandidates = [];
-    if (start > 0) outerCandidates.push({ opIndex:start-1, numberIndex:start-1 });
-    if (end < nums.length-1) outerCandidates.push({ opIndex:end, numberIndex:end+1 });
+    if (start > 0) outerCandidates.push({ opIndex:start-1, numberIndex:start-1, side:"left" });
+    if (end < nums.length-1) outerCandidates.push({ opIndex:end, numberIndex:end+1, side:"right" });
     const high = outerCandidates.filter(({opIndex}) => ops[opIndex] === 2 || ops[opIndex] === 3);
     // Her parantezin dışarıyla yalnız tek ×/÷ bağlantısı olabilir.
     if (high.length !== 1) return false;
@@ -7146,6 +7147,14 @@ function resultFindRangesValidForConfig(nums, ops, ranges, cfg) {
     if (externalNumbers.has(link.numberIndex)) return false;
     externalNumbers.add(link.numberIndex);
     if (ops[link.opIndex] === 2 && nums[link.numberIndex] > cfg.parenMulMax) return false;
+
+    // Paranteze ×/÷ ile bağlanan dış sayı, öbür tarafında başka bir sayı ile
+    // tekrar ×/÷ ilişkisine giremez. Örn: a × (b+c) × d veya
+    // d × a × (b+c) gibi zincirler bu sayı için yasaktır.
+    const otherOpIndex = link.side === "left" ? link.opIndex - 1 : link.opIndex + 1;
+    if (otherOpIndex >= 0 && otherOpIndex < ops.length && (ops[otherOpIndex] === 2 || ops[otherOpIndex] === 3)) {
+      return false;
+    }
   }
   for (let i = 0; i < ops.length; i += 1) {
     if (ops[i] !== 2) continue;
@@ -7172,15 +7181,35 @@ function generateInfiniteResultFindPuzzle(stageValue) {
       ranges.sort((a,b)=>a[0]-b[0]);
       for (const [start,end] of ranges) {
         ops[start] = secureRandomInt(0,2); // parantez içi + veya -
-        if (ops[start] === 1 && nums[start] <= nums[end]) [nums[start], nums[end]] = [nums[end], nums[start]];
+
+        // Parantez içi sonucu üretim anında 1..29 aralığına zorla.
+        // Böylece doğrulayıcıya bırakılmış şansa bağlı bir <30 durumu kalmaz.
+        if (ops[start] === 0) {
+          // a + b < 30, a/b >= 2
+          const leftMax = Math.min(cfg.valueMax, 27);
+          nums[start] = secureRandomInt(2, leftMax + 1);
+          const rightMax = Math.min(cfg.valueMax, 29 - nums[start]);
+          if (rightMax < 2) { nums[start] = 2; nums[end] = 2; }
+          else nums[end] = secureRandomInt(2, rightMax + 1);
+        } else {
+          // 1 <= a - b <= 29
+          const rightMax = Math.max(2, cfg.valueMax - 1);
+          nums[end] = secureRandomInt(2, rightMax + 1);
+          const maxDiff = Math.min(29, cfg.valueMax - nums[end]);
+          if (maxDiff < 1) { nums[end] = 2; nums[start] = 3; }
+          else nums[start] = nums[end] + secureRandomInt(1, maxDiff + 1);
+        }
+
         const useLeft = start > 0 && (end === cfg.count-1 || secureRandomInt(0,2)===0);
         if (useLeft) {
           ops[start-1] = secureRandomInt(2,4);
-          if (start < ops.length && (ops[start]===2 || ops[start]===3)) ops[start] = secureRandomInt(0,2);
           if (ops[start-1]===2 && nums[start-1] > cfg.parenMulMax) nums[start-1] = secureRandomInt(2, cfg.parenMulMax+1);
+          // Paranteze bağlanan dış sayının diğer tarafı yalnız + veya - olabilir.
+          if (start - 2 >= 0) ops[start-2] = secureRandomInt(0,2);
         } else {
           ops[end] = secureRandomInt(2,4);
           if (end+1 < nums.length && ops[end]===2 && nums[end+1] > cfg.parenMulMax) nums[end+1] = secureRandomInt(2, cfg.parenMulMax+1);
+          if (end + 1 < ops.length) ops[end+1] = secureRandomInt(0,2);
           if (start > 0 && (ops[start-1]===2 || ops[start-1]===3)) ops[start-1] = secureRandomInt(0,2);
         }
       }
