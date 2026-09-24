@@ -8135,7 +8135,7 @@ function digitHuntAnswerFinishedFiniteRun(puzzle, answer = {}) {
 // SONSUZ MOD: AŞAMAYA GÖRE OYUNA ÖZEL BULMACA ÜRETİMİ
 // Bu üreticiler yalnız /game/challenges/start (mode=infinite) tarafından kullanılır.
 // İkili oyun / turnuva / 100 kişilik / arkadaşınla oyna eski createPuzzle akışında kalır.
-// Aşama sınırları: 1-20, 21-40, 41-60, 61-80, 81-100, 101+.
+// Her oyun kendi zorluk bantlarını kullanır; bazı oyunlar 20, bazıları 30 veya 40 aşamalık bantlara ayrılır.
 // ============================================================================
 function infiniteStageBand(stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
@@ -8156,38 +8156,17 @@ function randomInclusive(minValue, maxValue) {
 
 function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
-  const band = infiniteStageBand(stage);
-  const configs = [
-    { count: 3, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 65, operatorMode: "stage1to20" },
-    { count: 4, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 100, operatorMode: "balanced3" },
-    { count: 5, numberMin: 2, numberMax: 10, targetMin: 2, targetMax: 200, operatorMode: "mixed" },
-    { count: 6, numberMin: 2, numberMax: 20, targetMin: 2, targetMax: 400, operatorMode: "mixed" },
-    { count: 7, numberMin: 2, numberMax: 20, targetMin: 2, targetMax: 600, operatorMode: "mixed" },
-    { count: 8, numberMin: 2, numberMax: 50, targetMin: 2, targetMax: 2000, operatorMode: "mixed" },
-  ];
-  const cfg = configs[band];
+  const cfg = stage <= 40
+    ? { count: 3, numberMin: 2, numberMax: 10, targetMin: 0, targetMax: 80 }
+    : stage <= 80
+      ? { count: 4, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 200 }
+      : stage <= 120
+        ? { count: 5, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 250 }
+        : { count: 6, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 300 };
   const allOps = ["+", "−", "×", "÷"];
-  for (let attempt = 0; attempt < 20000; attempt += 1) {
+  for (let attempt = 0; attempt < 30000; attempt += 1) {
     const numbers = Array.from({ length: cfg.count }, () => randomInclusive(cfg.numberMin, cfg.numberMax));
-    let operators;
-    if (cfg.operatorMode === "stage1to20") {
-      // 1-15: iki işlem tam olarak bir toplama + bir çıkarma.
-      // 16-20: işlemlerden biri çarpma/bölme, diğeri toplama/çıkarma.
-      operators = stage <= 15
-        ? shuffled(["+", "−"])
-        : shuffled([
-            ["×", "÷"][secureRandomInt(0, 2)],
-            ["+", "−"][secureRandomInt(0, 2)],
-          ]);
-    } else if (cfg.operatorMode === "balanced3") {
-      operators = shuffled([
-        ["×", "÷"][secureRandomInt(0, 2)],
-        ["+", "−"][secureRandomInt(0, 2)],
-        allOps[secureRandomInt(0, allOps.length)],
-      ]);
-    } else {
-      operators = Array.from({ length: cfg.count - 1 }, () => allOps[secureRandomInt(0, allOps.length)]);
-    }
+    const operators = Array.from({ length: cfg.count - 1 }, () => allOps[secureRandomInt(0, allOps.length)]);
     const orderedNumbers = shuffled(numbers);
     const result = evaluateExpression(orderedNumbers, operators);
     if (result === null || !Number.isFinite(result)) continue;
@@ -8207,14 +8186,11 @@ function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
 }
 
 function infiniteEqualSumConfig(stageValue) {
-  return [
-    { size: 3, minTarget: 10, maxTarget: 20 },
-    { size: 4, minTarget: 12, maxTarget: 30 },
-    { size: 5, minTarget: 24, maxTarget: 48 },
-    { size: 6, minTarget: 30, maxTarget: 60 },
-    { size: 7, minTarget: 40, maxTarget: 80 },
-    { size: 8, minTarget: 50, maxTarget: 200 },
-  ][infiniteStageBand(stageValue)];
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 40) return { size: 3, minTarget: 12, maxTarget: 20, fixedCount: 4, maxFixedPerLine: 2 };
+  if (stage <= 80) return { size: 4, minTarget: 20, maxTarget: 40, fixedCount: 8, maxFixedPerLine: 3 };
+  if (stage <= 120) return { size: 5, minTarget: 30, maxTarget: 60, fixedCount: 12, maxFixedPerLine: 4 };
+  return { size: 6, minTarget: 40, maxTarget: 80, fixedCount: 11, maxFixedPerLine: 2 };
 }
 
 function equalSumInfiniteBaseValues(size, target) {
@@ -8254,16 +8230,21 @@ function buildInfiniteEqualSumSolution(size, target) {
   return grid.flat();
 }
 
-function chooseInfiniteEqualSumFixedIndices(size, fixedCount) {
+function chooseInfiniteEqualSumFixedIndices(size, fixedCount, maxFixedPerLine) {
   const total = size * size;
-  for (let attempt = 0; attempt < 1000; attempt += 1) {
-    const selected = shuffled(Array.from({ length: total }, (_, index) => index)).slice(0, fixedCount);
+  const cap = Math.max(1, Math.min(size - 1, Number(maxFixedPerLine || size - 1)));
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
     const rows = Array(size).fill(0);
     const cols = Array(size).fill(0);
-    selected.forEach((index) => { rows[Math.floor(index / size)] += 1; cols[index % size] += 1; });
-    if (rows.every((count) => count < size) && cols.every((count) => count < size)) return new Set(selected);
+    const selected = [];
+    for (const index of shuffled(Array.from({ length: total }, (_, i) => i))) {
+      const row = Math.floor(index / size), col = index % size;
+      if (rows[row] >= cap || cols[col] >= cap) continue;
+      selected.push(index); rows[row] += 1; cols[col] += 1;
+      if (selected.length === fixedCount) return new Set(selected);
+    }
   }
-  return new Set(Array.from({ length: fixedCount }, (_, index) => index));
+  return null;
 }
 
 function generateInfiniteEqualSumPuzzle(stageValue) {
@@ -8273,8 +8254,9 @@ function generateInfiniteEqualSumPuzzle(stageValue) {
     const target = randomInclusive(cfg.minTarget, cfg.maxTarget);
     const solution = buildInfiniteEqualSumSolution(cfg.size, target);
     if (!solution) continue;
-    const fixedCount = Math.floor((cfg.size * cfg.size) / 2);
-    const fixed = chooseInfiniteEqualSumFixedIndices(cfg.size, fixedCount);
+    const fixedCount = cfg.fixedCount;
+    const fixed = chooseInfiniteEqualSumFixedIndices(cfg.size, fixedCount, cfg.maxFixedPerLine);
+    if (!fixed) continue;
     const initialGrid = solution.map((value, index) => fixed.has(index) ? value : null);
     const numbers = shuffled(solution.filter((_, index) => !fixed.has(index)));
     return { gameKey: "equal_sum", difficulty: "Standard", target, numbers, initialGrid, infiniteStage: stage };
@@ -8292,7 +8274,16 @@ function validateInfiniteEqualSumAnswer(puzzle, numberSlotsRaw) {
   const pool = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const slots = Array.isArray(numberSlotsRaw) ? numberSlotsRaw.map(Number) : [];
   if (!Number.isInteger(stage) || stage <= 0 || !Number.isInteger(target) || target < cfg.minTarget || target > cfg.maxTarget) return false;
-  if (initialGrid.length !== total || pool.length !== total - Math.floor(total / 2) || slots.length !== total) return false;
+  if (initialGrid.length !== total || pool.length !== total - cfg.fixedCount || slots.length !== total) return false;
+  const fixedRows = Array(size).fill(0), fixedCols = Array(size).fill(0);
+  initialGrid.forEach((value, index) => {
+    if (value != null) {
+      fixedRows[Math.floor(index / size)] += 1;
+      fixedCols[index % size] += 1;
+    }
+  });
+  if (initialGrid.filter((v) => v != null).length !== cfg.fixedCount) return false;
+  if (fixedRows.some((c) => c > cfg.maxFixedPerLine) || fixedCols.some((c) => c > cfg.maxFixedPerLine)) return false;
   if (!slots.every(Number.isInteger)) return false;
   for (let i = 0; i < total; i += 1) {
     if (initialGrid[i] != null && slots[i] !== Number(initialGrid[i])) return false;
@@ -8308,18 +8299,11 @@ function validateInfiniteEqualSumAnswer(puzzle, numberSlotsRaw) {
 }
 
 function infiniteArithmeticConfig(stageValue) {
-  const band = infiniteStageBand(stageValue);
-  const configs = [
-    { targetCount: 3, perTarget: 2, valueMin: 2, valueMax: 10, targetMin: 2, targetMax: 7 },
-    { targetCount: 3, perTarget: 3, valueMin: 2, valueMax: 34, targetMin: 11, targetMax: 25 },
-    { targetCount: 4, perTarget: 4, valueMin: 4, valueMax: 48, targetMin: 16, targetMax: 36 },
-    { targetCount: 5, perTarget: 5, valueMin: 6, valueMax: 72, targetMin: 24, targetMax: 54 },
-    { targetCount: 6, perTarget: 6, valueMin: 8, valueMax: 100, targetMin: 30, targetMax: 72 },
-    { targetCount: 6, perTarget: 6, valueMin: 8, valueMax: 100, targetMin: 30, targetMax: 72 },
-  ];
-  const cfg = { ...configs[band] };
-  cfg.fixedCount = ({ 2: 2, 3: 3, 4: 5, 5: 8, 6: 12 })[cfg.targetCount] || cfg.targetCount;
-  return cfg;
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 40) return { targetCount: 2, perTarget: 2, valueMin: 2, valueMax: 10, targetMin: 2, targetMax: 7, fixedCount: 2, maxFixedPerTarget: 1 };
+  if (stage <= 80) return { targetCount: 3, perTarget: 3, valueMin: 2, valueMax: 34, targetMin: 11, targetMax: 25, fixedCount: 3, maxFixedPerTarget: 1 };
+  if (stage <= 120) return { targetCount: 4, perTarget: 4, valueMin: 4, valueMax: 48, targetMin: 16, targetMax: 36, fixedCount: 6, maxFixedPerTarget: 2 };
+  return { targetCount: 5, perTarget: 4, valueMin: 6, valueMax: 72, targetMin: 24, targetMax: 54, fixedCount: 7, maxFixedPerTarget: 2 };
 }
 
 function makeInfiniteArithmeticGroup(target, count, minValue, maxValue) {
@@ -8337,6 +8321,24 @@ function makeInfiniteArithmeticGroup(target, count, minValue, maxValue) {
   return shuffled(values);
 }
 
+function chooseInfiniteArithmeticFixedIndices(cfg) {
+  const selected = [];
+  const perGroup = Array(cfg.targetCount).fill(0);
+  // Önce gruplara olabildiğince dengeli birer taş dağıt; sonra ikinci tura geç.
+  for (let round = 0; round < cfg.maxFixedPerTarget && selected.length < cfg.fixedCount; round += 1) {
+    for (const group of shuffled(Array.from({ length: cfg.targetCount }, (_, i) => i))) {
+      if (selected.length >= cfg.fixedCount) break;
+      if (perGroup[group] >= cfg.maxFixedPerTarget) continue;
+      const candidates = Array.from({ length: cfg.perTarget }, (_, local) => group * cfg.perTarget + local)
+        .filter((index) => !selected.includes(index));
+      if (candidates.length === 0) continue;
+      selected.push(candidates[secureRandomInt(0, candidates.length)]);
+      perGroup[group] += 1;
+    }
+  }
+  return new Set(selected);
+}
+
 function generateInfiniteTotalEqualsPuzzle(stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
   const cfg = infiniteArithmeticConfig(stage);
@@ -8345,7 +8347,7 @@ function generateInfiniteTotalEqualsPuzzle(stageValue) {
   while (targets.length < cfg.targetCount) targets.push(randomInclusive(cfg.targetMin, cfg.targetMax));
   const groups = targets.map((target) => makeInfiniteArithmeticGroup(target, cfg.perTarget, cfg.valueMin, cfg.valueMax));
   const values = groups.flat();
-  const fixed = new Set(shuffled(Array.from({ length: values.length }, (_, i) => i)).slice(0, cfg.fixedCount));
+  const fixed = chooseInfiniteArithmeticFixedIndices(cfg);
   const initialGrid = values.map((value, index) => fixed.has(index) ? value : null);
   return {
     gameKey: "total_equals", difficulty: "Standard", target: targets[0],
@@ -8367,6 +8369,10 @@ function validateInfiniteTotalEqualsAnswer(puzzle, answer = {}) {
   if (!targets.every((v) => Number.isInteger(v) && v >= cfg.targetMin && v <= cfg.targetMax)) return false;
   if (!values.every((v) => Number.isInteger(v) && v >= cfg.valueMin && v <= cfg.valueMax)) return false;
   if (initialGrid.filter((v) => v != null).length !== cfg.fixedCount) return false;
+  for (let group = 0; group < cfg.targetCount; group += 1) {
+    const fixedInGroup = initialGrid.slice(group * cfg.perTarget, (group + 1) * cfg.perTarget).filter((v) => v != null).length;
+    if (fixedInGroup > cfg.maxFixedPerTarget) return false;
+  }
   if (integerMultisetKey(slots) !== integerMultisetKey(values)) return false;
   for (let i = 0; i < slots.length; i += 1) if (initialGrid[i] != null && slots[i] !== Number(initialGrid[i])) return false;
   for (let group = 0; group < cfg.targetCount; group += 1) {
@@ -8459,15 +8465,12 @@ function validateInfiniteRatioAnswer(puzzle, answer = {}) {
 }
 
 function infiniteTripleBalanceConfig(stageValue) {
-  const configs = [
-    { containers: 2, perContainer: 4, minValue: 1, maxValue: 15 },
-    { containers: 3, perContainer: 5, minValue: 1, maxValue: 20 },
-    { containers: 4, perContainer: 6, minValue: 1, maxValue: 40 },
-    { containers: 5, perContainer: 7, minValue: 1, maxValue: 60 },
-    { containers: 6, perContainer: 8, minValue: 1, maxValue: 100 },
-    { containers: 6, perContainer: 8, minValue: 1, maxValue: 100 },
-  ];
-  return configs[infiniteStageBand(stageValue)];
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 30) return { containers: 2, perContainer: 4, minValue: 1, maxValue: 15 };
+  if (stage <= 60) return { containers: 3, perContainer: 5, minValue: 1, maxValue: 20 };
+  if (stage <= 90) return { containers: 4, perContainer: 6, minValue: 1, maxValue: 30 };
+  if (stage <= 120) return { containers: 5, perContainer: 7, minValue: 1, maxValue: 40 };
+  return { containers: 6, perContainer: 8, minValue: 1, maxValue: 50 };
 }
 
 function makeBalancedInfiniteValues(count, minValue, maxValue, center) {
@@ -8516,15 +8519,12 @@ function validateInfiniteTripleBalanceAnswer(puzzle, answer = {}) {
 }
 
 function infiniteSortConfig(stageValue) {
-  const configs = [
-    { count: 6, operands: 2, resultMin: 1, resultMax: 15, valueMin: 1, valueMax: 30 },
-    { count: 8, operands: 2, resultMin: 10, resultMax: 40, valueMin: 3, valueMax: 60 },
-    { count: 10, operands: 2, resultMin: 40, resultMax: 80, valueMin: 5, valueMax: 120 },
-    { count: 12, operands: 2, resultMin: 60, resultMax: 120, valueMin: 6, valueMax: 200 },
-    { count: 14, operands: 2, resultMin: 90, resultMax: 180, valueMin: 7, valueMax: 300 },
-    { count: 16, operands: 3, resultMin: 500, resultMax: 1000, valueMin: 8, valueMax: 500 },
-  ];
-  return configs[infiniteStageBand(stageValue)];
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 30) return { count: 6, operands: 2, resultMin: 1, resultMax: 15, valueMin: 1, valueMax: 30 };
+  if (stage <= 60) return { count: 8, operands: 2, resultMin: 10, resultMax: 40, valueMin: 2, valueMax: 30 };
+  if (stage <= 90) return { count: 10, operands: 2, resultMin: 20, resultMax: 80, valueMin: 2, valueMax: 50 };
+  if (stage <= 120) return { count: 12, operands: 2, resultMin: 30, resultMax: 100, valueMin: 2, valueMax: 40 };
+  return { count: 14, operands: 2, resultMin: 40, resultMax: 120, valueMin: 2, valueMax: 50 };
 }
 
 function dynamicArithmeticResult(valuesRaw, opsRaw) {
@@ -8642,15 +8642,13 @@ function validateInfiniteSortOrderAnswer(puzzle, answer = {}) {
 }
 
 function infiniteDualPyramidConfig(stageValue) {
-  const configs = [
-    { layers: 3, bottomMin: 1, bottomMax: 7 },
-    { layers: 4, bottomMin: 1, bottomMax: 10 },
-    { layers: 5, bottomMin: 1, bottomMax: 20 },
-    { layers: 6, bottomMin: 10, bottomMax: 30 },
-    { layers: 7, bottomMin: 20, bottomMax: 50 },
-    { layers: 8, bottomMin: 50, bottomMax: 100 },
-  ];
-  return configs[infiniteStageBand(stageValue)];
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 20) return { layers: 3, bottomMin: 1, bottomMax: 7 };
+  if (stage <= 40) return { layers: 4, bottomMin: 1, bottomMax: 10 };
+  if (stage <= 60) return { layers: 5, bottomMin: 1, bottomMax: 15 };
+  if (stage <= 80) return { layers: 6, bottomMin: 1, bottomMax: 20 };
+  if (stage <= 100) return { layers: 7, bottomMin: 1, bottomMax: 25 };
+  return { layers: 8, bottomMin: 1, bottomMax: 30 };
 }
 
 function buildPyramidDynamic(bottomRaw) {
@@ -8713,23 +8711,30 @@ function validateInfiniteDualPyramidAnswer(puzzle, answer = {}) {
 }
 
 function infiniteNextNumberConfig(stageValue) {
-  const band = infiniteStageBand(stageValue);
-  return [
-    { firstMin: 1, firstMax: 10, xMin: 2, xMax: 2, yMin: 1, yMax: 3, rules: ["multiply_plus","multiply_minus"], variableAllowed: false, parenthesizedMustFixed: true },
-    { firstMin: 1, firstMax: 20, xMin: 2, xMax: 3, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus"], variableAllowed: true, parenthesizedMustFixed: true },
-    { firstMin: 1, firstMax: 30, xMin: 2, xMax: 3, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: true, parenthesizedYMax: 2 },
-    { firstMin: 10, firstMax: 40, xMin: 2, xMax: 4, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false },
-    { firstMin: 20, firstMax: 50, xMin: 2, xMax: 5, yMin: 5, yMax: 10, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false },
-    { firstMin: 50, firstMax: 100, xMin: 2, xMax: 6, yMin: 5, yMax: 30, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false },
-  ][band];
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 20) return { firstMin: 1, firstMax: 10, xMin: 2, xMax: 2, yMin: 1, yMax: 3, rules: ["multiply_plus","multiply_minus"], variableAllowed: false, parenthesizedMustFixed: true };
+  if (stage <= 40) return { firstMin: 1, firstMax: 15, xMin: 2, xMax: 3, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus"], variableAllowed: true, parenthesizedMustFixed: true };
+  if (stage <= 60) return { firstMin: 1, firstMax: 20, xMin: 2, xMax: 3, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: true, parenthesizedYMax: 2 };
+  if (stage <= 80) return { firstMin: 1, firstMax: 25, xMin: 2, xMax: 4, yMin: 1, yMax: 5, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false };
+  if (stage <= 100) return { firstMin: 1, firstMax: 30, xMin: 2, xMax: 5, yMin: 1, yMax: 10, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false };
+  return { firstMin: 1, firstMax: 40, xMin: 2, xMax: 6, yMin: 1, yMax: 10, rules: ["multiply_plus","multiply_minus","plus_then_multiply","minus_then_multiply"], variableAllowed: true, parenthesizedMustFixed: false };
 }
 
 function infiniteNextOffsets(cfg, ruleType) {
   const parenthesized = ruleType === "plus_then_multiply" || ruleType === "minus_then_multiply";
   const yMax = parenthesized && cfg.parenthesizedYMax ? cfg.parenthesizedYMax : cfg.yMax;
-  const base = randomInclusive(cfg.yMin, yMax);
   const mustFixed = !cfg.variableAllowed || (parenthesized && cfg.parenthesizedMustFixed);
-  if (mustFixed || secureRandomInt(0, 2) === 0) return [base, base, base];
+  if (mustFixed || secureRandomInt(0, 2) === 0) {
+    const base = randomInclusive(cfg.yMin, yMax);
+    return [base, base, base];
+  }
+  // Değişken y de bütün adımlarda tanımlı y aralığında kalır.
+  const progressiveBaseMax = Math.floor(yMax / 3);
+  if (progressiveBaseMax < cfg.yMin) {
+    const base = randomInclusive(cfg.yMin, yMax);
+    return [base, base, base];
+  }
+  const base = randomInclusive(cfg.yMin, progressiveBaseMax);
   return secureRandomInt(0, 2) === 0 ? [base, base * 2, base * 3] : [base * 3, base * 2, base];
 }
 
@@ -8766,14 +8771,13 @@ function validateInfiniteNextNumberAnswer(puzzle, answer = {}) {
 }
 
 function infiniteWrongNumbersConfig(stageValue) {
-  return [
-    { count: 3, valueMin: 1, valueMax: 8, targetMin: 1, targetMax: 100, parentheses: false },
-    { count: 4, valueMin: 2, valueMax: 10, targetMin: 1, targetMax: 100, parentheses: false },
-    { count: 5, valueMin: 2, valueMax: 20, targetMin: 1, targetMax: 200, parentheses: true },
-    { count: 6, valueMin: 2, valueMax: 30, targetMin: 1, targetMax: 300, parentheses: true },
-    { count: 7, valueMin: 2, valueMax: 30, targetMin: 1, targetMax: 500, parentheses: true },
-    { count: 10, valueMin: 3, valueMax: 100, targetMin: 1, targetMax: 2000, parentheses: true },
-  ][infiniteStageBand(stageValue)];
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  if (stage <= 20) return { count: 3, valueMin: 1, valueMax: 8, targetMin: 1, targetMax: 100, parenCount: 0 };
+  if (stage <= 40) return { count: 4, valueMin: 2, valueMax: 10, targetMin: 1, targetMax: 100, parenCount: 0 };
+  if (stage <= 60) return { count: 5, valueMin: 2, valueMax: 10, targetMin: 1, targetMax: 150, parenCount: 0 };
+  if (stage <= 80) return { count: 6, valueMin: 2, valueMax: 15, targetMin: 1, targetMax: 200, parenCount: 1, parenResultMin: 2, parenResultMax: 12, connectorValueMax: 5 };
+  if (stage <= 100) return { count: 7, valueMin: 2, valueMax: 20, targetMin: 1, targetMax: 200, parenCount: 1, parenResultMin: 2, parenResultMax: 16, connectorValueMax: 7 };
+  return { count: 10, valueMin: 2, valueMax: 25, targetMin: 1, targetMax: 250, parenCount: 2, parenResultMin: 2, parenResultMax: 20, connectorValueMax: 9 };
 }
 
 function normalizeInfiniteWrongParenStarts(raw) {
@@ -8832,7 +8836,7 @@ function infiniteWrongParenConnectorIndex(start, parenStarts, valueCount) {
   return connections.length === 1 ? connections[0].operatorIndex : -1;
 }
 
-function infiniteWrongParenLayoutValid(count, operators, parenStarts) {
+function infiniteWrongParenLayoutValid(count, operators, parenStarts, values = null, cfg = null) {
   if (parenStarts.length === 0) return true;
   if (new Set(parenStarts).size !== parenStarts.length) return false;
   if (parenStarts.some((start) => start < 0 || start >= count - 1)) return false;
@@ -8843,14 +8847,24 @@ function infiniteWrongParenLayoutValid(count, operators, parenStarts) {
   if (parenStarts.some((start) => start === 3 || start === 4)) return false;
   const externalIndexes = [];
   for (const start of parenStarts) {
-    // Bir parantez grubunun dışında yalnızca TEK komşu sayı bulunabilir.
-    // Böylece parantez iki ayrı dış sayıya/işleme birden bağlanmaz.
     const connections = infiniteWrongParenExternalConnections(start, parenStarts, count);
     if (connections.length !== 1) return false;
-    const connectorIndex = connections[0].operatorIndex;
+    const { operatorIndex: connectorIndex, externalValueIndex } = connections[0];
     const connectorOp = Number(operators[connectorIndex]);
     if (connectorOp !== WRONG_NUMBERS_MULTIPLY && connectorOp !== WRONG_NUMBERS_DIVIDE) return false;
-    externalIndexes.push(connections[0].externalValueIndex);
+    // Parantezle irtibatlı dış sayı, diğer tarafında ikinci bir ×/÷ zincirine giremez.
+    const otherOperatorIndexes = [externalValueIndex - 1, externalValueIndex]
+      .filter((index) => index >= 0 && index < operators.length && index !== connectorIndex);
+    if (otherOperatorIndexes.some((index) => Number(operators[index]) === WRONG_NUMBERS_MULTIPLY || Number(operators[index]) === WRONG_NUMBERS_DIVIDE)) return false;
+    if (Array.isArray(values) && cfg) {
+      const inner = dynamicArithmeticResult([Number(values[start]), Number(values[start + 1])], [Number(operators[start])]);
+      if (!Number.isInteger(inner) || inner < cfg.parenResultMin || inner > cfg.parenResultMax) return false;
+      if (connectorOp === WRONG_NUMBERS_MULTIPLY) {
+        const externalValue = Number(values[externalValueIndex]);
+        if (!Number.isInteger(externalValue) || externalValue < 2 || externalValue > cfg.connectorValueMax) return false;
+      }
+    }
+    externalIndexes.push(externalValueIndex);
   }
   if (new Set(externalIndexes).size !== externalIndexes.length) return false;
   return true;
@@ -8859,7 +8873,7 @@ function infiniteWrongParenLayoutValid(count, operators, parenStarts) {
 function generateInfiniteWrongNumbersPuzzle(stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
   const cfg = infiniteWrongNumbersConfig(stage);
-  for (let attempt = 0; attempt < 60000; attempt += 1) {
+  for (let attempt = 0; attempt < 100000; attempt += 1) {
     const values = Array.from({ length: cfg.count }, () => randomInclusive(cfg.valueMin, cfg.valueMax));
     const operators = Array.from({ length: cfg.count - 1 }, () => {
       const weighted = [0,0,1,1,2,3];
@@ -8867,14 +8881,10 @@ function generateInfiniteWrongNumbersPuzzle(stageValue) {
     });
 
     let parenStarts = [];
-    if (cfg.parentheses) {
-      if (cfg.count >= 8) {
-        // 8+ sayıda iki parantez vardır. Her parantez yalnız bir dış sayıya bağlanabilsin
-        // diye gruplar ifadenin iki ucuna yerleştirilir. 5. sayı da doğal olarak dışarıda kalır.
+    if (cfg.parenCount > 0) {
+      if (cfg.parenCount === 2) {
         parenStarts = [0, cfg.count - 2];
       } else {
-        // Tek parantezli aşamalarda da parantezin yalnız bir dış bağlantısı olsun:
-        // ifade başındaki veya (5. sayıyı içine almıyorsa) sonundaki ikili seçilir.
         const edgeCandidates = [0, cfg.count - 2]
           .filter((i, pos, arr) => arr.indexOf(i) === pos)
           .filter((i) => i >= 0 && i < cfg.count - 1)
@@ -8883,16 +8893,24 @@ function generateInfiniteWrongNumbersPuzzle(stageValue) {
         parenStarts = [edgeCandidates[secureRandomInt(0, edgeCandidates.length)]];
       }
 
-      // Her parantezli grubun dışındaki bir sayı ile bağlantısı kesinlikle × veya ÷ olur.
       for (const start of parenStarts) {
-        const connectorIndex = infiniteWrongParenConnectorIndex(start, parenStarts, cfg.count);
-        if (connectorIndex < 0) { parenStarts = []; break; }
-        operators[connectorIndex] = secureRandomInt(2, 4);
+        const connections = infiniteWrongParenExternalConnections(start, parenStarts, cfg.count);
+        if (connections.length !== 1) { parenStarts = []; break; }
+        const { operatorIndex: connectorIndex, externalValueIndex } = connections[0];
+        operators[connectorIndex] = secureRandomInt(2, 4); // yalnız × veya ÷
+        // Dış sayının diğer tarafı mutlaka + veya − olsun.
+        for (const index of [externalValueIndex - 1, externalValueIndex]) {
+          if (index >= 0 && index < operators.length && index !== connectorIndex) operators[index] = secureRandomInt(0, 2);
+        }
+        // Çarpma bağlantısında dış sayı istenen küçük aralıkta olsun.
+        if (operators[connectorIndex] === WRONG_NUMBERS_MULTIPLY) {
+          values[externalValueIndex] = randomInclusive(2, cfg.connectorValueMax);
+        }
       }
-      if (cfg.parentheses && parenStarts.length === 0) continue;
+      if (parenStarts.length !== cfg.parenCount) continue;
     }
 
-    if (!infiniteWrongParenLayoutValid(cfg.count, operators, parenStarts)) continue;
+    if (cfg.parenCount > 0 && !infiniteWrongParenLayoutValid(cfg.count, operators, parenStarts, values, cfg)) continue;
     const result = evaluateInfiniteWrongNumbers(values, operators, parenStarts);
     if (!Number.isFinite(result) || Math.abs(result - Math.round(result)) > 1e-8) continue;
     const target = Math.round(result);
@@ -8912,17 +8930,17 @@ function validateInfiniteWrongNumbersAnswer(puzzle, answer = {}) {
   const cfg = infiniteWrongNumbersConfig(stage);
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const initialGrid = Array.isArray(puzzle?.initialGrid) ? puzzle.initialGrid : [];
-  const parenCount = cfg.parentheses ? (cfg.count >= 8 ? 2 : 1) : 1; // parantezsizde -1 sentinel tutulur.
-  const expectedLength = cfg.count + (cfg.count - 1) + parenCount;
+  const storedParenCount = cfg.parenCount > 0 ? cfg.parenCount : 1; // parantezsizde -1 sentinel
+  const expectedLength = cfg.count + (cfg.count - 1) + storedParenCount;
   if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== expectedLength || initialGrid.length !== cfg.count) return false;
   const values = numbers.slice(0, cfg.count);
   const operators = numbers.slice(cfg.count, cfg.count + cfg.count - 1);
   const rawParens = numbers.slice(cfg.count + cfg.count - 1);
-  const parenStarts = cfg.parentheses ? rawParens : [];
+  const parenStarts = cfg.parenCount > 0 ? rawParens : [];
   if (!values.every((v) => Number.isInteger(v) && v >= cfg.valueMin && v <= cfg.valueMax)) return false;
   if (!operators.every((op) => Number.isInteger(op) && op >= 0 && op <= 3)) return false;
-  if (!cfg.parentheses && !(rawParens.length === 1 && rawParens[0] === -1)) return false;
-  if (cfg.parentheses && !infiniteWrongParenLayoutValid(cfg.count, operators, parenStarts)) return false;
+  if (cfg.parenCount === 0 && !(rawParens.length === 1 && rawParens[0] === -1)) return false;
+  if (cfg.parenCount > 0 && (parenStarts.length !== cfg.parenCount || !infiniteWrongParenLayoutValid(cfg.count, operators, parenStarts, values, cfg))) return false;
   if (initialGrid.filter((v) => v == null).length !== 1) return false;
   for (let i = 0; i < cfg.count; i += 1) if (initialGrid[i] != null && Number(initialGrid[i]) !== values[i]) return false;
   const result = evaluateInfiniteWrongNumbers(values, operators, parenStarts);
