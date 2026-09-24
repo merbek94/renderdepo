@@ -8154,6 +8154,40 @@ function randomInclusive(minValue, maxValue) {
   return secureRandomInt(min, max + 1);
 }
 
+function generateInfiniteTargetNumberOperators(stageValue, numberCountValue) {
+  const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
+  const operatorCount = Math.max(1, Math.floor(Number(numberCountValue || 2)) - 1);
+  const allOps = ["+", "−", "×", "÷"];
+  const operators = Array.from({ length: operatorCount }, () => allOps[secureRandomInt(0, allOps.length)]);
+
+  // 41–120: çözümde en az bir çarpma veya bölme olsun.
+  if (stage >= 41 && stage <= 120 && !operators.some((op) => op === "×" || op === "÷")) {
+    operators[secureRandomInt(0, operators.length)] = secureRandomInt(0, 2) === 0 ? "×" : "÷";
+  }
+
+  // 121+: çözümde en az bir çarpma VE en az bir bölme olsun.
+  if (stage >= 121) {
+    const hasMultiply = operators.includes("×");
+    const hasDivide = operators.includes("÷");
+    if (!hasMultiply && !hasDivide) {
+      const multiplyIndex = secureRandomInt(0, operators.length);
+      const divideCandidates = operators.map((_, index) => index).filter((index) => index !== multiplyIndex);
+      const divideIndex = divideCandidates[secureRandomInt(0, divideCandidates.length)];
+      operators[multiplyIndex] = "×";
+      operators[divideIndex] = "÷";
+    } else if (!hasMultiply) {
+      const candidates = operators.map((op, index) => op !== "÷" ? index : -1).filter((index) => index >= 0);
+      const index = candidates.length > 0 ? candidates[secureRandomInt(0, candidates.length)] : 0;
+      operators[index] = "×";
+    } else if (!hasDivide) {
+      const candidates = operators.map((op, index) => op !== "×" ? index : -1).filter((index) => index >= 0);
+      const index = candidates.length > 0 ? candidates[secureRandomInt(0, candidates.length)] : operators.length - 1;
+      operators[index] = "÷";
+    }
+  }
+  return shuffled(operators);
+}
+
 function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
   const stage = Math.max(1, Math.floor(Number(stageValue || 1)));
   const cfg = stage <= 40
@@ -8163,10 +8197,9 @@ function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
       : stage <= 120
         ? { count: 5, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 250 }
         : { count: 6, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 300 };
-  const allOps = ["+", "−", "×", "÷"];
   for (let attempt = 0; attempt < 30000; attempt += 1) {
     const numbers = Array.from({ length: cfg.count }, () => randomInclusive(cfg.numberMin, cfg.numberMax));
-    const operators = Array.from({ length: cfg.count - 1 }, () => allOps[secureRandomInt(0, allOps.length)]);
+    const operators = generateInfiniteTargetNumberOperators(stage, cfg.count);
     const orderedNumbers = shuffled(numbers);
     const result = evaluateExpression(orderedNumbers, operators);
     if (result === null || !Number.isFinite(result)) continue;
