@@ -2809,14 +2809,14 @@ const NEXT_NUMBER_MAX_FIXED_OFFSET = 5;
 // Sabit olmayan y yalnızca bu altı desen olabilir ve yalnızca "sayı × x ± y"
 // kurallarında kullanılır. Böylece 1-4-7, 2-5-8, 7-5-3 gibi başka
 // aritmetik diziler üretilemez. "(sayı ± y) × x" kurallarında ise y her
-// üç geçişte de sabittir. Sabit y değeri bütün kural türlerinde 1..5'tir.
+// dört geçişte de sabittir. Sabit y değeri bütün kural türlerinde 1..5'tir.
 const NEXT_NUMBER_VARIABLE_OFFSET_SERIES = Object.freeze([
-  Object.freeze([1, 2, 3]),
-  Object.freeze([3, 2, 1]),
-  Object.freeze([2, 4, 6]),
-  Object.freeze([6, 4, 2]),
-  Object.freeze([3, 6, 9]),
-  Object.freeze([9, 6, 3]),
+  Object.freeze([1, 2, 3, 4]),
+  Object.freeze([4, 3, 2, 1]),
+  Object.freeze([2, 4, 6, 8]),
+  Object.freeze([8, 6, 4, 2]),
+  Object.freeze([3, 6, 9, 12]),
+  Object.freeze([12, 9, 6, 3]),
 ]);
 
 function nextNumberStep(value, multiplier, offset, ruleType) {
@@ -2831,7 +2831,7 @@ function nextNumberStep(value, multiplier, offset, ruleType) {
 
 function generateNextNumberOffsetSeries(ruleType) {
   // Önce y eklenip/çıkarılıp sonra çarpılan kurallarda değişken y YOKTUR.
-  // Örn. (sayı + 3) × 2 ise sonraki iki geçiş de yine +3 kullanır.
+  // Örn. (sayı + 3) × 2 ise sonraki üç geçiş de yine +3 kullanır.
   const mustUseFixedOffset =
     ruleType === "plus_then_multiply" || ruleType === "minus_then_multiply";
 
@@ -2841,7 +2841,7 @@ function generateNextNumberOffsetSeries(ruleType) {
       NEXT_NUMBER_MIN_FIXED_OFFSET,
       NEXT_NUMBER_MAX_FIXED_OFFSET + 1
     );
-    return [offset, offset, offset];
+    return [offset, offset, offset, offset];
   }
 
   // Değişken y yalnızca sayı × x + y / sayı × x - y kurallarında kullanılır.
@@ -2861,31 +2861,31 @@ function generateNextNumberPuzzle() {
     const first = secureRandomInt(1, 21);
     const sequence = [first];
 
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offsets[index], ruleType);
       if (!Number.isInteger(next) || next <= 0 || next > NEXT_NUMBER_MAX_VALUE) break;
       sequence.push(next);
     }
 
-    if (sequence.length !== 4) continue;
-    if (new Set(sequence).size !== 4) continue;
+    if (sequence.length !== 5) continue;
+    if (new Set(sequence).size !== 5) continue;
 
     return {
       gameKey: "next_number",
       difficulty: "Standard",
-      target: sequence[3],
-      numbers: sequence.slice(0, 3),
+      target: sequence[4],
+      numbers: sequence.slice(0, 4),
       initialGrid: [],
     };
   }
 
   // RNG'nin olağan dışı biçimde geçerli dizi üretememesi durumunda da izin verilen sabit kurala uyan fallback.
-  // 3 -> 8 -> 18 -> 38 : her adım 2x+2.
+  // 3 -> 8 -> 18 -> 38 -> 78 : her adım 2x+2.
   return {
     gameKey: "next_number",
     difficulty: "Standard",
-    target: 38,
-    numbers: [3, 8, 18],
+    target: 78,
+    numbers: [3, 8, 18, 38],
     initialGrid: [],
   };
 }
@@ -2899,26 +2899,26 @@ function generateTwoPlayerNextNumberPuzzle() {
     const ruleType = ruleTypes[secureRandomInt(0, ruleTypes.length)];
     // Normal İkili Oyun'da (sayı ± y) × x ailesinde y kesinlikle 1'dir.
     const offsets = (ruleType === "plus_then_multiply" || ruleType === "minus_then_multiply")
-      ? [1, 1, 1]
+      ? [1, 1, 1, 1]
       : generateNextNumberOffsetSeries(ruleType);
     const first = secureRandomInt(1, 21);
     const sequence = [first];
 
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 4; index += 1) {
       const next = nextNumberStep(sequence[sequence.length - 1], multiplier, offsets[index], ruleType);
       if (!Number.isInteger(next) || next <= 0 || next > maxValue) break;
       sequence.push(next);
     }
-    if (sequence.length !== 4 || new Set(sequence).size !== 4) continue;
+    if (sequence.length !== 5 || new Set(sequence).size !== 5) continue;
     return {
-      gameKey: "next_number", difficulty: "Standard", target: sequence[3],
-      numbers: sequence.slice(0, 3), initialGrid: [], twoPlayerVariant: true,
+      gameKey: "next_number", difficulty: "Standard", target: sequence[4],
+      numbers: sequence.slice(0, 4), initialGrid: [], twoPlayerVariant: true,
     };
   }
 
   return {
-    gameKey: "next_number", difficulty: "Standard", target: 38,
-    numbers: [3, 8, 18], initialGrid: [], twoPlayerVariant: true,
+    gameKey: "next_number", difficulty: "Standard", target: 78,
+    numbers: [3, 8, 18, 38], initialGrid: [], twoPlayerVariant: true,
   };
 }
 
@@ -2927,10 +2927,10 @@ function validateNextNumberChallengeAnswer(puzzle, answer = {}) {
   const target = Number(puzzle?.target);
   const submitted = Number(answer?.nextNumber);
   const maxValue = puzzle?.twoPlayerVariant === true ? 200 : NEXT_NUMBER_MAX_VALUE;
-  if (numbers.length !== 3 || numbers.some((value) => !Number.isInteger(value))) return false;
+  if (![3, 4].includes(numbers.length) || numbers.some((value) => !Number.isInteger(value))) return false;
   if (!Number.isInteger(target) || target < NEXT_NUMBER_MIN_VALUE || target > maxValue) return false;
   if (numbers.some((value) => value <= 0 || value > maxValue) || target <= 0) return false;
-  if (new Set([...numbers, target]).size !== 4) return false;
+  if (new Set([...numbers, target]).size !== numbers.length + 1) return false;
   return Number.isInteger(submitted) && submitted === target;
 }
 
@@ -3652,7 +3652,7 @@ function generateSecurePuzzle(difficultyValue) {
   const count = secureRandomInt(3, 5); // 3 veya 4 sayı
 
   for (let attempt = 0; attempt < 1000; attempt += 1) {
-    const numbers = Array.from({ length: count }, () => secureRandomInt(2, 10));
+    const numbers = shuffled(Array.from({ length: 9 }, (_, index) => index + 2)).slice(0, count);
     const operatorCount = count - 1;
     const operators = [];
 
@@ -8198,7 +8198,7 @@ function generateInfiniteTargetNumberPuzzle(difficultyValue, stageValue) {
         ? { count: 5, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 250 }
         : { count: 6, numberMin: 2, numberMax: 10, targetMin: 1, targetMax: 300 };
   for (let attempt = 0; attempt < 30000; attempt += 1) {
-    const numbers = Array.from({ length: cfg.count }, () => randomInclusive(cfg.numberMin, cfg.numberMax));
+    const numbers = shuffled(Array.from({ length: cfg.numberMax - cfg.numberMin + 1 }, (_, index) => cfg.numberMin + index)).slice(0, cfg.count);
     const operators = generateInfiniteTargetNumberOperators(stage, cfg.count);
     const orderedNumbers = shuffled(numbers);
     const result = evaluateExpression(orderedNumbers, operators);
@@ -8759,16 +8759,18 @@ function infiniteNextOffsets(cfg, ruleType) {
   const mustFixed = !cfg.variableAllowed || (parenthesized && cfg.parenthesizedMustFixed);
   if (mustFixed || secureRandomInt(0, 2) === 0) {
     const base = randomInclusive(cfg.yMin, yMax);
-    return [base, base, base];
+    return [base, base, base, base];
   }
   // Değişken y de bütün adımlarda tanımlı y aralığında kalır.
-  const progressiveBaseMax = Math.floor(yMax / 3);
+  const progressiveBaseMax = Math.floor(yMax / 4);
   if (progressiveBaseMax < cfg.yMin) {
     const base = randomInclusive(cfg.yMin, yMax);
-    return [base, base, base];
+    return [base, base, base, base];
   }
   const base = randomInclusive(cfg.yMin, progressiveBaseMax);
-  return secureRandomInt(0, 2) === 0 ? [base, base * 2, base * 3] : [base * 3, base * 2, base];
+  return secureRandomInt(0, 2) === 0
+    ? [base, base * 2, base * 3, base * 4]
+    : [base * 4, base * 3, base * 2, base];
 }
 
 function generateInfiniteNextNumberPuzzle(stageValue) {
@@ -8780,13 +8782,13 @@ function generateInfiniteNextNumberPuzzle(stageValue) {
     const rule = cfg.rules[secureRandomInt(0, cfg.rules.length)];
     const offsets = infiniteNextOffsets(cfg, rule);
     const sequence = [first];
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 4; i += 1) {
       const next = nextNumberStep(sequence[sequence.length - 1], x, offsets[i], rule);
       if (!Number.isSafeInteger(next) || next <= 0) break;
       sequence.push(next);
     }
-    if (sequence.length !== 4 || new Set(sequence).size !== 4) continue;
-    return { gameKey: "next_number", difficulty: "Standard", target: sequence[3], numbers: sequence.slice(0,3), initialGrid: [], infiniteStage: stage };
+    if (sequence.length !== 5 || new Set(sequence).size !== 5) continue;
+    return { gameKey: "next_number", difficulty: "Standard", target: sequence[4], numbers: sequence.slice(0,4), initialGrid: [], infiniteStage: stage };
   }
   throw new Error("Sonsuz Sonraki Sayı bulmacası üretilemedi.");
 }
@@ -8797,7 +8799,7 @@ function validateInfiniteNextNumberAnswer(puzzle, answer = {}) {
   const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
   const target = Number(puzzle?.target);
   const submitted = Number(answer?.nextNumber);
-  if (!Number.isInteger(stage) || stage <= 0 || numbers.length !== 3) return false;
+  if (!Number.isInteger(stage) || stage <= 0 || ![3, 4].includes(numbers.length)) return false;
   if (![...numbers, target].every((v) => Number.isSafeInteger(v) && v > 0)) return false;
   if (numbers[0] < cfg.firstMin || numbers[0] > cfg.firstMax) return false;
   return Number.isSafeInteger(submitted) && submitted === target;
