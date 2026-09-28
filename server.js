@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v29-20260923";
+const SERVER_BUILD_ID = "shared-game-flow-v30-20260928";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -13332,6 +13332,9 @@ function createRealtimeRoom(
     loserPlayerId: null,
     isFriend: false,
     awardedAt: null,
+    // İlk el başlamadan iptal/kopma halinde oyun hakkı iadesi tek transaction olarak
+    // paylaşılır; aynı anda cancel + HTTP forfeit gelirse ikinci kez hak eklenmez.
+    prestartRefundPromise: null,
     deadlineHandle: null,
     botFinishHandle: null,
     // Kullanıcı reconnect ekranındayken rakip zaten oyundan ayrılmış veya
@@ -13563,6 +13566,61 @@ function getRoomContextBySocket(socket) {
   };
 }
 
+function isInitialTwoPlayerPreparation(room) {
+  if (!room || room.resolved) return false;
+  const gameKey = String(room.gameKey || "");
+  return (
+    !room.isFriend &&
+    !gameKey.endsWith("_tournament") &&
+    !gameKey.endsWith("_hundred") &&
+    Number(room.roundIndex || 0) === 0 &&
+    Date.now() < Number(room.startsAtMillis || 0)
+  );
+}
+
+// Oyun hakkı yalnız gerçek oyunculardan tüketilir. Bot participant'ı refund listesine
+// katmak PLAYER_STATE_MISSING hatası üretip gerçek oyuncunun hakkının da iade edilmemesine yol açar.
+function refundableRealtimeParticipants(room) {
+  return roomParticipants(room).filter((item) => item && item.isBot !== true && item.playerId);
+}
+
+async function refundInitialTwoPlayerPreparationRights(room) {
+  if (!room) return new Map();
+  if (room.prestartRefundPromise) return room.prestartRefundPromise;
+
+  const refundPromise = (async () => {
+    const participants = roomParticipants(room);
+    const refundable = refundableRealtimeParticipants(room);
+    const states = await refundConsumedGameRights(
+      refundable.map((item) => item.playerId),
+      normalizeBaseGameKey(room.gameKey)
+    );
+
+    // Socket'i hâlâ bağlı olan oyuncuların ana ekran hak göstergesi de anında güncellensin.
+    participants.forEach((item) => {
+      const participantSocket = item.socketId
+        ? io.sockets.sockets.get(item.socketId)
+        : null;
+      const state = states.get(item.playerId);
+      if (participantSocket && state) {
+        participantSocket.emit("authoritative_reward", state);
+      }
+    });
+    return states;
+  })();
+
+  room.prestartRefundPromise = refundPromise;
+  try {
+    return await refundPromise;
+  } catch (error) {
+    // Geçici DB hatasında sonraki güvenli forfeit isteği yeniden deneyebilsin.
+    if (room.prestartRefundPromise === refundPromise) {
+      room.prestartRefundPromise = null;
+    }
+    throw error;
+  }
+}
+
 function leaveRoomAsCancel(socket) {
   const {
     active,
@@ -13580,27 +13638,12 @@ function leaveRoomAsCancel(socket) {
       opponent &&
       !opponent.finishedAt
     ) {
-      const isFreePreparationExit =
-        !room.isFriend &&
-        !String(room.gameKey || "").endsWith("_tournament") &&
-        Date.now() < Number(room.startsAtMillis || 0);
+      const isFreePreparationExit = isInitialTwoPlayerPreparation(room);
 
       if (isFreePreparationExit) {
-        const participants = roomParticipants(room);
         markRoomResolved(room, "prestart_cancelled", null, null);
 
-        refundConsumedGameRights(participants.map((item) => item.playerId), normalizeBaseGameKey(room.gameKey))
-          .then((states) => {
-            participants.forEach((item) => {
-              const participantSocket = item.socketId
-                ? io.sockets.sockets.get(item.socketId)
-                : null;
-              const state = states.get(item.playerId);
-              if (participantSocket && state) {
-                participantSocket.emit("authoritative_reward", state);
-              }
-            });
-          })
+        refundInitialTwoPlayerPreparationRights(room)
           .catch((error) => {
             console.error("prestart game-right refund error:", error);
           });
@@ -13697,14 +13740,10 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
     let state = null;
 
     if (!room.resolved && opponent) {
-      const isFreePreparationExit = Date.now() < Number(room.startsAtMillis || 0);
+      const isFreePreparationExit = isInitialTwoPlayerPreparation(room);
       if (isFreePreparationExit) {
-        const participants = roomParticipants(room);
         markRoomResolved(room, "prestart_cancelled", null, null);
-        const states = await refundConsumedGameRights(
-          participants.map((item) => item.playerId),
-          gameKey
-        );
+        const states = await refundInitialTwoPlayerPreparationRights(room);
         state = states.get(participant.playerId) || null;
         const opponentSocket = opponent.socketId ? io.sockets.sockets.get(opponent.socketId) : null;
         if (opponentSocket) {
@@ -13746,6 +13785,11 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
           }
         }
       }
+    } else if (room.prestartRefundPromise) {
+      // İlk el başlamadan socket koptuysa refund async devam ediyor olabilir.
+      // "Yeniden bağlanma" ekranından gelen HTTP isteği stale hak sayısı dönmesin.
+      const states = await room.prestartRefundPromise.catch(() => null);
+      state = states?.get(participant.playerId) || null;
     } else if (room.awardPromise) {
       // Disconnect timeout veya rakibin bitirmesi tam bu anda ödülü/cezayı yazıyorsa,
       // stale puan dönmek yerine aynı transaction'ın bitmesini bekle.
@@ -13784,6 +13828,41 @@ function markSocketDisconnected(socket) {
   ) {
     participant.connected = false;
     participant.socketId = null;
+    return;
+  }
+
+  const opponent = getOpponentParticipant(room, participant.playerId);
+
+  // İlk eşleşmeden sonra 1. el henüz başlamadıysa bağlantı kopması aktif maç olarak
+  // reconnect beklemez: oda hemen iptal edilir ve tüketilmiş oyun hakkı iade edilir.
+  // roundIndex > 0 olduğunda ise bu aynı startsAtMillis alanı EL ARASI countdown'dur;
+  // o durumda aşağıdaki normal reconnect süreci aynen korunur.
+  if (
+    isInitialTwoPlayerPreparation(room) &&
+    opponent &&
+    !opponent.finishedAt
+  ) {
+    markRoomResolved(room, "prestart_disconnected", null, null);
+    participant.connected = false;
+    participant.socketId = null;
+    participant.awaySince = null;
+    participant.backgrounded = false;
+    participant.reconnectDeadlineAt = null;
+
+    refundInitialTwoPlayerPreparationRights(room)
+      .catch((error) => {
+        console.error("prestart disconnect game-right refund error:", error);
+      });
+
+    const opponentSocket = opponent.socketId
+      ? io.sockets.sockets.get(opponent.socketId)
+      : null;
+    if (opponentSocket) {
+      opponentSocket.emit("opponent_left", {
+        roomId: room.roomId,
+        reason: "prestart_disconnected",
+      });
+    }
     return;
   }
 
