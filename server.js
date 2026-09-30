@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v31-20260930-prestart-appclose-score";
+const SERVER_BUILD_ID = "shared-game-flow-v30-20260928";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -12647,38 +12647,6 @@ function resolveRoomByAwayTimeout(
 
   if (!loser || loser.finishedAt) return;
 
-  // Uygulama kapanırken Android socket'i hemen düşürmeyebilir; yalnız player_backgrounded
-  // gelip 60 sn reconnect timeout'u çalışabilir. İlk el için oyuncu henüz gerçek oyun ekranına
-  // geçtiğini match_play_started ile onaylamadıysa bu timeout mağlubiyet/puan cezası değildir.
-  if (
-    isInitialTwoPlayerPreparation(room, loser) &&
-    opponent &&
-    !opponent.finishedAt
-  ) {
-    markRoomResolved(room, "prestart_timeout_cancelled", null, null);
-    loser.connected = false;
-    loser.socketId = null;
-    loser.awaySince = null;
-    loser.backgrounded = false;
-    loser.reconnectDeadlineAt = null;
-
-    refundInitialTwoPlayerPreparationRights(room)
-      .catch((error) => {
-        console.error("prestart timeout game-right refund error:", error);
-      });
-
-    const opponentSocket = opponent.socketId
-      ? io.sockets.sockets.get(opponent.socketId)
-      : null;
-    if (opponentSocket) {
-      opponentSocket.emit("opponent_left", {
-        roomId,
-        reason: "prestart_timeout_cancelled",
-      });
-    }
-    return;
-  }
-
   markRoomResolved(
     room,
     "timeout",
@@ -13392,9 +13360,6 @@ function createRealtimeRoom(
         reconnectDeadlineAt: null,
         timeoutHandle: null,
         digitAttackFlowHandle: null,
-        // İlk el için puan cezası yalnız istemci gerçekten oyun ekranına geçtiğini
-        // match_play_started ile onayladıktan sonra uygulanabilir.
-        firstRoundPlayStarted: false,
         finishedAt: null,
         elapsedMs: null,
         roundElapsedMs: null,
@@ -13417,9 +13382,6 @@ function createRealtimeRoom(
         reconnectDeadlineAt: null,
         timeoutHandle: null,
         digitAttackFlowHandle: null,
-        // İlk el için puan cezası yalnız istemci gerçekten oyun ekranına geçtiğini
-        // match_play_started ile onayladıktan sonra uygulanabilir.
-        firstRoundPlayStarted: false,
         finishedAt: null,
         elapsedMs: null,
         roundElapsedMs: null,
@@ -13604,16 +13566,15 @@ function getRoomContextBySocket(socket) {
   };
 }
 
-function isInitialTwoPlayerPreparation(room, participant = null) {
+function isInitialTwoPlayerPreparation(room) {
   if (!room || room.resolved) return false;
   const gameKey = String(room.gameKey || "");
-  const participantStartedFirstRound = participant?.firstRoundPlayStarted === true;
   return (
     !room.isFriend &&
     !gameKey.endsWith("_tournament") &&
     !gameKey.endsWith("_hundred") &&
     Number(room.roundIndex || 0) === 0 &&
-    !participantStartedFirstRound
+    Date.now() < Number(room.startsAtMillis || 0)
   );
 }
 
@@ -13677,7 +13638,7 @@ function leaveRoomAsCancel(socket) {
       opponent &&
       !opponent.finishedAt
     ) {
-      const isFreePreparationExit = isInitialTwoPlayerPreparation(room, participant);
+      const isFreePreparationExit = isInitialTwoPlayerPreparation(room);
 
       if (isFreePreparationExit) {
         markRoomResolved(room, "prestart_cancelled", null, null);
@@ -13779,7 +13740,7 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
     let state = null;
 
     if (!room.resolved && opponent) {
-      const isFreePreparationExit = isInitialTwoPlayerPreparation(room, participant);
+      const isFreePreparationExit = isInitialTwoPlayerPreparation(room);
       if (isFreePreparationExit) {
         markRoomResolved(room, "prestart_cancelled", null, null);
         const states = await refundInitialTwoPlayerPreparationRights(room);
@@ -13877,7 +13838,7 @@ function markSocketDisconnected(socket) {
   // roundIndex > 0 olduğunda ise bu aynı startsAtMillis alanı EL ARASI countdown'dur;
   // o durumda aşağıdaki normal reconnect süreci aynen korunur.
   if (
-    isInitialTwoPlayerPreparation(room, participant) &&
+    isInitialTwoPlayerPreparation(room) &&
     opponent &&
     !opponent.finishedAt
   ) {
@@ -14906,38 +14867,6 @@ io.on("connection", (socket) => {
   );
 
   socket.on(
-    "match_play_started",
-    async (payload = {}) => {
-      const fallbackActive = activeRooms.get(socket.id);
-      const roomId = String(payload.roomId || fallbackActive?.roomId || "").trim();
-      const room = realtimeRooms.get(roomId);
-      const playerId = fallbackActive?.playerId || roomParticipants(room).find(
-        (item) => item.socketId === socket.id
-      )?.playerId;
-      const participant = getParticipant(room, playerId);
-
-      if (!room || !participant || room.resolved || participant.isBot) return;
-      if (!(await socketHasActiveGameplaySession(socket, participant.playerId, "match_error"))) return;
-
-      // Arka plana geçmiş/kapanmakta olan istemciden geç ulaşan başlangıç eventi ceza
-      // kapısını açamaz. Yeni Android istemcisi bu eventi yalnız RESUMED oyun ekranından yollar;
-      // bu sunucu kontrolü de event sıralaması ters dönerse ek güvenlik sağlar.
-      if (participant.backgrounded === true || participant.connected !== true) return;
-
-      const requestedRoundIndex = Math.max(0, Number(payload.roundIndex || 0));
-      if (requestedRoundIndex !== Number(room.roundIndex || 0)) return;
-      if (Date.now() + 500 < Number(room.startsAtMillis || 0)) return;
-
-      // İlk el için puan cezası, geri sayım saatinin dolmasına değil kullanıcının gerçekten
-      // oyun ekranına geçtiğine bağlanır. Socket/cancel olayı birkaç yüz ms geç ulaşsa bile
-      // hazırlık aşamasında kapanan uygulama artık hükmen mağlubiyet sayılmaz.
-      if (room.roundIndex === 0) {
-        participant.firstRoundPlayStarted = true;
-      }
-    }
-  );
-
-  socket.on(
     "player_backgrounded",
     (payload = {}) => {
       const fallbackActive =
@@ -15427,7 +15356,6 @@ io.on("connection", (socket) => {
         socket.emit("match_error", { code: "MATCH_NOT_STARTED", message: "Hazırlık geri sayımı henüz tamamlanmadı." });
         return;
       }
-      if (room.roundIndex === 0) participant.firstRoundPlayStarted = true;
       const baseGameKey = normalizeBaseGameKey(room.gameKey);
       let checkpointState = null;
       let validAnswer = false;
