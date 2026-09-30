@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v33-20260930-reconnect-forfeit-score-cache-opt";
+const SERVER_BUILD_ID = "shared-game-flow-v31-20260930-prestart-appclose-score";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -4347,26 +4347,6 @@ async function ensureAllPlayerGameProgress(client, playerId) {
      ON CONFLICT (player_id, game_key) DO NOTHING`,
     [playerId, gameKeys, INITIAL_PER_GAME_SCORE, monthKey]
   );
-}
-
-async function readAllGameGeneralScores(client, playerId) {
-  const gameKeys = Object.keys(GAME_DEFINITIONS);
-  const scores = Object.fromEntries(
-    gameKeys.map((gameKey) => [gameKey, safeScoreNumber(INITIAL_PER_GAME_SCORE)])
-  );
-  const result = await client.query(
-    `SELECT game_key, general_score
-     FROM player_game_progress
-     WHERE player_id = $1 AND game_key = ANY($2::text[])`,
-    [playerId, gameKeys]
-  );
-  for (const row of result.rows) {
-    const gameKey = normalizeBaseGameKey(row.game_key);
-    if (Object.prototype.hasOwnProperty.call(scores, gameKey)) {
-      scores[gameKey] = safeScoreNumber(row.general_score, INITIAL_PER_GAME_SCORE);
-    }
-  }
-  return scores;
 }
 
 async function readPlayerGameProgress(client, playerId, gameKey, forUpdate = false) {
@@ -10272,16 +10252,6 @@ app.get("/player/state", requireAuth, async (req, res) => {
         client.release();
       }
     }
-    // Tüm oyun puanlarını alan ek SELECT yalnız istemci açıkça snapshot istediğinde çalışır.
-    // Normal rekabetçi erişim/yenileme çağrıları includeGameScores göndermediği için 20 oyunluk
-    // sorgu maliyeti oluşturmaz. Uygulama açılışı/hesap değişimi bunu süreç başına bir kez ister.
-    const includeGameScores = String(req.query.includeGameScores || "") === "1";
-    if (includeGameScores) {
-      const gameScores = await readAllGameGeneralScores(pool, playerId);
-      if (state?.gameKey) gameScores[state.gameKey] = safeScoreNumber(state.generalScore);
-      res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state, gameScores });
-      return;
-    }
     res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state });
   } catch (error) {
     sendLeaderboardError(res, error, "Oyuncu durumu yüklenemedi.", "player state error:");
@@ -15383,15 +15353,6 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Geçerli oyun-tahtası checkpoint'i yalnız gerçek oyun ekranı oluşturulduktan sonra
-      // gönderilir. İlk turun başlangıç event'i cihaz kapanışı/lifecycle yarışı nedeniyle kaçmışsa
-      // bu authoritative olarak doğrulanmış checkpoint de "oyun gerçekten başladı" kanıtıdır.
-      // Böylece kullanıcı gerçek oyunda uygulamayı kapatıp reconnect ekranında "Hayır" dediğinde
-      // prestart ücretsiz iptal dalına yanlışlıkla düşmez.
-      if (room.roundIndex === 0 && Date.now() >= Number(room.startsAtMillis || 0)) {
-        participant.firstRoundPlayStarted = true;
-      }
-
       // Assignment intentionally replaces the previous checkpoint. We keep one latest state,
       // not a growing list of moves or historical snapshots.
       participant.resumeCheckpoint = checkpoint;
@@ -15440,12 +15401,6 @@ io.on("connection", (socket) => {
       const checkpoint = gameKey === "merge_5120"
         ? merge5120InfiniteCheckpointPayload(state)
         : digitHuntInfiniteCheckpointPayload(state);
-
-      // 729 / Rakam Avı gibi progress-event kullanan oyunlarda da ilk turdaki geçerli
-      // sunucu-doğrulanmış hareket gerçek oyun başlangıcının kesin kanıtıdır.
-      if (room.roundIndex === 0 && Date.now() >= Number(room.startsAtMillis || 0)) {
-        participant.firstRoundPlayStarted = true;
-      }
       participant.progressState = { roundIndex: room.roundIndex, gameKey, checkpoint };
       socket.emit("player_progress_ack", {
         roomId: room.roomId,
