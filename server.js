@@ -13633,12 +13633,17 @@ function isInitialTwoPlayerPreparation(room, participant = null) {
   if (!room || room.resolved) return false;
   const gameKey = String(room.gameKey || "");
   const participantStartedFirstRound = participant?.firstRoundPlayStarted === true;
+  // match_play_started paketi, kullanıcı oyun ekranına geçtiği anda cancel/disconnect ile
+  // yarışabilir. Geri sayım sunucu saatine göre bittiyse artık hazırlık aşaması değildir;
+  // aksi halde açıkça "Evet, çık" / reconnect "Hayır" diyen oyuncu ücretsiz çıkabiliyordu.
+  const firstRoundClockStarted = Date.now() >= Number(room.startsAtMillis || Number.MAX_SAFE_INTEGER);
   return (
     !room.isFriend &&
     !gameKey.endsWith("_tournament") &&
     !gameKey.endsWith("_hundred") &&
     Number(room.roundIndex || 0) === 0 &&
-    !participantStartedFirstRound
+    !participantStartedFirstRound &&
+    !firstRoundClockStarted
   );
 }
 
