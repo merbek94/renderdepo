@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v32-20260930-instant-game-score-cache";
+const SERVER_BUILD_ID = "shared-game-flow-v33-20260930-reconnect-forfeit-score-cache-opt";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -10272,12 +10272,17 @@ app.get("/player/state", requireAuth, async (req, res) => {
         client.release();
       }
     }
-    // Uygulama açılışındaki /player/state isteği bütün oyunların normal puanlarını tek seferde
-    // döndürür. Android bu snapshot'ı oyuncu+oyun bazlı kalıcı cache'e yazar. Bu ek sorgu yalnız
-    // /player/state için çalışır; her oyun sonucu/reward cevabına 20 oyunluk yük eklenmez.
-    const gameScores = await readAllGameGeneralScores(pool, playerId);
-    if (state?.gameKey) gameScores[state.gameKey] = safeScoreNumber(state.generalScore);
-    res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state, gameScores });
+    // Tüm oyun puanlarını alan ek SELECT yalnız istemci açıkça snapshot istediğinde çalışır.
+    // Normal rekabetçi erişim/yenileme çağrıları includeGameScores göndermediği için 20 oyunluk
+    // sorgu maliyeti oluşturmaz. Uygulama açılışı/hesap değişimi bunu süreç başına bir kez ister.
+    const includeGameScores = String(req.query.includeGameScores || "") === "1";
+    if (includeGameScores) {
+      const gameScores = await readAllGameGeneralScores(pool, playerId);
+      if (state?.gameKey) gameScores[state.gameKey] = safeScoreNumber(state.generalScore);
+      res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state, gameScores });
+      return;
+    }
+    res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state });
   } catch (error) {
     sendLeaderboardError(res, error, "Oyuncu durumu yüklenemedi.", "player state error:");
   }
@@ -15378,6 +15383,15 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // Geçerli oyun-tahtası checkpoint'i yalnız gerçek oyun ekranı oluşturulduktan sonra
+      // gönderilir. İlk turun başlangıç event'i cihaz kapanışı/lifecycle yarışı nedeniyle kaçmışsa
+      // bu authoritative olarak doğrulanmış checkpoint de "oyun gerçekten başladı" kanıtıdır.
+      // Böylece kullanıcı gerçek oyunda uygulamayı kapatıp reconnect ekranında "Hayır" dediğinde
+      // prestart ücretsiz iptal dalına yanlışlıkla düşmez.
+      if (room.roundIndex === 0 && Date.now() >= Number(room.startsAtMillis || 0)) {
+        participant.firstRoundPlayStarted = true;
+      }
+
       // Assignment intentionally replaces the previous checkpoint. We keep one latest state,
       // not a growing list of moves or historical snapshots.
       participant.resumeCheckpoint = checkpoint;
@@ -15426,6 +15440,12 @@ io.on("connection", (socket) => {
       const checkpoint = gameKey === "merge_5120"
         ? merge5120InfiniteCheckpointPayload(state)
         : digitHuntInfiniteCheckpointPayload(state);
+
+      // 729 / Rakam Avı gibi progress-event kullanan oyunlarda da ilk turdaki geçerli
+      // sunucu-doğrulanmış hareket gerçek oyun başlangıcının kesin kanıtıdır.
+      if (room.roundIndex === 0 && Date.now() >= Number(room.startsAtMillis || 0)) {
+        participant.firstRoundPlayStarted = true;
+      }
       participant.progressState = { roundIndex: room.roundIndex, gameKey, checkpoint };
       socket.emit("player_progress_ack", {
         roomId: room.roomId,
