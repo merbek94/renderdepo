@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v30-20260928";
+const SERVER_BUILD_ID = "shared-game-flow-v31-20260930-prestart-appclose-score";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -14918,6 +14918,11 @@ io.on("connection", (socket) => {
 
       if (!room || !participant || room.resolved || participant.isBot) return;
       if (!(await socketHasActiveGameplaySession(socket, participant.playerId, "match_error"))) return;
+
+      // Arka plana geçmiş/kapanmakta olan istemciden geç ulaşan başlangıç eventi ceza
+      // kapısını açamaz. Yeni Android istemcisi bu eventi yalnız RESUMED oyun ekranından yollar;
+      // bu sunucu kontrolü de event sıralaması ters dönerse ek güvenlik sağlar.
+      if (participant.backgrounded === true || participant.connected !== true) return;
 
       const requestedRoundIndex = Math.max(0, Number(payload.roundIndex || 0));
       if (requestedRoundIndex !== Number(room.roundIndex || 0)) return;
