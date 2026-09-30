@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v31-20260930-prestart-appclose-score";
+const SERVER_BUILD_ID = "shared-game-flow-v32-20260930-instant-game-score-cache";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -4347,6 +4347,26 @@ async function ensureAllPlayerGameProgress(client, playerId) {
      ON CONFLICT (player_id, game_key) DO NOTHING`,
     [playerId, gameKeys, INITIAL_PER_GAME_SCORE, monthKey]
   );
+}
+
+async function readAllGameGeneralScores(client, playerId) {
+  const gameKeys = Object.keys(GAME_DEFINITIONS);
+  const scores = Object.fromEntries(
+    gameKeys.map((gameKey) => [gameKey, safeScoreNumber(INITIAL_PER_GAME_SCORE)])
+  );
+  const result = await client.query(
+    `SELECT game_key, general_score
+     FROM player_game_progress
+     WHERE player_id = $1 AND game_key = ANY($2::text[])`,
+    [playerId, gameKeys]
+  );
+  for (const row of result.rows) {
+    const gameKey = normalizeBaseGameKey(row.game_key);
+    if (Object.prototype.hasOwnProperty.call(scores, gameKey)) {
+      scores[gameKey] = safeScoreNumber(row.general_score, INITIAL_PER_GAME_SCORE);
+    }
+  }
+  return scores;
 }
 
 async function readPlayerGameProgress(client, playerId, gameKey, forUpdate = false) {
@@ -10252,7 +10272,12 @@ app.get("/player/state", requireAuth, async (req, res) => {
         client.release();
       }
     }
-    res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state });
+    // Uygulama açılışındaki /player/state isteği bütün oyunların normal puanlarını tek seferde
+    // döndürür. Android bu snapshot'ı oyuncu+oyun bazlı kalıcı cache'e yazar. Bu ek sorgu yalnız
+    // /player/state için çalışır; her oyun sonucu/reward cevabına 20 oyunluk yük eklenmez.
+    const gameScores = await readAllGameGeneralScores(pool, playerId);
+    if (state?.gameKey) gameScores[state.gameKey] = safeScoreNumber(state.generalScore);
+    res.json({ ok: true, abandonedHundredSettled: shouldSettleAbandonedHundred, ...state, gameScores });
   } catch (error) {
     sendLeaderboardError(res, error, "Oyuncu durumu yüklenemedi.", "player state error:");
   }
