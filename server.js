@@ -522,6 +522,15 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS player_lobby_bot_history (
+      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+      bot_key TEXT NOT NULL,
+      played_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (player_id, bot_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_player_lobby_bot_history_player_played
+      ON player_lobby_bot_history (player_id, played_at DESC);
+
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0;
 
@@ -3819,6 +3828,17 @@ function minimumTwoPlayerStake(difficulty) {
   return secureDifficulty(difficulty) === "Hard" ? 15 : 10;
 }
 
+function assertPublicTwoPlayerScoreLimit(availableScore) {
+  const score = safeScoreNumber(availableScore);
+  if (score > TWO_PLAYER_MAX_PUBLIC_SCORE) {
+    const error = new Error("İkili oyun salonlarında üst puan sınırı 10.000.000 puandır.");
+    error.statusCode = 409;
+    error.publicCode = "TWO_PLAYER_SCORE_ABOVE_MAX";
+    throw error;
+  }
+  return score;
+}
+
 function quickStakeRange(availableScore, difficulty) {
   // Bahis/masa puanı protokolü hâlâ Int tabanlıdır; toplam oyuncu skoru 2 milyarı
   // geçse bile yalnız bahis üretimi kendi bağımsız güvenli aralığında kalır.
@@ -3877,6 +3897,7 @@ function minimumOpenTableStake(availableScore, difficulty) {
 }
 
 function assertOpenTableStake(stakePoints, availableScore, difficulty) {
+  assertPublicTwoPlayerScoreLimit(availableScore);
   const minimum = minimumOpenTableStake(availableScore, difficulty);
   const requested = Math.floor(Number(stakePoints || 0));
   if (!Number.isFinite(requested) || requested < minimum) {
@@ -4029,7 +4050,8 @@ async function consumeGameRightsForPlayers(
   playerIds,
   difficulty,
   wagerPoints = minimumTwoPlayerStake(difficulty),
-  gameKey = "target_number"
+  gameKey = "target_number",
+  enforcePublicScoreLimit = false
 ) {
   const baseGameKey = normalizeBaseGameKey(gameKey);
   const uniqueIds = [...new Set((playerIds || []).filter(Boolean).map(String))].sort();
@@ -4062,6 +4084,7 @@ async function consumeGameRightsForPlayers(
     const byId = new Map(locked.rows.map((row) => [String(row.player_id), row]));
     const states = uniqueIds.map((playerId) => {
       const row = byId.get(playerId);
+      if (enforcePublicScoreLimit) assertPublicTwoPlayerScoreLimit(row?.general_score);
       return {
         playerId,
         ...normalizedGameRightConsumption(row, difficulty, wagerPoints, false),
@@ -10432,9 +10455,27 @@ app.get("/player/state", requireAuth, async (req, res) => {
   }
 });
 
+const DIAMOND_SCORE_EXCHANGE_OPTIONS = new Map([
+  [1, 20],
+  [10, 400],
+  [100, 10_000],
+  [1_000, 300_000],
+  [10_000, 10_000_000],
+]);
+
 app.post("/game/diamonds/score", requireAuth, challengeMutationRateLimit, async (req, res) => {
   if (!requireDatabase(res)) return;
   const gameKey = normalizeBaseGameKey(req.body.gameKey);
+  const diamondAmount = Math.floor(Number(req.body.diamondAmount ?? 1));
+  const pointsToAdd = DIAMOND_SCORE_EXCHANGE_OPTIONS.get(diamondAmount);
+  if (!pointsToAdd) {
+    res.status(400).json({
+      ok: false,
+      code: "INVALID_DIAMOND_EXCHANGE",
+      message: "Geçersiz elmas-puan dönüştürme seçeneği.",
+    });
+    return;
+  }
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -10445,22 +10486,22 @@ app.post("/game/diamonds/score", requireAuth, challengeMutationRateLimit, async 
       [req.auth.sub]
     );
     const diamondBalance = Math.max(0, Number(progress.rows[0]?.diamond_balance || 0));
-    if (diamondBalance < 1) {
-      const error = new Error("Puan kazanmak için en az 1 elmas gerekir.");
+    if (diamondBalance < diamondAmount) {
+      const error = new Error(`${diamondAmount.toLocaleString("tr-TR")} elmas gerekli.`);
       error.statusCode = 409;
-      error.publicCode = "DIAMOND_REQUIRED";
+      error.publicCode = "DIAMONDS_REQUIRED";
       throw error;
     }
     await client.query(
       `UPDATE player_progress
-       SET diamond_balance = diamond_balance - 1, updated_at = NOW()
+       SET diamond_balance = diamond_balance - $2, updated_at = NOW()
        WHERE player_id = $1`,
-      [req.auth.sub]
+      [req.auth.sub, diamondAmount]
     );
-    await applyGameGeneralScoreDeltaInTransaction(client, req.auth.sub, gameKey, 20);
+    await applyGameGeneralScoreDeltaInTransaction(client, req.auth.sub, gameKey, pointsToAdd);
     const state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
     await client.query("COMMIT");
-    res.json({ ok: true, ...state, diamondSpent: 1, pointsAdded: 20 });
+    res.json({ ok: true, ...state, diamondSpent: diamondAmount, pointsAdded: pointsToAdd });
   } catch (error) {
     await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Elmas puana çevrilemedi.", "diamond score exchange error:");
@@ -10778,6 +10819,7 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         matchMode === "quick",
         gameKey
       );
+      assertPublicTwoPlayerScoreLimit(consumed.generalScore);
       if (matchMode === "open_table") {
         assertOpenTableStake(req.body.wagerPoints, consumed.generalScore, requestedDifficulty);
       }
@@ -12414,6 +12456,8 @@ const privateRooms = new Map();
 const publicOpenTables = new Map();
 const generatedLobbyBots = new Map();
 
+const TWO_PLAYER_MAX_PUBLIC_SCORE = 10_000_000;
+
 const TWO_PLAYER_ROOM_GROUPS = [
   { id: "acemi", title: "Acemi Masaları", subtitle: "10 - 100", minScore: 10, maxScore: 100 },
   { id: "bronz", title: "Bronz Salon", subtitle: "80 - 500", minScore: 80, maxScore: 500 },
@@ -12422,7 +12466,18 @@ const TWO_PLAYER_ROOM_GROUPS = [
   { id: "platin", title: "Platin Salon", subtitle: "4.000 - 50.000", minScore: 4_000, maxScore: 50_000 },
   { id: "elmas", title: "Elmas Salon", subtitle: "20.000 - 200.000", minScore: 20_000, maxScore: 200_000 },
   { id: "efsane", title: "Efsane Salon", subtitle: "200.000 - 2.000.000", minScore: 200_000, maxScore: 2_000_000 },
-  { id: "sonsuz", title: "Sonsuz Masa", subtitle: "1.000.000 ve üzeri", minScore: 1_000_000, maxScore: null },
+  { id: "sonsuz", title: "Sonsuz Masa", subtitle: "1.000.000 - 10.000.000", minScore: 1_000_000, maxScore: TWO_PLAYER_MAX_PUBLIC_SCORE },
+];
+
+const LOBBY_ROOM_COUNT_RANGES = [
+  { min: 25, max: 50 }, // Acemi
+  { min: 20, max: 45 }, // Bronz
+  { min: 20, max: 40 }, // Gümüş
+  { min: 20, max: 35 }, // Altın
+  { min: 15, max: 35 }, // Platin
+  { min: 15, max: 30 }, // Elmas
+  { min: 15, max: 25 }, // Efsane
+  { min: 10, max: 20 }, // Sonsuz
 ];
 
 const LOBBY_BOT_FIRST_PARTS = [
@@ -12439,32 +12494,56 @@ const LOBBY_BOT_COUNTRIES = [
   "JP", "CN", "KR", "TH", "EG", "SA", "IR", "IN", "BD", "PK", "VN", "AR",
 ];
 
-function createLobbyBotIdentity(usedNames = new Set()) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const first = LOBBY_BOT_FIRST_PARTS[secureRandomInt(0, LOBBY_BOT_FIRST_PARTS.length)];
-    const second = LOBBY_BOT_SECOND_PARTS[secureRandomInt(0, LOBBY_BOT_SECOND_PARTS.length)];
-    const number = secureRandomInt(1, 1000);
-    const pattern = secureRandomInt(0, 5);
-    const name = pattern === 0
-      ? `${first}${second}`
-      : pattern === 1
-        ? `${first}.${second}`
-        : pattern === 2
-          ? `${first}${number}`
-          : pattern === 3
-            ? `${second}${first}`
-            : `${first}_${second}${secureRandomInt(1, 100)}`;
-    if (!usedNames.has(name)) {
-      usedNames.add(name);
-      return {
-        name,
-        country: LOBBY_BOT_COUNTRIES[secureRandomInt(0, LOBBY_BOT_COUNTRIES.length)],
-      };
-    }
-  }
-  const fallbackName = `Oyuncu${crypto.randomBytes(4).toString("hex")}`;
-  usedNames.add(fallbackName);
-  return { name: fallbackName, country: "TR" };
+function stableLobbyInt(seed, minimumInclusive, maximumExclusive) {
+  const minimum = Math.floor(Number(minimumInclusive || 0));
+  const maximum = Math.floor(Number(maximumExclusive || minimum + 1));
+  if (maximum <= minimum) return minimum;
+  const digest = crypto.createHash("sha256").update(String(seed)).digest();
+  return minimum + (digest.readUInt32BE(0) % (maximum - minimum));
+}
+
+function sharedLobbyBotIdentity(groupId, botIndex) {
+  const safeIndex = Math.max(0, Math.floor(Number(botIndex || 0)));
+  const groupIndex = Math.max(0, TWO_PLAYER_ROOM_GROUPS.findIndex((group) => group.id === groupId));
+  const seed = `shared-lobby-bot-v1:${groupId}:${safeIndex}`;
+  const first = LOBBY_BOT_FIRST_PARTS[stableLobbyInt(`${seed}:first`, 0, LOBBY_BOT_FIRST_PARTS.length)];
+  const second = LOBBY_BOT_SECOND_PARTS[stableLobbyInt(`${seed}:second`, 0, LOBBY_BOT_SECOND_PARTS.length)];
+  const uniqueNumber = groupIndex * 100_000 + safeIndex + 1;
+  const pattern = stableLobbyInt(`${seed}:pattern`, 0, 5);
+  const name = pattern === 0
+    ? `${first}${second}${uniqueNumber}`
+    : pattern === 1
+      ? `${first}.${second}${uniqueNumber}`
+      : pattern === 2
+        ? `${first}${uniqueNumber}`
+        : pattern === 3
+          ? `${second}${first}${uniqueNumber}`
+          : `${first}_${second}${uniqueNumber}`;
+  return {
+    name: name.slice(0, 40),
+    country: LOBBY_BOT_COUNTRIES[stableLobbyInt(`${seed}:country`, 0, LOBBY_BOT_COUNTRIES.length)],
+  };
+}
+
+function sharedLobbyBotKey(groupId, botIndex) {
+  return `shared:${groupId}:${Math.max(0, Math.floor(Number(botIndex || 0)))}`;
+}
+
+function sharedLobbyBotListingId(gameKey, difficulty, groupId, botIndex) {
+  return `bot:shared:${normalizeBaseGameKey(gameKey)}:${secureDifficulty(difficulty)}:${groupId}:${Math.max(0, Math.floor(Number(botIndex || 0)))}`;
+}
+
+function parseSharedLobbyBotListingId(listingId) {
+  const parts = String(listingId || "").split(":");
+  if (parts.length !== 6 || parts[0] !== "bot" || parts[1] !== "shared") return null;
+  const botIndex = Number(parts[5]);
+  if (!Number.isInteger(botIndex) || botIndex < 0) return null;
+  return {
+    gameKey: normalizeBaseGameKey(parts[2]),
+    difficulty: secureDifficulty(parts[3]),
+    groupId: safeText(parts[4], "", 32),
+    botIndex,
+  };
 }
 
 function roomGroupForStake(stakePoints) {
@@ -12474,16 +12553,23 @@ function roomGroupForStake(stakePoints) {
   ) || TWO_PLAYER_ROOM_GROUPS[TWO_PLAYER_ROOM_GROUPS.length - 1];
 }
 
-function roomTargetCount(groupIndex) {
-  if (groupIndex <= 4) return 10;
-  if (groupIndex === 5) return secureRandomInt(5, 11);
-  return secureRandomInt(2, 6);
+function roomTargetCount(groupIndex, gameKey, difficulty) {
+  const range = LOBBY_ROOM_COUNT_RANGES[groupIndex] || { min: 10, max: 20 };
+  // Beş dakikalık ortak dilim aynı lig/oyun/zorluktaki bütün oyunculara aynı temel sayıyı verir.
+  const timeBucket = Math.floor(Date.now() / (5 * 60_000));
+  return stableLobbyInt(
+    `lobby-count-v1:${groupIndex}:${normalizeBaseGameKey(gameKey)}:${secureDifficulty(difficulty)}:${timeBucket}`,
+    range.min,
+    range.max + 1
+  );
 }
 
-function generatedRoomRoundCount(groupIndex, currentMultiRoomCount, targetCount) {
+function generatedRoomRoundCount(groupIndex, _currentMultiRoomCount, _targetCount, botIndex = 0) {
   if (groupIndex < 3) return 1;
-  const desiredMultiRoomCount = Math.round(targetCount / 2);
-  return currentMultiRoomCount < desiredMultiRoomCount ? secureRandomInt(2, 4) : 1;
+  // Botun el sayısı listing önbelleği silinse bile yalnız botIndex'ten yeniden üretilebilsin.
+  return botIndex % 2 === 0
+    ? stableLobbyInt(`lobby-round-v1:${groupIndex}:${botIndex}`, 2, 4)
+    : 1;
 }
 
 function expireGeneratedLobbyBots() {
@@ -12491,6 +12577,42 @@ function expireGeneratedLobbyBots() {
   for (const [listingId, bot] of generatedLobbyBots.entries()) {
     if (now - Number(bot.createdAt || 0) > 3 * 60 * 1000) generatedLobbyBots.delete(listingId);
   }
+}
+
+async function loadPlayedLobbyBotKeys(playerId) {
+  const result = await pool.query(
+    `SELECT bot_key FROM player_lobby_bot_history WHERE player_id = $1`,
+    [playerId]
+  );
+  return new Set(result.rows.map((row) => String(row.bot_key || "")).filter(Boolean));
+}
+
+async function rememberLobbyBotPlayed(playerId, botKey) {
+  if (!botKey) return;
+  await pool.query(
+    `INSERT INTO player_lobby_bot_history (player_id, bot_key, played_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (player_id, bot_key) DO UPDATE SET played_at = EXCLUDED.played_at`,
+    [playerId, botKey]
+  );
+}
+
+function deterministicLobbyStakeForGroup(group, difficulty, botIndex) {
+  const minimum = Math.max(group.minScore, minimumTwoPlayerStake(difficulty));
+  const maximum = Math.max(minimum, Number(group.maxScore ?? TWO_PLAYER_MAX_PUBLIC_SCORE));
+  if (maximum <= minimum) return minimum;
+
+  const span = maximum - minimum;
+  const preferredMaximum = Math.min(maximum, minimum + Math.max(1, Math.ceil(span / 6)));
+  const useLowerBand = stableLobbyInt(`lobby-stake-band-v1:${group.id}:${difficulty}:${botIndex}`, 0, 100) < 75;
+  const lower = useLowerBand ? minimum : Math.min(maximum, preferredMaximum + 1);
+  const upper = useLowerBand ? preferredMaximum : maximum;
+  let stake = stableLobbyInt(`lobby-stake-v1:${group.id}:${difficulty}:${botIndex}`, lower, upper + 1);
+  if (stableLobbyInt(`lobby-stake-friendly-v1:${group.id}:${difficulty}:${botIndex}`, 0, 100) < 40) {
+    const rounded = Math.round(stake / 50) * 50;
+    if (rounded >= lower && rounded <= upper) stake = rounded;
+  }
+  return Math.max(minimum, Math.min(maximum, stake));
 }
 
 function randomStakeForGroup(group, difficulty) {
@@ -12515,6 +12637,45 @@ function randomStakeForGroup(group, difficulty) {
   }
 
   return randomStakeWithNaturalEnding(preferredMaximum + 1, maximum);
+}
+
+
+function buildSharedLobbyBotTable(gameKey, difficulty, groupId, botIndex, listingIdOverride = null) {
+  const groupIndex = TWO_PLAYER_ROOM_GROUPS.findIndex((item) => item.id === groupId);
+  if (groupIndex < 0) return null;
+  const group = TWO_PLAYER_ROOM_GROUPS[groupIndex];
+  const identity = sharedLobbyBotIdentity(group.id, botIndex);
+  const targetCount = roomTargetCount(groupIndex, gameKey, difficulty);
+  const roundCount = generatedRoomRoundCount(groupIndex, 0, targetCount, botIndex);
+  return {
+    listingId: listingIdOverride || sharedLobbyBotListingId(gameKey, difficulty, group.id, botIndex),
+    botKey: sharedLobbyBotKey(group.id, botIndex),
+    botIndex,
+    groupId: group.id,
+    player: {
+      id: `bot_shared_${group.id}_${botIndex}`,
+      name: identity.name,
+      country: identity.country,
+      isBot: true,
+    },
+    gameKey: normalizeBaseGameKey(gameKey),
+    difficulty: secureDifficulty(difficulty),
+    stakePoints: deterministicLobbyStakeForGroup(group, difficulty, botIndex),
+    roundCount,
+    createdAt: Date.now(),
+    stateless: true,
+  };
+}
+
+async function nextUnplayedSharedLobbyBot(playerId, groupId) {
+  const played = await loadPlayedLobbyBotKeys(playerId);
+  for (let botIndex = 0; botIndex < 100_000; botIndex += 1) {
+    const botKey = sharedLobbyBotKey(groupId, botIndex);
+    if (played.has(botKey)) continue;
+    const identity = sharedLobbyBotIdentity(groupId, botIndex);
+    return { botKey, botIndex, identity };
+  }
+  return null;
 }
 
 const LOBBY_EVENT_DEBOUNCE_MS = Math.max(100, Math.min(2_000,
@@ -12583,10 +12744,9 @@ const PRIVATE_ROOM_TTL_MS = Number(
     15 * 60 * 1000
 );
 
-const ROOM_RECONNECT_TIMEOUT_MS = Number(
-  process.env.ROOM_RECONNECT_TIMEOUT_MS ||
-    60 * 1000
-);
+// Normal ikili oyunda bağlantı kurtarma penceresi kesin olarak 1 dakikadır.
+// Ortam değişkeniyle uzatılamaz; Android ve sunucu aynı authoritative süreyi kullanır.
+const ROOM_RECONNECT_TIMEOUT_MS = 60 * 1000;
 
 const TWO_PLAYER_PREPARE_MS = Number(
   process.env.TWO_PLAYER_PREPARE_MS ||
@@ -14400,42 +14560,44 @@ async function authenticatedSocketPlayerFromDatabase(socket, payload, errorEvent
 app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
   if (!requireDatabase(res)) return;
   expireOldOpenTables();
-  const clientBots = String(req.query.clientBots || "") === "1";
-  if (!clientBots) expireGeneratedLobbyBots();
+  expireGeneratedLobbyBots();
   const difficulty = secureDifficulty(req.query.difficulty);
   const gameKey = normalizeBaseGameKey(req.query.gameKey);
   try {
-    // Yeni istemcide lobi uygunluğu yalnız görsel bilgidir; gerçek oyuna girişte puan tekrar
-    // authoritative DB state ile doğrulanır. Böylece her lobi refresh'inde PostgreSQL SELECT yoktur.
-    let requesterScore = safeScore(req.query.score);
-    if (!clientBots) {
-      const scoreResult = await pool.query(
-        `SELECT general_score
-         FROM player_game_progress
-         WHERE player_id = $1 AND game_key = $2`,
-        [req.auth.sub, gameKey]
-      );
-      requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
-    }
+    const scoreResult = await pool.query(
+      `SELECT general_score
+       FROM player_game_progress
+       WHERE player_id = $1 AND game_key = $2`,
+      [req.auth.sub, gameKey]
+    );
+    const requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
+    const playedBotKeys = await loadPlayedLobbyBotKeys(req.auth.sub);
+
     const realTables = [...publicOpenTables.values()]
-      .filter((table) => table.player.id !== req.auth.sub && table.difficulty === difficulty && normalizeBaseGameKey(table.gameKey) === gameKey)
+      .filter((table) =>
+        table.player.id !== req.auth.sub &&
+        table.difficulty === difficulty &&
+        normalizeBaseGameKey(table.gameKey) === gameKey
+      )
       .sort((a, b) => a.createdAt - b.createdAt);
 
     const usedListings = new Set();
-    const usedLobbyBotNames = new Set(realTables.map((table) => table.player.name));
     const groups = TWO_PLAYER_ROOM_GROUPS.map((group, groupIndex) => {
-      const normalTargetCount = roomTargetCount(groupIndex);
+      const countRange = LOBBY_ROOM_COUNT_RANGES[groupIndex] || { min: 10, max: 20 };
+      const normalTargetCount = roomTargetCount(groupIndex, gameKey, difficulty);
       const realCandidates = realTables.filter((table) => {
         if (usedListings.has(table.listingId)) return false;
         return table.stakePoints >= group.minScore &&
           (group.maxScore == null || table.stakePoints <= group.maxScore);
       });
-      // Üst salonlarda gerçek masa sayısı normal bot hedefini aşarsa bütün gerçek
-      // masaları göster; ancak tek salonda görünen toplam masa sayısı 10'u geçmesin.
-      const targetCount = groupIndex >= 5
-        ? Math.min(10, Math.max(normalTargetCount, realCandidates.length))
-        : normalTargetCount;
-      const matchingReal = realCandidates.slice(0, targetCount);
+
+      // Gerçek oyuncular bot hedefinden önceliklidir. Salondaki gerçek masa sayısı temel hedefi
+      // aşıyorsa, o salonun kullanıcı tarafından istenen üst görünür sayısına kadar hepsi gösterilir.
+      const targetCount = Math.min(
+        countRange.max,
+        Math.max(normalTargetCount, realCandidates.length)
+      );
+      const matchingReal = realCandidates.slice(0, countRange.max);
       matchingReal.forEach((table) => usedListings.add(table.listingId));
       const rooms = matchingReal.map((table) => ({
         listingId: table.listingId,
@@ -14445,26 +14607,31 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         roundCount: normalizeRoundCount(table.roundCount),
         isBot: false,
       }));
-      // Yeni istemci görsel bot odalarını cihazda üretir. Sunucu bu GET sırasında bot kimliği,
-      // listing ve Map kaydı üretmez; bot ancak kullanıcı gerçekten o masaya bastığında yaratılır.
-      while (!clientBots && rooms.length < targetCount) {
-        const botIdentity = createLobbyBotIdentity(usedLobbyBotNames);
-        const stakePoints = randomStakeForGroup(group, difficulty);
-        const currentMultiRoomCount = rooms
-          .filter((room) => normalizeRoundCount(room.roundCount) > 1)
-          .length;
-        const roundCount = generatedRoomRoundCount(
-          groupIndex,
-          currentMultiRoomCount,
-          targetCount
-        );
-        const listingId = `bot:${group.id}:${crypto.randomBytes(8).toString("hex")}`;
+
+      // Her ligdeki bot havuzu bütün oyuncular için aynıdır. Kullanıcının daha önce gerçekten
+      // oynadığı bot anahtarları kalıcı geçmişten çıkarılır ve bir daha listelenmez.
+      let botIndex = 0;
+      const maxBotScan = 100_000;
+      while (rooms.length < targetCount && botIndex < maxBotScan) {
+        const botKey = sharedLobbyBotKey(group.id, botIndex);
+        if (playedBotKeys.has(botKey)) {
+          botIndex += 1;
+          continue;
+        }
+        const identity = sharedLobbyBotIdentity(group.id, botIndex);
+        const stakePoints = deterministicLobbyStakeForGroup(group, difficulty, botIndex);
+        const currentMultiRoomCount = rooms.filter((room) => normalizeRoundCount(room.roundCount) > 1).length;
+        const roundCount = generatedRoomRoundCount(groupIndex, currentMultiRoomCount, targetCount, botIndex);
+        const listingId = sharedLobbyBotListingId(gameKey, difficulty, group.id, botIndex);
         generatedLobbyBots.set(listingId, {
           listingId,
+          botKey,
+          botIndex,
+          groupId: group.id,
           player: {
-            id: `bot_${crypto.randomBytes(12).toString("hex")}`,
-            name: botIdentity.name,
-            country: botIdentity.country,
+            id: `bot_shared_${group.id}_${botIndex}`,
+            name: identity.name,
+            country: identity.country,
             isBot: true,
           },
           gameKey,
@@ -14472,21 +14639,23 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
           stakePoints,
           roundCount,
           createdAt: Date.now(),
+          stateless: true,
         });
         rooms.push({
           listingId,
-          opponentName: botIdentity.name,
-          opponentCountry: botIdentity.country,
+          opponentName: identity.name,
+          opponentCountry: identity.country,
           stakePoints,
           roundCount,
           isBot: true,
         });
+        botIndex += 1;
       }
+
       return {
         ...group,
         targetCount,
-        eligible: requesterScore >= group.minScore &&
-          (group.maxScore == null || requesterScore <= group.maxScore),
+        eligible: requesterScore >= group.minScore && requesterScore <= Number(group.maxScore ?? TWO_PLAYER_MAX_PUBLIC_SCORE),
         rooms,
       };
     });
@@ -14664,14 +14833,23 @@ io.on("connection", (socket) => {
         return;
       }
 
+      const tableGroup = roomGroupForStake(table.stakePoints);
+      const sharedBot = await nextUnplayedSharedLobbyBot(identity.player.id, tableGroup.id);
+      if (!sharedBot) {
+        socket.emit("match_error", { code: "BOT_POOL_EXHAUSTED", message: "Uygun yeni bot bulunamadı." });
+        return;
+      }
+
       try {
         assertRoundCountEligibility(table.roundCount, identity.generalScore, table.stakePoints);
         await consumeGameRightsForPlayers(
           [identity.player.id],
           table.difficulty,
           table.stakePoints,
-          table.gameKey
+          table.gameKey,
+          true
         );
+        await rememberLobbyBotPlayed(identity.player.id, sharedBot.botKey);
       } catch (error) {
         socket.emit("match_error", {
           code: error.publicCode || "NO_GAME_RIGHT",
@@ -14684,12 +14862,10 @@ io.on("connection", (socket) => {
       emitRoomLobbyChanged(table.difficulty, table.gameKey);
       await clearBotFallbackEligibilityForPlayers([identity.player.id]);
 
-      const usedNames = new Set([identity.player.name]);
-      const botIdentity = createLobbyBotIdentity(usedNames);
       const botPlayer = {
-        id: `bot_${crypto.randomBytes(12).toString("hex")}`,
-        name: botIdentity.name,
-        country: botIdentity.country,
+        id: `bot_shared_${tableGroup.id}_${sharedBot.botIndex}`,
+        name: sharedBot.identity.name,
+        country: sharedBot.identity.country,
         isBot: true,
       };
 
@@ -14766,6 +14942,12 @@ io.on("connection", (socket) => {
         difficulty = "Standard";
       } else {
         difficulty = secureDifficulty(difficulty);
+        try {
+          assertPublicTwoPlayerScoreLimit(identity.generalScore);
+        } catch (error) {
+          socket.emit("match_error", { code: error.publicCode || "TWO_PLAYER_SCORE_ABOVE_MAX", message: error.message });
+          return;
+        }
       }
 
       removeFromAllQueues(socket.id, player.id);
@@ -14778,43 +14960,36 @@ io.on("connection", (socket) => {
         let botTable = generatedLobbyBots.get(listingId);
         if (botTable && normalizeBaseGameKey(botTable.gameKey) !== normalizeBaseGameKey(gameKey)) botTable = null;
 
-        // Yeni istemci bot listing'ini yalnız görsel olarak kendisi üretir:
-        // bot:<groupId>:<stakePoints>:<roundCount>:<nonce>. Sunucu hiçbir lobi botu saklamaz;
-        // kullanıcı gerçekten seçtiğinde değerleri authoritative kurallarla doğrulayıp botu şimdi oluşturur.
         if (!botTable) {
-          const parts = listingId.split(":");
-          const groupId = safeText(parts[1], "", 32);
-          const stakePoints = Number(parts[2]);
-          const roundCount = Number(parts[3]);
-          const group = TWO_PLAYER_ROOM_GROUPS.find((item) => item.id === groupId);
-          const stakeValid = group && Number.isInteger(stakePoints) &&
-            stakePoints >= Math.max(group.minScore, minimumTwoPlayerStake(difficulty)) &&
-            (group.maxScore == null || stakePoints <= group.maxScore);
-          const roundValid = Number.isInteger(roundCount) && roundCount >= 1 && roundCount <= 3;
-          if (!stakeValid || !roundValid) {
+          const parsed = parseSharedLobbyBotListingId(listingId);
+          if (
+            !parsed ||
+            parsed.gameKey !== normalizeBaseGameKey(gameKey) ||
+            parsed.difficulty !== secureDifficulty(difficulty)
+          ) {
             socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen bot masası artık uygun değil." });
             return;
           }
-          const usedNames = new Set([player.name]);
-          const generatedIdentity = createLobbyBotIdentity(usedNames);
-          const requestedBotName = safeText(payload.presetOpponentName, "", 40);
-          const requestedBotCountry = safeText(payload.presetOpponentCountry, "", 3);
-          botTable = {
-            listingId,
-            player: {
-              id: `bot_${crypto.randomBytes(12).toString("hex")}`,
-              // Bot adı/ülkesi puana etki etmez; istemcide görülen kimliği koru.
-              name: requestedBotName || generatedIdentity.name,
-              country: requestedBotCountry ? safeCountry(requestedBotCountry) : generatedIdentity.country,
-              isBot: true,
-            },
-            gameKey: normalizeBaseGameKey(gameKey),
+          botTable = buildSharedLobbyBotTable(
+            gameKey,
             difficulty,
-            stakePoints,
-            roundCount,
-            createdAt: Date.now(),
-            stateless: true,
-          };
+            parsed.groupId,
+            parsed.botIndex,
+            listingId
+          );
+          if (!botTable) {
+            socket.emit("match_error", { code: "ROOM_NOT_FOUND", message: "Seçilen bot masası artık uygun değil." });
+            return;
+          }
+        }
+
+        const playedBotKeys = await loadPlayedLobbyBotKeys(player.id);
+        if (playedBotKeys.has(botTable.botKey)) {
+          socket.emit("match_error", {
+            code: "BOT_ALREADY_PLAYED",
+            message: "Bu botla daha önce oynadınız. Salon listesi yenilenecek.",
+          });
+          return;
         }
         if (identity.generalScore < botTable.stakePoints) {
           socket.emit("match_error", { code: "INSUFFICIENT_SCORE", message: "Bu masaya katılmak için yeterli puanınız yok." });
@@ -14822,7 +14997,8 @@ io.on("connection", (socket) => {
         }
         try {
           assertRoundCountEligibility(botTable.roundCount, identity.generalScore, botTable.stakePoints);
-          await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints, gameKey);
+          await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints, gameKey, true);
+          await rememberLobbyBotPlayed(player.id, botTable.botKey);
         } catch (error) {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
@@ -14869,7 +15045,7 @@ io.on("connection", (socket) => {
         }
         try {
           assertRoundCountEligibility(table.roundCount, identity.generalScore, table.stakePoints);
-          await consumeGameRightsForPlayers([player.id, table.player.id], table.difficulty, table.stakePoints, gameKey);
+          await consumeGameRightsForPlayers([player.id, table.player.id], table.difficulty, table.stakePoints, gameKey, true);
         } catch (error) {
           const message = error.message || "İki oyunculu oyun hakkı doğrulanamadı.";
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
@@ -14963,7 +15139,7 @@ io.on("connection", (socket) => {
         const selectedPuzzle = opponent.puzzle || puzzle;
         if (!gameKey.endsWith("_tournament")) {
           try {
-            await consumeGameRightsForPlayers([player.id, opponent.player.id], difficulty, selectedStake, gameKey);
+            await consumeGameRightsForPlayers([player.id, opponent.player.id], difficulty, selectedStake, gameKey, true);
           } catch (error) {
             const message = error.message || "İki oyunculu oyun hakkı doğrulanamadı.";
             socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message });
