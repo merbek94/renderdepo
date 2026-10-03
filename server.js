@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v33-20261001-infinite-diamond-economy";
+const SERVER_BUILD_ID = "shared-game-flow-v34-20261003-reconnect-bot-pool-no-history";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -522,14 +522,9 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS player_lobby_bot_history (
-      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
-      bot_key TEXT NOT NULL,
-      played_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (player_id, bot_key)
-    );
-    CREATE INDEX IF NOT EXISTS idx_player_lobby_bot_history_player_played
-      ON player_lobby_bot_history (player_id, played_at DESC);
+    -- v3 denemesinde kullanılan kalıcı lobby-bot geçmişi artık kullanılmıyor.
+    -- Botlar yalnız RAM'deki ortak salon havuzunda oyun gerçekten başlayınca yenilenir.
+    DROP TABLE IF EXISTS player_lobby_bot_history;
 
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0;
@@ -12455,7 +12450,16 @@ const realtimeRooms = new Map();
 const privateRooms = new Map();
 const publicOpenTables = new Map();
 const generatedLobbyBots = new Map();
+// Hazır salon botları PostgreSQL'e yazılmaz. Aynı oyun+zorluk+lig için bütün
+// oyuncular aynı RAM havuzunu görür; oyun gerçekten başladığında yalnız o bot
+// slotu yeni bir botla değiştirilir. Render yeniden başlarsa epoch değiştiği için
+// önceki süreçteki bot isimleri de kendiliğinden yeniden üretilmez.
+const sharedLobbyBotPools = new Map();
+const LOBBY_BOT_PROCESS_EPOCH = crypto.randomBytes(8).toString("hex");
+let ephemeralLobbyBotIndex = 1_000_000;
 
+// Bu sınır oyuncunun genel/single puanını sınırlamaz. Yalnız normal İKİLİ
+// oyun girişlerinde, ilgili oyunun puanı 10 milyonu aşıyorsa eşleşmeyi engeller.
 const TWO_PLAYER_MAX_PUBLIC_SCORE = 10_000_000;
 
 const TWO_PLAYER_ROOM_GROUPS = [
@@ -12505,7 +12509,7 @@ function stableLobbyInt(seed, minimumInclusive, maximumExclusive) {
 function sharedLobbyBotIdentity(groupId, botIndex) {
   const safeIndex = Math.max(0, Math.floor(Number(botIndex || 0)));
   const groupIndex = Math.max(0, TWO_PLAYER_ROOM_GROUPS.findIndex((group) => group.id === groupId));
-  const seed = `shared-lobby-bot-v1:${groupId}:${safeIndex}`;
+  const seed = `shared-lobby-bot-v2:${LOBBY_BOT_PROCESS_EPOCH}:${groupId}:${safeIndex}`;
   const first = LOBBY_BOT_FIRST_PARTS[stableLobbyInt(`${seed}:first`, 0, LOBBY_BOT_FIRST_PARTS.length)];
   const second = LOBBY_BOT_SECOND_PARTS[stableLobbyInt(`${seed}:second`, 0, LOBBY_BOT_SECOND_PARTS.length)];
   const uniqueNumber = groupIndex * 100_000 + safeIndex + 1;
@@ -12523,10 +12527,6 @@ function sharedLobbyBotIdentity(groupId, botIndex) {
     name: name.slice(0, 40),
     country: LOBBY_BOT_COUNTRIES[stableLobbyInt(`${seed}:country`, 0, LOBBY_BOT_COUNTRIES.length)],
   };
-}
-
-function sharedLobbyBotKey(groupId, botIndex) {
-  return `shared:${groupId}:${Math.max(0, Math.floor(Number(botIndex || 0)))}`;
 }
 
 function sharedLobbyBotListingId(gameKey, difficulty, groupId, botIndex) {
@@ -12579,21 +12579,61 @@ function expireGeneratedLobbyBots() {
   }
 }
 
-async function loadPlayedLobbyBotKeys(playerId) {
-  const result = await pool.query(
-    `SELECT bot_key FROM player_lobby_bot_history WHERE player_id = $1`,
-    [playerId]
-  );
-  return new Set(result.rows.map((row) => String(row.bot_key || "")).filter(Boolean));
+function sharedLobbyBotPoolKey(gameKey, difficulty, groupId) {
+  return `${normalizeBaseGameKey(gameKey)}::${secureDifficulty(difficulty)}::${String(groupId || "")}`;
 }
 
-async function rememberLobbyBotPlayed(playerId, botKey) {
-  if (!botKey) return;
-  await pool.query(
-    `INSERT INTO player_lobby_bot_history (player_id, bot_key, played_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (player_id, bot_key) DO UPDATE SET played_at = EXCLUDED.played_at`,
-    [playerId, botKey]
+function ensureSharedLobbyBotPool(gameKey, difficulty, groupId, desiredCount) {
+  const key = sharedLobbyBotPoolKey(gameKey, difficulty, groupId);
+  let poolState = sharedLobbyBotPools.get(key);
+  if (!poolState) {
+    poolState = { activeBotIndexes: [], nextBotIndex: 0 };
+    sharedLobbyBotPools.set(key, poolState);
+  }
+  const needed = Math.max(0, Math.floor(Number(desiredCount || 0)));
+  while (poolState.activeBotIndexes.length < needed) {
+    poolState.activeBotIndexes.push(poolState.nextBotIndex);
+    poolState.nextBotIndex += 1;
+  }
+  return poolState.activeBotIndexes.slice(0, needed);
+}
+
+function isSharedLobbyBotActive(gameKey, difficulty, groupId, botIndex) {
+  const state = sharedLobbyBotPools.get(sharedLobbyBotPoolKey(gameKey, difficulty, groupId));
+  return Boolean(state?.activeBotIndexes?.includes(Math.max(0, Math.floor(Number(botIndex || 0)))));
+}
+
+function replaceSharedLobbyBotSlot(gameKey, difficulty, groupId, botIndex) {
+  const key = sharedLobbyBotPoolKey(gameKey, difficulty, groupId);
+  const state = sharedLobbyBotPools.get(key);
+  if (!state) return false;
+  const oldIndex = Math.max(0, Math.floor(Number(botIndex || 0)));
+  const slotIndex = state.activeBotIndexes.indexOf(oldIndex);
+  if (slotIndex < 0) return false;
+
+  const replacementIndex = state.nextBotIndex;
+  state.nextBotIndex += 1;
+  state.activeBotIndexes[slotIndex] = replacementIndex;
+  generatedLobbyBots.delete(sharedLobbyBotListingId(gameKey, difficulty, groupId, oldIndex));
+  emitRoomLobbyChanged(difficulty, gameKey);
+  return true;
+}
+
+function nextEphemeralLobbyBot(groupId) {
+  const botIndex = ephemeralLobbyBotIndex;
+  ephemeralLobbyBotIndex += 1;
+  return { botIndex, identity: sharedLobbyBotIdentity(groupId, botIndex) };
+}
+
+function consumeReadyRoomLobbyBotAfterPlayStarted(room) {
+  const reservation = room?.lobbyBotReservation;
+  if (!reservation || room.lobbyBotReservationConsumed === true) return;
+  room.lobbyBotReservationConsumed = true;
+  replaceSharedLobbyBotSlot(
+    reservation.gameKey,
+    reservation.difficulty,
+    reservation.groupId,
+    reservation.botIndex
   );
 }
 
@@ -12649,7 +12689,6 @@ function buildSharedLobbyBotTable(gameKey, difficulty, groupId, botIndex, listin
   const roundCount = generatedRoomRoundCount(groupIndex, 0, targetCount, botIndex);
   return {
     listingId: listingIdOverride || sharedLobbyBotListingId(gameKey, difficulty, group.id, botIndex),
-    botKey: sharedLobbyBotKey(group.id, botIndex),
     botIndex,
     groupId: group.id,
     player: {
@@ -12665,17 +12704,6 @@ function buildSharedLobbyBotTable(gameKey, difficulty, groupId, botIndex, listin
     createdAt: Date.now(),
     stateless: true,
   };
-}
-
-async function nextUnplayedSharedLobbyBot(playerId, groupId) {
-  const played = await loadPlayedLobbyBotKeys(playerId);
-  for (let botIndex = 0; botIndex < 100_000; botIndex += 1) {
-    const botKey = sharedLobbyBotKey(groupId, botIndex);
-    if (played.has(botKey)) continue;
-    const identity = sharedLobbyBotIdentity(groupId, botIndex);
-    return { botKey, botIndex, identity };
-  }
-  return null;
 }
 
 const LOBBY_EVENT_DEBOUNCE_MS = Math.max(100, Math.min(2_000,
@@ -13058,6 +13086,26 @@ async function resolveRoomByGameDeadline(roomId) {
   realtimeLog("Realtime match deadline reached:", roomId, room.gameKey);
 }
 
+function reconnectTimeoutShouldBeNoPenalty(room, participant, opponent) {
+  if (!room || !participant) return false;
+  const protectedByOpponentTerminalLoss =
+    room.reconnectNoPenaltyPlayerIds instanceof Set &&
+    room.reconnectNoPenaltyPlayerIds.has(participant.playerId);
+  if (protectedByOpponentTerminalLoss) return true;
+
+  // Gerçek rakip bağlantıyı kapattı/arka plana düştü/ayrıldıysa kullanıcı 60 saniye
+  // içinde dönemedi diye ayrıca puan kaybetmez. Botun planlı ayrılışı ve 3 yanlış
+  // terminal kaybı yukarıdaki reconnectNoPenaltyPlayerIds set'i ile korunur.
+  if (!opponent) return true;
+  if (opponent.isBot !== true && (
+    opponent.connected === false ||
+    opponent.awaySince != null ||
+    opponent.backgrounded === true
+  )) return true;
+
+  return false;
+}
+
 function resolveRoomByAwayTimeout(
   roomId,
   loserPlayerId
@@ -13108,6 +13156,23 @@ function resolveRoomByAwayTimeout(
         reason: "prestart_timeout_cancelled",
       });
     }
+    return;
+  }
+
+  if (reconnectTimeoutShouldBeNoPenalty(room, loser, opponent)) {
+    // Rakip kullanıcı bağlantıdayken/yeniden bağlanmayı beklerken zaten ayrılmış veya
+    // 3 yanlışla terminal olarak kaybetmişse timeout ikinci bir mağlubiyet üretmez.
+    finishRealtimeDraw(room, "reconnect_timeout_no_penalty");
+    const loserSocket = loser.socketId ? io.sockets.sockets.get(loser.socketId) : null;
+    if (loserSocket) {
+      loserSocket.emit("resume_error", {
+        code: "RECONNECT_EXPIRED",
+        message: "1 dakikalık yeniden bağlanma süresi doldu.",
+        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+        noPenalty: true,
+      });
+    }
+    realtimeLog("Reconnect timeout without score penalty:", roomId, loserPlayerId);
     return;
   }
 
@@ -14237,8 +14302,9 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
         const protectedByOpponentTerminalLoss =
           room.reconnectNoPenaltyPlayerIds instanceof Set &&
           room.reconnectNoPenaltyPlayerIds.has(participant.playerId);
+        const noPenaltyBecauseOpponentIsGone = reconnectTimeoutShouldBeNoPenalty(room, participant, opponent);
 
-        if (opponentAlreadyAway || protectedByOpponentTerminalLoss) {
+        if (noPenaltyBecauseOpponentIsGone) {
           // Rakip daha önce ayrıldıysa veya 3 yanlışla kaybettiyse kullanıcının puanı
           // düşmez. Tek elli maç zaten çoğunlukla burada gelmeden kullanıcı lehine
           // resolved olur; bu dal özellikle çok elli/yarış durumundaki açık odayı nötr kapatır.
@@ -14246,7 +14312,9 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
             room,
             opponentAlreadyAway
               ? "reconnect_declined_opponent_already_away"
-              : "reconnect_declined_after_opponent_terminal_loss"
+              : protectedByOpponentTerminalLoss
+                ? "reconnect_declined_after_opponent_terminal_loss"
+                : "reconnect_declined_without_penalty"
           );
           state = await readAuthoritativePlayerStateReadMostly(participant.playerId, gameKey);
         } else {
@@ -14571,8 +14639,6 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
       [req.auth.sub, gameKey]
     );
     const requesterScore = Math.max(0, Number(scoreResult.rows[0]?.general_score || 0));
-    const playedBotKeys = await loadPlayedLobbyBotKeys(req.auth.sub);
-
     const realTables = [...publicOpenTables.values()]
       .filter((table) =>
         table.player.id !== req.auth.sub &&
@@ -14608,16 +14674,13 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         isBot: false,
       }));
 
-      // Her ligdeki bot havuzu bütün oyuncular için aynıdır. Kullanıcının daha önce gerçekten
-      // oynadığı bot anahtarları kalıcı geçmişten çıkarılır ve bir daha listelenmez.
-      let botIndex = 0;
-      const maxBotScan = 100_000;
-      while (rooms.length < targetCount && botIndex < maxBotScan) {
-        const botKey = sharedLobbyBotKey(group.id, botIndex);
-        if (playedBotKeys.has(botKey)) {
-          botIndex += 1;
-          continue;
-        }
+      // Hazır botlar kalıcı kullanıcı geçmişi tutmaz. Aynı oyun+zorluk+lig için tüm
+      // kullanıcılar aynı aktif bot slotlarını görür. Bir botla sadece eşleşilmesi onu
+      // listeden kaldırmaz; ilk el gerçekten başladığında slot yeni botla değiştirilir.
+      const desiredBotCount = Math.max(0, targetCount - rooms.length);
+      const activeBotIndexes = ensureSharedLobbyBotPool(gameKey, difficulty, group.id, desiredBotCount);
+      for (const botIndex of activeBotIndexes) {
+        if (rooms.length >= targetCount) break;
         const identity = sharedLobbyBotIdentity(group.id, botIndex);
         const stakePoints = deterministicLobbyStakeForGroup(group, difficulty, botIndex);
         const currentMultiRoomCount = rooms.filter((room) => normalizeRoundCount(room.roundCount) > 1).length;
@@ -14625,7 +14688,6 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
         const listingId = sharedLobbyBotListingId(gameKey, difficulty, group.id, botIndex);
         generatedLobbyBots.set(listingId, {
           listingId,
-          botKey,
           botIndex,
           groupId: group.id,
           player: {
@@ -14649,7 +14711,6 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
           roundCount,
           isBot: true,
         });
-        botIndex += 1;
       }
 
       return {
@@ -14834,11 +14895,9 @@ io.on("connection", (socket) => {
       }
 
       const tableGroup = roomGroupForStake(table.stakePoints);
-      const sharedBot = await nextUnplayedSharedLobbyBot(identity.player.id, tableGroup.id);
-      if (!sharedBot) {
-        socket.emit("match_error", { code: "BOT_POOL_EXHAUSTED", message: "Uygun yeni bot bulunamadı." });
-        return;
-      }
+      // Masa Aç botu hazır salon havuzundan ayrı, yalnız bu maç için RAM'de üretilir.
+      // PostgreSQL bot geçmişi tutulmaz.
+      const sharedBot = nextEphemeralLobbyBot(tableGroup.id);
 
       try {
         assertRoundCountEligibility(table.roundCount, identity.generalScore, table.stakePoints);
@@ -14849,7 +14908,6 @@ io.on("connection", (socket) => {
           table.gameKey,
           true
         );
-        await rememberLobbyBotPlayed(identity.player.id, sharedBot.botKey);
       } catch (error) {
         socket.emit("match_error", {
           code: error.publicCode || "NO_GAME_RIGHT",
@@ -14983,11 +15041,10 @@ io.on("connection", (socket) => {
           }
         }
 
-        const playedBotKeys = await loadPlayedLobbyBotKeys(player.id);
-        if (playedBotKeys.has(botTable.botKey)) {
+        if (!isSharedLobbyBotActive(gameKey, difficulty, botTable.groupId, botTable.botIndex)) {
           socket.emit("match_error", {
-            code: "BOT_ALREADY_PLAYED",
-            message: "Bu botla daha önce oynadınız. Salon listesi yenilenecek.",
+            code: "ROOM_NOT_FOUND",
+            message: "Seçilen bot masası yenilendi. Salon listesi güncellenecek.",
           });
           return;
         }
@@ -14998,7 +15055,6 @@ io.on("connection", (socket) => {
         try {
           assertRoundCountEligibility(botTable.roundCount, identity.generalScore, botTable.stakePoints);
           await consumeGameRightsForPlayers([player.id], botTable.difficulty, botTable.stakePoints, gameKey, true);
-          await rememberLobbyBotPlayed(player.id, botTable.botKey);
         } catch (error) {
           socket.emit("match_error", { code: error.publicCode || "NO_GAME_RIGHT", message: error.message || "Oyun başlatılamadı." });
           return;
@@ -15010,6 +15066,16 @@ io.on("connection", (socket) => {
           botPuzzles[0], null, null, botTable.stakePoints, "ready_room", TWO_PLAYER_PREPARE_MS,
           botTable.roundCount, botPuzzles, identity.twoPlayerFinishProfile
         );
+        // Sadece eşleşme botu tüketmez. İlk el gerçekten başladığında match_play_started
+        // bu slotu yeni bir ortak botla değiştirecek.
+        room.lobbyBotReservation = {
+          gameKey: normalizeBaseGameKey(gameKey),
+          difficulty: botTable.difficulty,
+          groupId: botTable.groupId,
+          botIndex: botTable.botIndex,
+          listingId: botTable.listingId,
+        };
+        room.lobbyBotReservationConsumed = false;
         if (isFirstFinishRaceGameKey(gameKey)) {
           try {
             await incrementAdaptiveBotTimingGame(player.id, gameKey);
@@ -15380,6 +15446,12 @@ io.on("connection", (socket) => {
       const requestedRoundIndex = Math.max(0, Number(payload.roundIndex || 0));
       if (requestedRoundIndex !== Number(room.roundIndex || 0)) return;
       if (Date.now() + 500 < Number(room.startsAtMillis || 0)) return;
+
+      // Hazır masadaki bot yalnız eşleşildi diye kaybolmaz. İlk el gerçekten oyun
+      // ekranında başladığı anda ortak salon slotu başka bir botla değiştirilir.
+      if (room.roundIndex === 0) {
+        consumeReadyRoomLobbyBotAfterPlayStarted(room);
+      }
 
       // İlk el için puan cezası, geri sayım saatinin dolmasına değil kullanıcının gerçekten
       // oyun ekranına geçtiğine bağlanır. Socket/cancel olayı birkaç yüz ms geç ulaşsa bile
