@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v34-20261003-reconnect-bot-pool-no-history";
+const SERVER_BUILD_ID = "shared-game-flow-v35-20261003-reconnect-win-table-stake-cap";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -3823,21 +3823,23 @@ function minimumTwoPlayerStake(difficulty) {
   return secureDifficulty(difficulty) === "Hard" ? 15 : 10;
 }
 
-function assertPublicTwoPlayerScoreLimit(availableScore) {
-  const score = safeScoreNumber(availableScore);
-  if (score > TWO_PLAYER_MAX_PUBLIC_SCORE) {
-    const error = new Error("İkili oyun salonlarında üst puan sınırı 10.000.000 puandır.");
+function assertTwoPlayerTableStakeLimit(stakePoints) {
+  const stake = Math.max(0, Math.floor(Number(stakePoints || 0)));
+  if (stake > TWO_PLAYER_MAX_TABLE_STAKE) {
+    const error = new Error("Bir ikili masanın puan değeri en fazla 10.000.000 olabilir.");
     error.statusCode = 409;
-    error.publicCode = "TWO_PLAYER_SCORE_ABOVE_MAX";
+    error.publicCode = "TABLE_STAKE_ABOVE_MAX";
     throw error;
   }
-  return score;
+  return stake;
 }
 
 function quickStakeRange(availableScore, difficulty) {
   // Bahis/masa puanı protokolü hâlâ Int tabanlıdır; toplam oyuncu skoru 2 milyarı
   // geçse bile yalnız bahis üretimi kendi bağımsız güvenli aralığında kalır.
-  const score = Math.min(safeScoreNumber(availableScore), 2_000_000_000);
+  // Oyuncunun kendi puanı trilyonlarca olabilir; Hemen Oyna yalnız masa puanı
+  // üretirken 10.000.000 tavanını kullanır.
+  const score = Math.min(safeScoreNumber(availableScore), TWO_PLAYER_MAX_TABLE_STAKE);
   const minimum = minimumTwoPlayerStake(difficulty);
   const minStake = Math.max(minimum, Math.floor(score / 10));
   const maxStake = Math.max(minStake, Math.floor(score / 2));
@@ -3882,8 +3884,11 @@ function randomStakeWithNaturalEnding(minimumValue, maximumValue) {
 
 function minimumOpenTableStake(availableScore, difficulty) {
   const score = safeScoreNumber(availableScore);
+  // Toplam oyun puanı 10 milyonu aşsa bile oyuncu Sonsuz Masa liginde kalır.
+  // Lig seçimi için yalnız karşılaştırma değeri tavana sıkıştırılır; gerçek puan değişmez.
+  const leagueScore = Math.min(score, TWO_PLAYER_MAX_TABLE_STAKE);
   const lowestEligibleGroup = TWO_PLAYER_ROOM_GROUPS.find((group) =>
-    score >= group.minScore && (group.maxScore == null || score <= group.maxScore)
+    leagueScore >= group.minScore && (group.maxScore == null || leagueScore <= group.maxScore)
   );
   return Math.max(
     minimumTwoPlayerStake(difficulty),
@@ -3892,7 +3897,6 @@ function minimumOpenTableStake(availableScore, difficulty) {
 }
 
 function assertOpenTableStake(stakePoints, availableScore, difficulty) {
-  assertPublicTwoPlayerScoreLimit(availableScore);
   const minimum = minimumOpenTableStake(availableScore, difficulty);
   const requested = Math.floor(Number(stakePoints || 0));
   if (!Number.isFinite(requested) || requested < minimum) {
@@ -3901,6 +3905,7 @@ function assertOpenTableStake(stakePoints, availableScore, difficulty) {
     error.publicCode = "INVALID_WAGER";
     throw error;
   }
+  assertTwoPlayerTableStakeLimit(requested);
   if (requested > Number(availableScore || 0)) {
     const error = new Error("Masa puanı mevcut oyun puanınızı aşamaz.");
     error.statusCode = 409;
@@ -3924,6 +3929,7 @@ function normalizeRequestedStake(value, difficulty, availableScore, allowAutomat
     error.publicCode = "INVALID_WAGER";
     throw error;
   }
+  assertTwoPlayerTableStakeLimit(requested);
   if (requested > score) {
     const error = new Error("Seçilen oyun puanı mevcut oyun puanınızı aşamaz.");
     error.statusCode = 409;
@@ -4079,7 +4085,6 @@ async function consumeGameRightsForPlayers(
     const byId = new Map(locked.rows.map((row) => [String(row.player_id), row]));
     const states = uniqueIds.map((playerId) => {
       const row = byId.get(playerId);
-      if (enforcePublicScoreLimit) assertPublicTwoPlayerScoreLimit(row?.general_score);
       return {
         playerId,
         ...normalizedGameRightConsumption(row, difficulty, wagerPoints, false),
@@ -10814,7 +10819,6 @@ app.post("/game/bot/start", requireAuth, challengeMutationRateLimit, requireGame
         matchMode === "quick",
         gameKey
       );
-      assertPublicTwoPlayerScoreLimit(consumed.generalScore);
       if (matchMode === "open_table") {
         assertOpenTableStake(req.body.wagerPoints, consumed.generalScore, requestedDifficulty);
       }
@@ -12458,9 +12462,9 @@ const sharedLobbyBotPools = new Map();
 const LOBBY_BOT_PROCESS_EPOCH = crypto.randomBytes(8).toString("hex");
 let ephemeralLobbyBotIndex = 1_000_000;
 
-// Bu sınır oyuncunun genel/single puanını sınırlamaz. Yalnız normal İKİLİ
-// oyun girişlerinde, ilgili oyunun puanı 10 milyonu aşıyorsa eşleşmeyi engeller.
-const TWO_PLAYER_MAX_PUBLIC_SCORE = 10_000_000;
+// Oyuncunun toplam oyun puanına hiçbir üst sınır koymaz. Kullanıcının puanı trilyonlarca
+// olabilir. Bu sabit yalnız normal İkili oyunda bir masanın/bahsin puan değerini sınırlar.
+const TWO_PLAYER_MAX_TABLE_STAKE = 10_000_000;
 
 const TWO_PLAYER_ROOM_GROUPS = [
   { id: "acemi", title: "Acemi Masaları", subtitle: "10 - 100", minScore: 10, maxScore: 100 },
@@ -12470,7 +12474,7 @@ const TWO_PLAYER_ROOM_GROUPS = [
   { id: "platin", title: "Platin Salon", subtitle: "4.000 - 50.000", minScore: 4_000, maxScore: 50_000 },
   { id: "elmas", title: "Elmas Salon", subtitle: "20.000 - 200.000", minScore: 20_000, maxScore: 200_000 },
   { id: "efsane", title: "Efsane Salon", subtitle: "200.000 - 2.000.000", minScore: 200_000, maxScore: 2_000_000 },
-  { id: "sonsuz", title: "Sonsuz Masa", subtitle: "1.000.000 - 10.000.000", minScore: 1_000_000, maxScore: TWO_PLAYER_MAX_PUBLIC_SCORE },
+  { id: "sonsuz", title: "Sonsuz Masa", subtitle: "1.000.000 - 10.000.000", minScore: 1_000_000, maxScore: TWO_PLAYER_MAX_TABLE_STAKE },
 ];
 
 const LOBBY_ROOM_COUNT_RANGES = [
@@ -12639,7 +12643,7 @@ function consumeReadyRoomLobbyBotAfterPlayStarted(room) {
 
 function deterministicLobbyStakeForGroup(group, difficulty, botIndex) {
   const minimum = Math.max(group.minScore, minimumTwoPlayerStake(difficulty));
-  const maximum = Math.max(minimum, Number(group.maxScore ?? TWO_PLAYER_MAX_PUBLIC_SCORE));
+  const maximum = Math.max(minimum, Number(group.maxScore ?? TWO_PLAYER_MAX_TABLE_STAKE));
   if (maximum <= minimum) return minimum;
 
   const span = maximum - minimum;
@@ -13086,16 +13090,21 @@ async function resolveRoomByGameDeadline(roomId) {
   realtimeLog("Realtime match deadline reached:", roomId, room.gameKey);
 }
 
+function reconnectProtectedByOpponentTerminalLoss(room, participant) {
+  return Boolean(
+    room && participant &&
+    room.reconnectNoPenaltyPlayerIds instanceof Set &&
+    room.reconnectNoPenaltyPlayerIds.has(participant.playerId)
+  );
+}
+
 function reconnectTimeoutShouldBeNoPenalty(room, participant, opponent) {
   if (!room || !participant) return false;
-  const protectedByOpponentTerminalLoss =
-    room.reconnectNoPenaltyPlayerIds instanceof Set &&
-    room.reconnectNoPenaltyPlayerIds.has(participant.playerId);
-  if (protectedByOpponentTerminalLoss) return true;
+  if (reconnectProtectedByOpponentTerminalLoss(room, participant)) return true;
 
-  // Gerçek rakip bağlantıyı kapattı/arka plana düştü/ayrıldıysa kullanıcı 60 saniye
-  // içinde dönemedi diye ayrıca puan kaybetmez. Botun planlı ayrılışı ve 3 yanlış
-  // terminal kaybı yukarıdaki reconnectNoPenaltyPlayerIds set'i ile korunur.
+  // Karşı tarafın bağlantısı da geçici olarak kopmuşsa iki ayrı disconnect yarışından
+  // aynı oyuncuya iki kez ceza üretme. Gerçek terminal ayrılışlar zaten oda sonucu ile
+  // veya reconnectProtectedByOpponentTerminalLoss korumasıyla kesinleştirilir.
   if (!opponent) return true;
   if (opponent.isBot !== true && (
     opponent.connected === false ||
@@ -13159,9 +13168,28 @@ function resolveRoomByAwayTimeout(
     return;
   }
 
+  if (reconnectProtectedByOpponentTerminalLoss(room, loser)) {
+    // Kullanıcı çevrimdışıyken rakip 3 yanlışla/terminal hatayla kaybetmiş veya bot
+    // oyundan ayrılmışsa, 60 saniyenin dolması kullanıcının mevcut galibiyetini silmez.
+    // Oda hâlâ açıksa kullanıcı maçın kazananı kabul edilir ve masa puanı verilir.
+    finishRealtimeMatch(room, loser, "reconnect_timeout_after_opponent_loss")
+      .catch((error) => console.error("reconnect protected win reward error:", error));
+    const winnerSocket = loser.socketId ? io.sockets.sockets.get(loser.socketId) : null;
+    if (winnerSocket) {
+      winnerSocket.emit("resume_error", {
+        code: "RECONNECT_EXPIRED",
+        message: "1 dakikalık yeniden bağlanma süresi doldu. Rakibiniz daha önce kaybettiği için maç kazanıldı.",
+        opponentFinishedMs: Number(opponent?.elapsedMs || 0),
+        won: true,
+        noPenalty: true,
+      });
+    }
+    realtimeLog("Reconnect timeout preserved win:", roomId, loserPlayerId);
+    return;
+  }
+
   if (reconnectTimeoutShouldBeNoPenalty(room, loser, opponent)) {
-    // Rakip kullanıcı bağlantıdayken/yeniden bağlanmayı beklerken zaten ayrılmış veya
-    // 3 yanlışla terminal olarak kaybetmişse timeout ikinci bir mağlubiyet üretmez.
+    // İki tarafın bağlantısı aynı anda geçici olarak kopmuşsa ikinci bir mağlubiyet üretme.
     finishRealtimeDraw(room, "reconnect_timeout_no_penalty");
     const loserSocket = loser.socketId ? io.sockets.sockets.get(loser.socketId) : null;
     if (loserSocket) {
@@ -13223,6 +13251,7 @@ function resolveRoomByAwayTimeout(
         opponentFinishedMs: Number(
           opponent?.elapsedMs || 0
         ),
+        won: false,
       }
     );
   }
@@ -13850,7 +13879,12 @@ function createRealtimeRoom(
     puzzles,
     roundCount,
     roundIndex: 0,
-    stakePoints: Math.max(0, Math.floor(Number(stakePoints || 0))),
+    // Savunma katmanı: hangi giriş yolu kullanılırsa kullanılsın normal İkili masa
+    // değeri 10 milyonu aşamaz. Turnuva/arkadaş odalarında stake zaten 0'dır.
+    stakePoints: Math.min(
+      TWO_PLAYER_MAX_TABLE_STAKE,
+      Math.max(0, Math.floor(Number(stakePoints || 0)))
+    ),
     matchMode: safeText(matchMode, "quick", 32),
     createdAt,
     startsAtMillis: createdAt,
@@ -14300,21 +14334,22 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
           opponent.backgrounded === true
         );
         const protectedByOpponentTerminalLoss =
-          room.reconnectNoPenaltyPlayerIds instanceof Set &&
-          room.reconnectNoPenaltyPlayerIds.has(participant.playerId);
+          reconnectProtectedByOpponentTerminalLoss(room, participant);
         const noPenaltyBecauseOpponentIsGone = reconnectTimeoutShouldBeNoPenalty(room, participant, opponent);
 
-        if (noPenaltyBecauseOpponentIsGone) {
-          // Rakip daha önce ayrıldıysa veya 3 yanlışla kaybettiyse kullanıcının puanı
-          // düşmez. Tek elli maç zaten çoğunlukla burada gelmeden kullanıcı lehine
-          // resolved olur; bu dal özellikle çok elli/yarış durumundaki açık odayı nötr kapatır.
+        if (protectedByOpponentTerminalLoss) {
+          // Rakip kullanıcı çevrimdışıyken 3 yanlışla/terminal sonuçla kaybetmiş veya bot
+          // ayrılmışsa "Hayır" demek kazanılmış maçı beraberliğe çeviremez. Masa puanı verilir.
+          await finishRealtimeMatch(room, participant, "reconnect_declined_after_opponent_terminal_loss");
+          state = room.awardResult?.winnerState
+            || await readAuthoritativePlayerStateReadMostly(participant.playerId, gameKey);
+        } else if (noPenaltyBecauseOpponentIsGone) {
+          // Yalnız iki gerçek oyuncunun bağlantısı aynı anda geçici olarak kopmuşsa nötr kapat.
           finishRealtimeDraw(
             room,
             opponentAlreadyAway
               ? "reconnect_declined_opponent_already_away"
-              : protectedByOpponentTerminalLoss
-                ? "reconnect_declined_after_opponent_terminal_loss"
-                : "reconnect_declined_without_penalty"
+              : "reconnect_declined_without_penalty"
           );
           state = await readAuthoritativePlayerStateReadMostly(participant.playerId, gameKey);
         } else {
@@ -14343,7 +14378,10 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
     if (!state) {
       state = await readAuthoritativePlayerStateReadMostly(participant.playerId, gameKey);
     }
-    res.json({ ok: true, gameKey, ...state });
+    const matchWon = room.winnerPlayerId
+      ? room.winnerPlayerId === participant.playerId
+      : null;
+    res.json({ ok: true, gameKey, matchWon, ...state });
   } catch (error) {
     sendLeaderboardError(res, error, "İkili oyun terk sonucu işlenemedi.", "realtime forfeit error:");
   }
@@ -14716,7 +14754,9 @@ app.get("/game/two-player/rooms", requireAuth, async (req, res) => {
       return {
         ...group,
         targetCount,
-        eligible: requesterScore >= group.minScore && requesterScore <= Number(group.maxScore ?? TWO_PLAYER_MAX_PUBLIC_SCORE),
+        eligible: requesterScore >= group.minScore && (
+          group.id === "sonsuz" || requesterScore <= Number(group.maxScore ?? TWO_PLAYER_MAX_TABLE_STAKE)
+        ),
         rooms,
       };
     });
@@ -14999,13 +15039,9 @@ io.on("connection", (socket) => {
         }
         difficulty = "Standard";
       } else {
+        // Oyuncunun toplam oyun puanına üst sınır yoktur. 10 milyon tavanı yalnız
+        // bu eşleşmede oluşacak masa puanı için uygulanır.
         difficulty = secureDifficulty(difficulty);
-        try {
-          assertPublicTwoPlayerScoreLimit(identity.generalScore);
-        } catch (error) {
-          socket.emit("match_error", { code: error.publicCode || "TWO_PLAYER_SCORE_ABOVE_MAX", message: error.message });
-          return;
-        }
       }
 
       removeFromAllQueues(socket.id, player.id);
@@ -15191,13 +15227,19 @@ io.on("connection", (socket) => {
               skippedOpponents.push(opponent);
               continue;
             }
-            selectedStake = overlapMax <= overlapMin
-              ? overlapMin
-              : secureRandomInt(overlapMin, overlapMax + 1);
+            selectedStake = Math.min(
+              TWO_PLAYER_MAX_TABLE_STAKE,
+              overlapMax <= overlapMin
+                ? overlapMin
+                : secureRandomInt(overlapMin, overlapMax + 1)
+            );
           } else {
-            selectedStake = Math.max(
-              minimumTwoPlayerStake(difficulty),
-              Math.min(requestedStake, opponent.stakePoints, identity.generalScore, opponent.generalScore)
+            selectedStake = Math.min(
+              TWO_PLAYER_MAX_TABLE_STAKE,
+              Math.max(
+                minimumTwoPlayerStake(difficulty),
+                Math.min(requestedStake, opponent.stakePoints, identity.generalScore, opponent.generalScore)
+              )
             );
           }
         }
@@ -15319,6 +15361,9 @@ io.on("connection", (socket) => {
                 opponent?.elapsedMs ||
                   0
               ),
+            won: room.winnerPlayerId
+              ? room.winnerPlayerId === participant.playerId
+              : null,
           }
         );
 
@@ -15348,6 +15393,9 @@ io.on("connection", (socket) => {
                 opponent?.elapsedMs ||
                   0
               ),
+            won: room.winnerPlayerId
+              ? room.winnerPlayerId === participant.playerId
+              : null,
           }
         );
 
