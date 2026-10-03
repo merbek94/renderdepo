@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v32-20260930-instant-game-score-cache";
+const SERVER_BUILD_ID = "shared-game-flow-v33-20261001-infinite-diamond-economy";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -1246,6 +1246,45 @@ async function applyGameInfiniteHighScoreInTransaction(
     [playerId, baseGameKey, highScore, monthKey]
   );
   return baseGameKey;
+}
+
+function infiniteDiamondMilestoneStep(gameKey) {
+  const base = normalizeBaseGameKey(gameKey);
+  if (base === "merge_5120") return 5;      // 3^5, 3^10, 3^15, ...
+  if (base === "digit_attack") return 100;  // 100, 200, 300, ... dalga
+  if (base === "digit_hunt") return 5000;   // 5000, 10000, ... skor
+  return 10;                                 // 10, 20, 30, ... aşama
+}
+
+function infiniteDiamondMilestoneDelta(gameKey, oldHighValue, newHighValue) {
+  const oldHigh = safeScoreNumber(oldHighValue, 0);
+  const newHigh = safeScoreNumber(newHighValue, 0);
+  if (newHigh <= oldHigh) return 0;
+  const step = infiniteDiamondMilestoneStep(gameKey);
+  const delta = Math.floor(newHigh / step) - Math.floor(oldHigh / step);
+  return Math.max(0, Math.min(2_000_000_000, delta));
+}
+
+async function grantInfiniteMilestoneDiamondsInTransaction(client, playerId, gameKey, oldHighValue, newHighValue) {
+  const diamondDelta = infiniteDiamondMilestoneDelta(gameKey, oldHighValue, newHighValue);
+  if (diamondDelta <= 0) return 0;
+  await client.query(
+    `UPDATE player_progress
+     SET diamond_balance = LEAST(diamond_balance + $2, 2000000000), updated_at = NOW()
+     WHERE player_id = $1`,
+    [playerId, diamondDelta]
+  );
+  return diamondDelta;
+}
+
+function digitAttackReachedWave(challenge, evaluation) {
+  const rawReached = Math.max(0, Number(evaluation?.reachedWave ??
+    (Number(evaluation?.correct || 0) + Number(evaluation?.mistakes || 0))));
+  if (isEndlessDigitAttackPuzzle(challenge?.puzzle)) return rawReached;
+  const encodedWaveCount = Array.isArray(challenge?.puzzle?.numbers)
+    ? Math.floor(challenge.puzzle.numbers.length / DIGIT_ATTACK_WAVE_STRIDE)
+    : 0;
+  return Math.max(0, Math.min(rawReached, encodedWaveCount));
 }
 
 async function incrementHomeTwoPlayerWinInTransaction(client, playerId) {
@@ -5763,7 +5802,93 @@ function digitAttackCorrectLane(wave) {
   return matches.length === 1 ? matches[0] : -1;
 }
 
+function digitAttackEndlessHash(seedValue, waveIndexValue, saltValue) {
+  const modulus = 2_147_483_647;
+  const seed = Math.max(1, Math.min(1_000_000, Math.floor(Number(seedValue) || 1)));
+  const waveIndex = Math.max(0, Math.floor(Number(waveIndexValue) || 0));
+  const salt = Math.floor(Number(saltValue) || 0);
+  const index = waveIndex + 1;
+  const raw = seed * 1_000_003 +
+    index * 97_409 +
+    (salt + 1) * 65_537 +
+    index * (salt + 3) * 31;
+  return raw % modulus;
+}
+
+function digitAttackEndlessCorrectCandidates(base, operation, advanced) {
+  const minTarget = advanced ? 1 : 4;
+  const maxTarget = advanced ? 200 : 99;
+  const minCorrect = operation <= 1 ? 9 : 2;
+  const maxCorrect = operation <= 1
+    ? (advanced ? 50 : 25)
+    : (advanced ? 8 : 5);
+  const candidates = [];
+  for (let operand = minCorrect; operand <= maxCorrect; operand += 1) {
+    const target = digitAttackApply(base, operation, operand);
+    if (Number.isInteger(target) && target !== base && target >= minTarget && target <= maxTarget) {
+      candidates.push(operand);
+    }
+  }
+  return candidates;
+}
+
+function digitAttackGenerateEndlessWave(seed, waveIndex, base) {
+  const advanced = waveIndex >= 100;
+  const operationStart = digitAttackEndlessHash(seed, waveIndex, 0) % 4;
+  for (let offset = 0; offset < 4; offset += 1) {
+    const operation = (operationStart + offset) % 4;
+    const candidates = digitAttackEndlessCorrectCandidates(base, operation, advanced);
+    if (candidates.length === 0) continue;
+    const candidateIndex = digitAttackEndlessHash(seed, waveIndex, 10 + operation) % candidates.length;
+    const correctOperand = candidates[candidateIndex];
+    const target = digitAttackApply(base, operation, correctOperand);
+    if (!Number.isInteger(target)) continue;
+    const radius = advanced ? (operation <= 1 ? 10 : 5) : 2;
+    const minimum = advanced ? (operation <= 1 ? 5 : 2) : 1;
+    const deltas = [];
+    for (let delta = -radius; delta <= radius; delta += 1) {
+      if (delta !== 0) deltas.push(delta);
+    }
+    if (deltas.length === 0) continue;
+    const rotation = digitAttackEndlessHash(seed, waveIndex, 20 + operation) % deltas.length;
+    const rotated = deltas.slice(rotation).concat(deltas.slice(0, rotation));
+    const wrongOperands = [];
+    for (const delta of rotated) {
+      const candidate = correctOperand + delta;
+      if (candidate < minimum || candidate === correctOperand) continue;
+      if (digitAttackApply(base, operation, candidate) === target) continue;
+      if (!wrongOperands.includes(candidate)) wrongOperands.push(candidate);
+      if (wrongOperands.length === 2) break;
+    }
+    if (wrongOperands.length !== 2) continue;
+    const correctLane = digitAttackEndlessHash(seed, waveIndex, 30) % 3;
+    const wrongs = digitAttackEndlessHash(seed, waveIndex, 31) % 2 === 0
+      ? wrongOperands
+      : [...wrongOperands].reverse();
+    const operands = [0, 0, 0];
+    operands[correctLane] = correctOperand;
+    let wrongIndex = 0;
+    for (let lane = 0; lane < 3; lane += 1) {
+      if (lane === correctLane) continue;
+      operands[lane] = wrongs[wrongIndex++];
+    }
+    return { base, target, operation, operands };
+  }
+  return null;
+}
+
+function isEndlessDigitAttackPuzzle(puzzle) {
+  const seed = Number(puzzle?.digitAttackInfiniteSeed);
+  const initialBase = Number(puzzle?.digitAttackInitialBase);
+  const numbers = Array.isArray(puzzle?.numbers) ? puzzle.numbers.map(Number) : [];
+  return Number(puzzle?.target) === 0 &&
+    Number.isInteger(seed) && seed >= 1 && seed <= 1_000_000 &&
+    Number.isInteger(initialBase) && initialBase >= 4 && initialBase <= 10 &&
+    (numbers.length === 0 || (numbers.length === 1 && numbers[0] === initialBase));
+}
+
 function isDigitAttackPuzzleEncodingValid(puzzle) {
+  if (isEndlessDigitAttackPuzzle(puzzle)) return true;
   const waves = digitAttackDecodeWaves(puzzle?.numbers);
   if (!waves) return false;
   const infiniteRun = waves.length > DIGIT_ATTACK_WAVE_COUNT;
@@ -5895,20 +6020,18 @@ function generateInfiniteDigitAttackWave(base, advanced) {
   return null;
 }
 function generateInfiniteDigitAttackPuzzle() {
-  const waveCount = 1000; // Tek uzun koşu; 100. dalgadan sonrası yeni zorluk kurallarıyla devam eder.
-  for (let attempt=0; attempt<200; attempt+=1) {
-    let base=secureRandomInt(4,11);
-    const waves=[];
-    let failed=false;
-    for (let index=0; index<waveCount; index+=1) {
-      const wave=generateInfiniteDigitAttackWave(base,index>=100);
-      if (!wave) { failed=true; break; }
-      waves.push(wave); base=wave.target;
-    }
-    if (failed) continue;
-    return {difficulty:"Standard",target:waveCount,numbers:waves.flatMap((w)=>[w.base,w.target,w.operation,...w.operands]),gameKey:"digit_attack",initialGrid:[],infiniteStage:1};
-  }
-  throw new Error("Sonsuz Rakam Saldırısı üretilemedi.");
+  const seed = secureRandomInt(1, 1_000_001);
+  const initialBase = secureRandomInt(4, 11);
+  return {
+    difficulty: "Standard",
+    target: 0,
+    numbers: [initialBase],
+    gameKey: "digit_attack",
+    initialGrid: [],
+    infiniteStage: 1,
+    digitAttackInfiniteSeed: seed,
+    digitAttackInitialBase: initialBase,
+  };
 }
 
 function generateDigitAttackPuzzle() {
@@ -5953,13 +6076,38 @@ function generateDigitAttackPuzzle() {
 function normalizeDigitAttackChoices(answer = {}, maxCount = DIGIT_ATTACK_WAVE_COUNT) {
   if (!Array.isArray(answer.choices)) return null;
   const choices = answer.choices.map(Number);
-  if (choices.length < 1 || choices.length > maxCount) return null;
+  if (choices.length < 1) return null;
+  if (maxCount !== null && maxCount !== undefined && choices.length > maxCount) return null;
   if (!choices.every((lane) => Number.isInteger(lane) && lane >= 0 && lane <= 2)) return null;
   return choices;
 }
 
 function digitAttackEvaluateAnswer(puzzle, answer = {}) {
   if (!isDigitAttackPuzzleEncodingValid(puzzle)) return null;
+
+  if (isEndlessDigitAttackPuzzle(puzzle)) {
+    const choices = normalizeDigitAttackChoices(answer, null);
+    if (!choices) return null;
+    const seed = Number(puzzle.digitAttackInfiniteSeed);
+    let base = Number(puzzle.digitAttackInitialBase);
+    let correct = 0;
+    let mistakes = 0;
+    for (let index = 0; index < choices.length; index += 1) {
+      const wave = digitAttackGenerateEndlessWave(seed, index, base);
+      if (!wave) return null;
+      const correctLane = digitAttackCorrectLane(wave);
+      if (correctLane < 0) return null;
+      if (choices[index] === correctLane) correct += 1;
+      else mistakes += 1;
+      base = wave.target;
+      if (mistakes >= DIGIT_ATTACK_MAX_MISTAKES) {
+        if (index !== choices.length - 1) return null;
+        return { terminal: true, won: false, correct, mistakes, reachedWave: choices.length };
+      }
+    }
+    return { terminal: false, won: false, correct, mistakes, reachedWave: choices.length };
+  }
+
   const waves = digitAttackDecodeWaves(puzzle.numbers);
   if (!waves) return null;
   const choices = normalizeDigitAttackChoices(answer, waves.length);
@@ -5973,7 +6121,7 @@ function digitAttackEvaluateAnswer(puzzle, answer = {}) {
     const lost = mistakes >= DIGIT_ATTACK_MAX_MISTAKES;
     if (lost) {
       if (index !== choices.length - 1) return null;
-      return { terminal: true, won: false, correct, mistakes };
+      return { terminal: true, won: false, correct, mistakes, reachedWave: choices.length };
     }
   }
   const completedAllWaves = choices.length >= waves.length;
@@ -5982,6 +6130,7 @@ function digitAttackEvaluateAnswer(puzzle, answer = {}) {
     won: completedAllWaves && mistakes < DIGIT_ATTACK_MAX_MISTAKES,
     correct,
     mistakes,
+    reachedWave: choices.length,
   };
 }
 
@@ -10283,6 +10432,90 @@ app.get("/player/state", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/game/diamonds/score", requireAuth, challengeMutationRateLimit, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const gameKey = normalizeBaseGameKey(req.body.gameKey);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, req.auth.sub);
+    await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
+    const progress = await client.query(
+      `SELECT diamond_balance FROM player_progress WHERE player_id = $1 FOR UPDATE`,
+      [req.auth.sub]
+    );
+    const diamondBalance = Math.max(0, Number(progress.rows[0]?.diamond_balance || 0));
+    if (diamondBalance < 1) {
+      const error = new Error("Puan kazanmak için en az 1 elmas gerekir.");
+      error.statusCode = 409;
+      error.publicCode = "DIAMOND_REQUIRED";
+      throw error;
+    }
+    await client.query(
+      `UPDATE player_progress
+       SET diamond_balance = diamond_balance - 1, updated_at = NOW()
+       WHERE player_id = $1`,
+      [req.auth.sub]
+    );
+    await applyGameGeneralScoreDeltaInTransaction(client, req.auth.sub, gameKey, 20);
+    const state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
+    await client.query("COMMIT");
+    res.json({ ok: true, ...state, diamondSpent: 1, pointsAdded: 20 });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Elmas puana çevrilemedi.", "diamond score exchange error:");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/game/diamonds/game-rights", requireAuth, challengeMutationRateLimit, async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const gameKey = normalizeBaseGameKey(req.body.gameKey);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await ensureAuthenticatedPlayer(client, req.auth.sub);
+    await ensurePlayerGameProgress(client, req.auth.sub, gameKey);
+    const rights = await normalizeGameRightsInTransaction(client, req.auth.sub, true);
+    if (rights.remainingRights > 0) {
+      const error = new Error("Elmasla doldurma yalnız oyun hakkı bittiğinde kullanılabilir.");
+      error.statusCode = 409;
+      error.publicCode = "GAME_RIGHTS_NOT_EMPTY";
+      throw error;
+    }
+    const progress = await client.query(
+      `SELECT diamond_balance FROM player_progress WHERE player_id = $1 FOR UPDATE`,
+      [req.auth.sub]
+    );
+    const diamondBalance = Math.max(0, Number(progress.rows[0]?.diamond_balance || 0));
+    if (diamondBalance < 2) {
+      const error = new Error("10 oyun hakkı için en az 2 elmas gerekir.");
+      error.statusCode = 409;
+      error.publicCode = "DIAMONDS_REQUIRED";
+      throw error;
+    }
+    const now = Date.now();
+    await client.query(
+      `UPDATE player_progress
+       SET diamond_balance = diamond_balance - 2,
+           game_rights = $2,
+           game_rights_refill_at = TO_TIMESTAMP($3 / 1000.0),
+           updated_at = NOW()
+       WHERE player_id = $1`,
+      [req.auth.sub, GAME_RIGHT_MAX, now]
+    );
+    const state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
+    await client.query("COMMIT");
+    res.json({ ok: true, ...state, diamondSpent: 2, rightsAdded: GAME_RIGHT_MAX });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    sendLeaderboardError(res, error, "Elmasla oyun hakkı doldurulamadı.", "diamond rights exchange error:");
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, requireGameplaySession, async (req, res) => {
   if (!requireDatabase(res)) return;
   const fresh = req.body.fresh === true;
@@ -10860,6 +11093,7 @@ app.post("/game/challenges/progress", requireAuth, challengeMutationRateLimit, r
     // checkpoint'in kaldığı yeri doğrulamak için gereklidir.
     if (challenge.mode === "infinite") delete checkpointPayload.score;
     let xpDelta = 0;
+    let diamondDelta = 0;
     let stateAfter = null;
 
     // 729 sonsuz ekonomisindeki yüksek-taş/XP ödülü yalnız sonsuz modda çalışır.
@@ -10876,6 +11110,9 @@ app.post("/game/challenges/progress", requireAuth, challengeMutationRateLimit, r
       const newlyPassedPowers = Math.max(0, newHighExponent - oldHighExponent);
       xpDelta = Math.min(2_000_000_000, newlyPassedPowers * 20);
       if (newHighExponent > oldHighExponent) {
+        diamondDelta = await grantInfiniteMilestoneDiamondsInTransaction(
+          client, req.auth.sub, gameKey, oldHighExponent, newHighExponent
+        );
         await applyGameInfiniteHighScoreInTransaction(client, req.auth.sub, gameKey, newHighExponent);
       }
       if (xpDelta > 0) {
@@ -10900,6 +11137,8 @@ app.post("/game/challenges/progress", requireAuth, challengeMutationRateLimit, r
       ok: true,
       ...checkpointPayload,
       xpDelta,
+      diamondDelta,
+      diamondBalance: stateAfter?.diamondBalance ?? null,
       infiniteScore: stateAfter ? (stateAfter.gameInfiniteScore ?? stateAfter.infiniteScore) : 0,
       totalXp: stateAfter?.totalXp ?? null,
     });
@@ -11183,12 +11422,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       if (digitAttackInfiniteSingleRun) {
         // Rakam Saldırısı Sonsuz puanı = oyuncunun bugüne kadar ulaştığı en yüksek dalga.
         // Üçüncü yanlışın geldiği terminal dalga da ulaşılan dalga olarak sayılır.
-        const reachedWave = Math.max(0, Math.min(
-          Number(digitAttackEvaluation?.correct || 0) + Number(digitAttackEvaluation?.mistakes || 0),
-          Array.isArray(challenge.puzzle?.numbers)
-            ? Math.floor(challenge.puzzle.numbers.length / DIGIT_ATTACK_WAVE_STRIDE)
-            : 0
-        ));
+        const reachedWave = digitAttackReachedWave(challenge, digitAttackEvaluation);
         const progressBefore = await client.query(
           `SELECT infinite_score FROM player_game_progress
            WHERE player_id = $1 AND game_key = $2 FOR UPDATE`,
@@ -11196,6 +11430,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         );
         const oldHighWave = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
         if (reachedWave > oldHighWave) {
+          await grantInfiniteMilestoneDiamondsInTransaction(
+            client, req.auth.sub, gameKey, oldHighWave, reachedWave
+          );
           await applyGameInfiniteHighScoreInTransaction(client, req.auth.sub, gameKey, reachedWave);
         }
         await client.query(
@@ -11246,6 +11483,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       );
       const oldHighScore = Math.max(0, Number(progressBefore.rows[0]?.infinite_score || 0));
       let awardedXp = 0;
+      let awardedDiamonds = 0;
 
       if (mergeInfiniteSingleRun) {
         // Son checkpoint'ten sonra kalan birkaç hamle yeni bir en-yüksek taş üretmiş olabilir.
@@ -11255,6 +11493,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         const newlyPassedPowers = Math.max(0, newHighExponent - oldHighScore);
         awardedXp = Math.min(2_000_000_000, newlyPassedPowers * 20);
         if (newHighExponent > oldHighScore) {
+          awardedDiamonds = await grantInfiniteMilestoneDiamondsInTransaction(
+            client, req.auth.sub, gameKey, oldHighScore, newHighExponent
+          );
           await applyGameInfiniteHighScoreInTransaction(
             client, req.auth.sub, gameKey, newHighExponent
           );
@@ -11277,6 +11518,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
           ? Math.max(0, newMilestone - oldMilestone) * 20
           : 0;
         if (newHighScore > oldHighScore) {
+          awardedDiamonds = await grantInfiniteMilestoneDiamondsInTransaction(
+            client, req.auth.sub, gameKey, oldHighScore, newHighScore
+          );
           await applyGameInfiniteHighScoreInTransaction(
             client, req.auth.sub, gameKey, newHighScore
           );
@@ -11293,13 +11537,11 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       } else if (digitAttackInfiniteSingleRun) {
         // Rakam Saldırısı aşamasız tek koşudur. Sonsuz puan, bu koşuda ulaşılan dalga
         // ile kişisel en yüksek dalganın maksimumudur; next-stage her zaman 1 kalır.
-        const reachedWave = Math.max(0, Math.min(
-          Number(digitAttackEvaluation?.correct || 0) + Number(digitAttackEvaluation?.mistakes || 0),
-          Array.isArray(challenge.puzzle?.numbers)
-            ? Math.floor(challenge.puzzle.numbers.length / DIGIT_ATTACK_WAVE_STRIDE)
-            : 0
-        ));
+        const reachedWave = digitAttackReachedWave(challenge, digitAttackEvaluation);
         if (reachedWave > oldHighScore) {
+          awardedDiamonds = await grantInfiniteMilestoneDiamondsInTransaction(
+            client, req.auth.sub, gameKey, oldHighScore, reachedWave
+          );
           await applyGameInfiniteHighScoreInTransaction(client, req.auth.sub, gameKey, reachedWave);
         }
         await client.query(
@@ -11319,6 +11561,9 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         // Aynı/alt aşamalar tekrar oynanırsa XP verilmez; yeni rekor aşamasında sabit 20 XP verilir.
         awardedXp = completedStage > oldHighScore ? 20 : 0;
         if (newHighStage > oldHighScore) {
+          awardedDiamonds = await grantInfiniteMilestoneDiamondsInTransaction(
+            client, req.auth.sub, gameKey, oldHighScore, newHighStage
+          );
           await applyGameInfiniteHighScoreInTransaction(
             client, req.auth.sub, gameKey, newHighStage
           );
@@ -11338,6 +11583,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
         ...rewards,
         infiniteDelta: (mergeInfiniteSingleRun || digitAttackInfiniteSingleRun) ? 0 : infiniteRunScore,
         xpDelta: awardedXp,
+        diamondDelta: awardedDiamonds,
       };
       if (awardedXp > 0) {
         await client.query(
@@ -11392,6 +11638,7 @@ app.post("/game/challenges/complete", requireAuth, challengeMutationRateLimit, r
       generalDelta: Number(rewards.generalDelta || 0),
       infiniteDelta: Number(rewards.infiniteDelta || 0),
       xpDelta: Number(rewards.xpDelta || 0),
+      diamondDelta: Number(rewards.diamondDelta || 0),
       runScore: mergeInfiniteSingleRun ? 0 : Number(
         digitAttackInfiniteSingleRun ? infiniteRunScore : (state.runScore || infiniteRunScore || 0)
       ),
