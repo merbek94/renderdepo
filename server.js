@@ -14259,8 +14259,9 @@ function leaveRoomAsCancel(socket) {
 
 // Uygulama yeniden açıldıktan sonra oyuncu "Yeniden bağlan: Hayır" dediğinde eski
 // socket'in tekrar kurulmasını beklemeden sonucu sunucuda hemen kesinleştirir.
-// Yalnız normal iki oyunculu odalarda kullanılır; hazırlık süresi bitmediyse mevcut
-// prestart-cancel davranışı korunur ve maç başlamadan hükmen mağlubiyet yazılmaz.
+// Normal İkili ve Turnuva gerçek-zamanlı odalarında kullanılır. Normal İkili hazırlık
+// süresi bitmediyse mevcut prestart-cancel davranışı korunur; Turnuva ise kendi maç
+// sonucu/hak akışını awardRealtimeRoom üzerinden authoritative olarak uygular.
 app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, async (req, res) => {
   if (!requireDatabase(res)) return;
   const roomId = safeText(req.body.roomId, "", 128);
@@ -14282,8 +14283,8 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
       return;
     }
 
-    if (room.isFriend || String(room.gameKey || "").endsWith("_tournament") || String(room.gameKey || "").endsWith("_hundred")) {
-      res.status(409).json({ ok: false, code: "UNSUPPORTED_MATCH_MODE", message: "Bu oda normal ikili oyun değil." });
+    if (room.isFriend || String(room.gameKey || "").endsWith("_hundred")) {
+      res.status(409).json({ ok: false, code: "UNSUPPORTED_MATCH_MODE", message: "Bu oda reconnect terk işlemini desteklemiyor." });
       return;
     }
 
@@ -14360,7 +14361,7 @@ app.post("/game/realtime/forfeit", requireAuth, challengeMutationRateLimit, asyn
       : null;
     res.json({ ok: true, gameKey, matchWon, ...state });
   } catch (error) {
-    sendLeaderboardError(res, error, "İkili oyun terk sonucu işlenemedi.", "realtime forfeit error:");
+    sendLeaderboardError(res, error, "Maç terk sonucu işlenemedi.", "realtime forfeit error:");
   }
 });
 
