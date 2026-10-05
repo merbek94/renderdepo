@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v36-20261004-ui-network-level-diamond-cleanup";
+const SERVER_BUILD_ID = "shared-game-flow-v38-20261005-lazy-progress-schema-cleanup";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -445,254 +445,43 @@ async function initDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_player_game_sessions_session_id
       ON player_game_sessions (session_id);
 
-    CREATE TABLE IF NOT EXISTS player_scores (
-      player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
-      general_score BIGINT NOT NULL DEFAULT 0 CHECK (general_score >= 0),
-      infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
-      monthly_key TEXT NOT NULL DEFAULT '',
-      monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
-      monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0),
-      monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    ALTER TABLE player_scores
-      ADD COLUMN IF NOT EXISTS monthly_key TEXT NOT NULL DEFAULT '';
-    ALTER TABLE player_scores
-      ADD COLUMN IF NOT EXISTS monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
-    ALTER TABLE player_scores
-      ADD COLUMN IF NOT EXISTS monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
-    ALTER TABLE player_scores
-      ADD COLUMN IF NOT EXISTS monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-
-    -- v21: skor kolonları artık 32-bit INTEGER değildir. Mevcut kurulumlarda değerleri
-    -- kaybetmeden BIGINT'e yükselt; indeksler ve CHECK constraint'leri korunur.
-    ALTER TABLE player_scores ALTER COLUMN general_score TYPE BIGINT USING general_score::bigint;
-    ALTER TABLE player_scores ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
-    ALTER TABLE player_scores ALTER COLUMN monthly_general_score TYPE BIGINT USING monthly_general_score::bigint;
-    ALTER TABLE player_scores ALTER COLUMN monthly_infinite_score TYPE BIGINT USING monthly_infinite_score::bigint;
-
-    -- Eski ayrı aylık leaderboard tablosunu yalnızca bir kez yeni player_scores
-    -- kolonlarına taşı. Sonrasında aylık ve genel skor aynı satırda tutulur.
-    DO $monthly_migration$
-    BEGIN
-      IF to_regclass('public.player_monthly_scores') IS NOT NULL THEN
-        EXECUTE $monthly_sql$
-          UPDATE player_scores AS target
-          SET monthly_key = legacy.month_key,
-              monthly_general_score = legacy.general_score,
-              monthly_infinite_score = legacy.infinite_score,
-              monthly_updated_at = legacy.updated_at
-          FROM player_monthly_scores AS legacy
-          WHERE legacy.player_id = target.player_id
-            AND legacy.month_key = TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM')
-        $monthly_sql$;
-        EXECUTE 'DROP TABLE player_monthly_scores';
-      END IF;
-    END
-    $monthly_migration$;
-
+    -- Hesaba ortak kaynaklar yalnız bu tabloda tutulur. Oyun-bazlı ilerleme/skor
+    -- player_game_progress içinde, yalnız ihtiyaç olduğunda oluşturulur.
     CREATE TABLE IF NOT EXISTS player_progress (
       player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
       total_xp INTEGER NOT NULL DEFAULT 0 CHECK (total_xp >= 0),
-      infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
-      infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
-      tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
-      tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3),
-      tournament_bank BIGINT NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0),
-      tournament_completed BOOLEAN NOT NULL DEFAULT FALSE,
-      tournament_tickets INTEGER NOT NULL DEFAULT 0 CHECK (tournament_tickets >= 0),
-      tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE,
-      hundred_active BOOLEAN NOT NULL DEFAULT FALSE,
-      hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12),
+      tournament_tickets INTEGER NOT NULL DEFAULT 0 CHECK (tournament_tickets BETWEEN 0 AND 9999),
+      tournament_reward_day_key TEXT NOT NULL DEFAULT '',
+      tournament_rewarded_tickets_today INTEGER NOT NULL DEFAULT 0
+        CHECK (tournament_rewarded_tickets_today BETWEEN 0 AND 15),
       hundred_daily_key TEXT NOT NULL DEFAULT '',
-      hundred_daily_base_used BOOLEAN NOT NULL DEFAULT FALSE,
+      hundred_daily_base_used_count INTEGER NOT NULL DEFAULT 0
+        CHECK (hundred_daily_base_used_count BETWEEN 0 AND 2),
       hundred_daily_ad_used BOOLEAN NOT NULL DEFAULT FALSE,
-      hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0 CHECK (hundred_rewarded_rights BETWEEN 0 AND 2),
+      hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0
+        CHECK (hundred_rewarded_rights BETWEEN 0 AND 2),
       game_rights INTEGER NOT NULL DEFAULT 10 CHECK (game_rights BETWEEN 0 AND 10),
       game_rights_refill_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       diamond_balance INTEGER NOT NULL DEFAULT 0 CHECK (diamond_balance >= 0),
-      home_two_player_wins BIGINT NOT NULL DEFAULT 0 CHECK (home_two_player_wins >= 0),
       level_reward_claimed_through INTEGER NOT NULL DEFAULT 0
         CHECK (level_reward_claimed_through BETWEEN 0 AND 1000),
-      two_player_finish_count INTEGER NOT NULL DEFAULT 0
-        CHECK (two_player_finish_count >= 0),
-      two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0
-        CHECK (two_player_finish_total_ms >= 0),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    -- v3 denemesinde kullanılan kalıcı lobby-bot geçmişi artık kullanılmıyor.
-    -- Botlar yalnız RAM'deki ortak salon havuzunda oyun gerçekten başlayınca yenilenir.
-    DROP TABLE IF EXISTS player_lobby_bot_history;
-
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0;
-
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS infinite_next_stage INTEGER NOT NULL DEFAULT 1;
-
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_stage INTEGER NOT NULL DEFAULT 1;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_rights INTEGER NOT NULL DEFAULT 3;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_bank BIGINT NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_tickets INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_active BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_stage INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_daily_key TEXT NOT NULL DEFAULT '';
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_daily_base_used BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_daily_ad_used BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS hundred_daily_base_used_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_reward_day_key TEXT NOT NULL DEFAULT '';
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS tournament_rewarded_tickets_today INTEGER NOT NULL DEFAULT 0;
-
-    -- Büyük UPDATE/constraint normalizasyonları her Render restartında değil yalnızca bir kez çalışır.
-    DO $progress_normalization_v3$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM schema_migrations WHERE migration_id = 'progress_normalization_v3_20260813'
-      ) THEN
-        UPDATE player_progress
-          SET tournament_entry_active = TRUE
-          WHERE tournament_entry_active = FALSE
-            AND tournament_completed = FALSE
-            AND (tournament_stage > 1 OR tournament_bank > 0 OR tournament_rights < 3);
-
-        UPDATE player_progress
-          SET tournament_entry_active = FALSE
-          WHERE tournament_completed = TRUE;
-
-        UPDATE player_progress
-          SET tournament_tickets = LEAST(GREATEST(tournament_tickets, 0), 9999)
-          WHERE tournament_tickets < 0 OR tournament_tickets > 9999;
-        ALTER TABLE player_progress
-          DROP CONSTRAINT IF EXISTS player_progress_tournament_tickets_check_v1;
-        BEGIN
-          ALTER TABLE player_progress
-            ADD CONSTRAINT player_progress_tournament_tickets_check_v1
-            CHECK (tournament_tickets BETWEEN 0 AND 9999);
-        EXCEPTION WHEN duplicate_object THEN
-          NULL;
-        END;
-
-        UPDATE player_progress
-          SET tournament_stage = LEAST(GREATEST(tournament_stage, 1), 8)
-          WHERE tournament_stage < 1 OR tournament_stage > 8;
-        ALTER TABLE player_progress
-          DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check;
-        ALTER TABLE player_progress
-          DROP CONSTRAINT IF EXISTS player_progress_tournament_stage_check_v2;
-        BEGIN
-          ALTER TABLE player_progress
-            ADD CONSTRAINT player_progress_tournament_stage_check_v2
-            CHECK (tournament_stage BETWEEN 1 AND 8);
-        EXCEPTION WHEN duplicate_object THEN
-          NULL;
-        END;
-
-        UPDATE player_progress
-          SET hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 2)
-          WHERE hundred_rewarded_rights < 0 OR hundred_rewarded_rights > 1;
-        ALTER TABLE player_progress
-          DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-        BEGIN
-          ALTER TABLE player_progress
-            ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v1
-            CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
-        EXCEPTION WHEN duplicate_object THEN
-          NULL;
-        END;
-
-        INSERT INTO schema_migrations (migration_id)
-        VALUES ('progress_normalization_v3_20260813')
-        ON CONFLICT (migration_id) DO NOTHING;
-      END IF;
-    END
-    $progress_normalization_v3$;
-
-    UPDATE player_progress
-      SET hundred_daily_base_used_count = CASE
-        WHEN hundred_daily_base_used_count > 0 THEN LEAST(hundred_daily_base_used_count, 2)
-        WHEN hundred_daily_base_used THEN 1
-        ELSE 0
-      END;
-
-    -- Bu constraint'ler her Render restartında silinip yeniden oluşturulmaz.
-    -- Var olan doğru constraint korunur; yalnız eksikse eklenir. Böylece eski/yeni
-    -- instance'ların kısa süre aynı anda initDatabase() çalıştırması duplicate_object
-    -- (PostgreSQL 42710) hatasına yol açmaz.
-    DO $shared_progress_constraints_v5$
-    BEGIN
-      -- Eski adlar artık kullanılmıyor; varsa kaldırmak güvenlidir.
-      ALTER TABLE player_progress
-        DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check;
-      ALTER TABLE player_progress
-        DROP CONSTRAINT IF EXISTS player_progress_hundred_rewarded_rights_check_v1;
-
-      IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'player_progress_hundred_daily_base_used_count_check'
-          AND conrelid = 'player_progress'::regclass
-      ) THEN
-        BEGIN
-          ALTER TABLE player_progress
-            ADD CONSTRAINT player_progress_hundred_daily_base_used_count_check
-            CHECK (hundred_daily_base_used_count BETWEEN 0 AND 2);
-        EXCEPTION WHEN duplicate_object THEN
-          NULL;
-        END;
-      END IF;
-
-      IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'player_progress_tournament_rewarded_tickets_today_check'
-          AND conrelid = 'player_progress'::regclass
-      ) THEN
-        BEGIN
-          ALTER TABLE player_progress
-            ADD CONSTRAINT player_progress_tournament_rewarded_tickets_today_check
-            CHECK (tournament_rewarded_tickets_today BETWEEN 0 AND 15);
-        EXCEPTION WHEN duplicate_object THEN
-          NULL;
-        END;
-      END IF;
-
-      IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'player_progress_hundred_rewarded_rights_check_v2'
-          AND conrelid = 'player_progress'::regclass
-      ) THEN
-        BEGIN
-          ALTER TABLE player_progress
-            ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v2
-            CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
-        EXCEPTION WHEN duplicate_object THEN
-          NULL;
-        END;
-      END IF;
-    END
-    $shared_progress_constraints_v5$;
-
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS hundred_daily_key TEXT NOT NULL DEFAULT '';
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS hundred_daily_base_used_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS hundred_daily_ad_used BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_progress
+      ADD COLUMN IF NOT EXISTS hundred_rewarded_rights INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS game_rights INTEGER NOT NULL DEFAULT 10;
     ALTER TABLE player_progress
@@ -700,13 +489,35 @@ async function initDatabase() {
     ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS diamond_balance INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS home_two_player_wins BIGINT NOT NULL DEFAULT 0 CHECK (home_two_player_wins >= 0);
-    ALTER TABLE player_progress
       ADD COLUMN IF NOT EXISTS level_reward_claimed_through INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE player_progress
-      ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0;
+
+    UPDATE player_progress
+    SET tournament_tickets = LEAST(GREATEST(tournament_tickets, 0), 9999),
+        tournament_rewarded_tickets_today = LEAST(GREATEST(tournament_rewarded_tickets_today, 0), 15),
+        hundred_daily_base_used_count = LEAST(GREATEST(hundred_daily_base_used_count, 0), 2),
+        hundred_rewarded_rights = LEAST(GREATEST(hundred_rewarded_rights, 0), 2),
+        game_rights = LEAST(GREATEST(game_rights, 0), 10),
+        diamond_balance = GREATEST(diamond_balance, 0),
+        level_reward_claimed_through = LEAST(GREATEST(level_reward_claimed_through, 0), 1000);
+
+    DO $shared_progress_constraints_v8$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'player_progress_tournament_tickets_check_v8' AND conrelid = 'player_progress'::regclass) THEN
+        ALTER TABLE player_progress ADD CONSTRAINT player_progress_tournament_tickets_check_v8 CHECK (tournament_tickets BETWEEN 0 AND 9999);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'player_progress_tournament_rewarded_tickets_today_check_v8' AND conrelid = 'player_progress'::regclass) THEN
+        ALTER TABLE player_progress ADD CONSTRAINT player_progress_tournament_rewarded_tickets_today_check_v8 CHECK (tournament_rewarded_tickets_today BETWEEN 0 AND 15);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'player_progress_hundred_daily_base_used_count_check_v8' AND conrelid = 'player_progress'::regclass) THEN
+        ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_daily_base_used_count_check_v8 CHECK (hundred_daily_base_used_count BETWEEN 0 AND 2);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'player_progress_hundred_rewarded_rights_check_v8' AND conrelid = 'player_progress'::regclass) THEN
+        ALTER TABLE player_progress ADD CONSTRAINT player_progress_hundred_rewarded_rights_check_v8 CHECK (hundred_rewarded_rights BETWEEN 0 AND 2);
+      END IF;
+    END
+    $shared_progress_constraints_v8$;
+
+    DROP TABLE IF EXISTS player_lobby_bot_history;
 
     ALTER TABLE players
       ADD COLUMN IF NOT EXISTS username_user_set BOOLEAN NOT NULL DEFAULT FALSE;
@@ -774,12 +585,11 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS player_game_progress (
       player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
       game_key TEXT NOT NULL,
-      general_score BIGINT NOT NULL DEFAULT 50 CHECK (general_score >= 0),
+      general_score BIGINT NOT NULL DEFAULT 20 CHECK (general_score >= 0),
       infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0),
       monthly_key TEXT NOT NULL DEFAULT '',
       monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0),
       monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0),
-      monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0),
       infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1),
       tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8),
@@ -795,170 +605,167 @@ async function initDatabase() {
       two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0),
       bot_timing_game_count INTEGER NOT NULL DEFAULT 0 CHECK (bot_timing_game_count >= 0),
       has_played BOOLEAN NOT NULL DEFAULT FALSE,
-      stats JSONB NOT NULL DEFAULT '{}'::jsonb,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (player_id, game_key)
     );
-    -- CREATE TABLE IF NOT EXISTS mevcut tabloyu değiştirmez. Eski/yarım migration ile
-    -- player_game_progress daha önce oluşmuşsa eksik kolonların tamamını burada tamamla.
-    -- Bu blok tekrar çalıştırılabilir; mevcut kolonlara dokunmaz.
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS general_score BIGINT NOT NULL DEFAULT 50 CHECK (general_score >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS monthly_key TEXT NOT NULL DEFAULT '';
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS monthly_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS tournament_bank BIGINT NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS hundred_active BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS bot_timing_game_count INTEGER NOT NULL DEFAULT 0 CHECK (bot_timing_game_count >= 0);
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS has_played BOOLEAN NOT NULL DEFAULT FALSE;
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS stats JSONB NOT NULL DEFAULT '{}'::jsonb;
-    ALTER TABLE player_game_progress
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS general_score BIGINT NOT NULL DEFAULT 20 CHECK (general_score >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_score >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS monthly_key TEXT NOT NULL DEFAULT '';
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS monthly_general_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_general_score >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS monthly_infinite_score BIGINT NOT NULL DEFAULT 0 CHECK (monthly_infinite_score >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS infinite_run_score BIGINT NOT NULL DEFAULT 0 CHECK (infinite_run_score >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS infinite_next_stage INTEGER NOT NULL DEFAULT 1 CHECK (infinite_next_stage >= 1);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS tournament_stage INTEGER NOT NULL DEFAULT 1 CHECK (tournament_stage BETWEEN 1 AND 8);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS tournament_rights INTEGER NOT NULL DEFAULT 3 CHECK (tournament_rights BETWEEN 0 AND 3);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS tournament_bank BIGINT NOT NULL DEFAULT 0 CHECK (tournament_bank >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS tournament_completed BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS tournament_entry_active BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS hundred_active BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS hundred_stage INTEGER NOT NULL DEFAULT 0 CHECK (hundred_stage BETWEEN 0 AND 12);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS two_player_finish_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_finish_count >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS two_player_finish_total_ms BIGINT NOT NULL DEFAULT 0 CHECK (two_player_finish_total_ms >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS two_player_score_count INTEGER NOT NULL DEFAULT 0 CHECK (two_player_score_count >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS two_player_score_total BIGINT NOT NULL DEFAULT 0 CHECK (two_player_score_total >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS bot_timing_game_count INTEGER NOT NULL DEFAULT 0 CHECK (bot_timing_game_count >= 0);
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS has_played BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE player_game_progress ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
     ALTER TABLE player_game_progress ALTER COLUMN general_score TYPE BIGINT USING general_score::bigint;
-    ALTER TABLE player_game_progress ALTER COLUMN general_score SET DEFAULT 50;
-
-    -- v24: v22 geçişinde daha önce 0 ile oluşmuş fakat hiç oynanmamış oyun satırlarına
-    -- olması gereken oyun-başı 50 puanı bir kez uygula. Gerçekten oynanmış/istatistikli
-    -- satırlara dokunulmaz; böylece maç kaybederek 0'a inmiş puanlar geri şişirilmez.
-    DO $per_game_initial50_v24$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM schema_migrations WHERE migration_id = 'per_game_initial50_v24_20260917'
-      ) THEN
-        UPDATE player_game_progress
-        SET general_score = 50,
-            monthly_general_score = CASE WHEN monthly_general_score = 0 THEN 50 ELSE monthly_general_score END,
-            updated_at = NOW()
-        WHERE general_score = 0
-          AND infinite_score = 0
-          AND infinite_run_score = 0
-          AND infinite_next_stage = 1
-          AND tournament_stage = 1
-          AND tournament_bank = 0
-          AND tournament_completed = FALSE
-          AND tournament_entry_active = FALSE
-          AND hundred_active = FALSE
-          AND hundred_stage = 0
-          AND two_player_finish_count = 0
-          AND two_player_score_count = 0
-          AND stats = '{}'::jsonb;
-
-        INSERT INTO schema_migrations (migration_id)
-        VALUES ('per_game_initial50_v24_20260917')
-        ON CONFLICT (migration_id) DO NOTHING;
-      END IF;
-    END
-    $per_game_initial50_v24$;
-
-    -- v28: skor tablosunda yalnız gerçekten en az bir oyun oynamış kullanıcılar görünür.
-    -- Eski oyuncular için mevcut ilerleme/istatistik kanıtlarından güvenli bir tek-seferlik backfill yapılır.
-    DO $per_game_has_played_v28$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM schema_migrations WHERE migration_id = 'per_game_has_played_v28_20260919'
-      ) THEN
-        UPDATE player_game_progress
-        SET has_played = TRUE,
-            updated_at = NOW()
-        WHERE has_played = FALSE
-          AND (
-            general_score <> 50 OR
-            infinite_score > 0 OR
-            infinite_run_score > 0 OR
-            infinite_next_stage > 1 OR
-            tournament_stage > 1 OR
-            tournament_bank > 0 OR
-            tournament_completed = TRUE OR
-            tournament_entry_active = TRUE OR
-            hundred_active = TRUE OR
-            hundred_stage > 0 OR
-            two_player_finish_count > 0 OR
-            two_player_score_count > 0 OR
-            bot_timing_game_count > 0 OR
-            stats <> '{}'::jsonb
-          );
-
-        INSERT INTO schema_migrations (migration_id)
-        VALUES ('per_game_has_played_v28_20260919')
-        ON CONFLICT (migration_id) DO NOTHING;
-      END IF;
-    END
-    $per_game_has_played_v28$;
-
+    ALTER TABLE player_game_progress ALTER COLUMN general_score SET DEFAULT 20;
     ALTER TABLE player_game_progress ALTER COLUMN infinite_score TYPE BIGINT USING infinite_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN monthly_general_score TYPE BIGINT USING monthly_general_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN monthly_infinite_score TYPE BIGINT USING monthly_infinite_score::bigint;
     ALTER TABLE player_game_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
+    ALTER TABLE player_game_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
 
-    -- v24: Eski normal sonsuz sistemindeki 5*(1+...+n) yüksek skorlarını doğrudan
-    -- "en yüksek aşama = n" biçimine çevir. 729 (üs) ve Rakam Avı (ham skor)
-    -- zaten oyun-özel semantik kullandığı için dönüşüm dışında tutulur.
-    DO $infinite_high_stage_v24$
+    -- v8: Eski global skor ve player_progress içindeki eski oyun-bazlı alanları son kez
+    -- target_number satırına taşı; ardından eski yapıları kaldır. Yeni kurulumlarda bu blok no-op'tur.
+    DO $lazy_progress_cleanup_v8$
     BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM schema_migrations WHERE migration_id = 'infinite_high_stage_v24_20260917'
-      ) THEN
-        UPDATE player_game_progress
-        SET infinite_score = CASE
-              WHEN infinite_score <= 0 THEN 0
-              ELSE FLOOR((SQRT(1::numeric + (8::numeric * infinite_score::numeric / 5::numeric)) - 1::numeric) / 2::numeric)::bigint
-            END,
-            monthly_infinite_score = CASE
-              WHEN monthly_infinite_score <= 0 THEN 0
-              ELSE FLOOR((SQRT(1::numeric + (8::numeric * monthly_infinite_score::numeric / 5::numeric)) - 1::numeric) / 2::numeric)::bigint
-            END,
-            infinite_run_score = CASE
-              WHEN infinite_run_score <= 0 THEN 0
-              ELSE FLOOR((SQRT(1::numeric + (8::numeric * infinite_run_score::numeric / 5::numeric)) - 1::numeric) / 2::numeric)::bigint
-            END,
+      IF to_regclass('public.player_scores') IS NOT NULL THEN
+        EXECUTE $legacy_score_sql$
+          INSERT INTO player_game_progress (
+            player_id, game_key, general_score, infinite_score,
+            monthly_key, monthly_general_score, monthly_infinite_score, has_played, updated_at
+          )
+          SELECT player_id, 'target_number',
+                 GREATEST(general_score, 20), infinite_score,
+                 monthly_key, monthly_general_score, monthly_infinite_score,
+                 (general_score <> 0 OR infinite_score > 0 OR monthly_general_score > 0 OR monthly_infinite_score > 0), NOW()
+          FROM player_scores
+          ON CONFLICT (player_id, game_key) DO UPDATE SET
+            general_score = GREATEST(player_game_progress.general_score, EXCLUDED.general_score),
+            infinite_score = GREATEST(player_game_progress.infinite_score, EXCLUDED.infinite_score),
+            monthly_key = CASE WHEN EXCLUDED.monthly_key <> '' THEN EXCLUDED.monthly_key ELSE player_game_progress.monthly_key END,
+            monthly_general_score = GREATEST(player_game_progress.monthly_general_score, EXCLUDED.monthly_general_score),
+            monthly_infinite_score = GREATEST(player_game_progress.monthly_infinite_score, EXCLUDED.monthly_infinite_score),
+            has_played = player_game_progress.has_played OR EXCLUDED.has_played,
             updated_at = NOW()
-        WHERE game_key NOT IN ('merge_5120', 'digit_hunt');
+        $legacy_score_sql$;
+      END IF;
 
-        INSERT INTO schema_migrations (migration_id)
-        VALUES ('infinite_high_stage_v24_20260917')
-        ON CONFLICT (migration_id) DO NOTHING;
+      IF to_regclass('public.player_monthly_scores') IS NOT NULL THEN
+        EXECUTE $legacy_month_sql$
+          INSERT INTO player_game_progress (player_id, game_key, monthly_key, monthly_general_score, monthly_infinite_score, has_played, updated_at)
+          SELECT player_id, 'target_number', month_key, general_score, infinite_score,
+                 (general_score > 0 OR infinite_score > 0), NOW()
+          FROM player_monthly_scores
+          WHERE month_key = TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM')
+          ON CONFLICT (player_id, game_key) DO UPDATE SET
+            monthly_key = EXCLUDED.monthly_key,
+            monthly_general_score = GREATEST(player_game_progress.monthly_general_score, EXCLUDED.monthly_general_score),
+            monthly_infinite_score = GREATEST(player_game_progress.monthly_infinite_score, EXCLUDED.monthly_infinite_score),
+            has_played = player_game_progress.has_played OR EXCLUDED.has_played,
+            updated_at = NOW()
+        $legacy_month_sql$;
+      END IF;
+
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='player_progress' AND column_name='infinite_run_score') THEN
+        EXECUTE $legacy_progress_sql$
+          INSERT INTO player_game_progress (
+            player_id, game_key, infinite_run_score, infinite_next_stage,
+            tournament_stage, tournament_rights, tournament_bank, tournament_completed, tournament_entry_active,
+            hundred_active, hundred_stage, two_player_finish_count, two_player_finish_total_ms, has_played, updated_at
+          )
+          SELECT player_id, 'target_number', infinite_run_score, infinite_next_stage,
+                 tournament_stage, tournament_rights, tournament_bank, tournament_completed, tournament_entry_active,
+                 hundred_active, hundred_stage, two_player_finish_count, two_player_finish_total_ms,
+                 (infinite_run_score > 0 OR infinite_next_stage > 1 OR tournament_stage > 1 OR tournament_bank > 0 OR
+                  tournament_completed OR tournament_entry_active OR hundred_active OR hundred_stage > 0 OR two_player_finish_count > 0), NOW()
+          FROM player_progress
+          ON CONFLICT (player_id, game_key) DO UPDATE SET
+            infinite_run_score = GREATEST(player_game_progress.infinite_run_score, EXCLUDED.infinite_run_score),
+            infinite_next_stage = GREATEST(player_game_progress.infinite_next_stage, EXCLUDED.infinite_next_stage),
+            tournament_stage = GREATEST(player_game_progress.tournament_stage, EXCLUDED.tournament_stage),
+            tournament_rights = GREATEST(player_game_progress.tournament_rights, EXCLUDED.tournament_rights),
+            tournament_bank = GREATEST(player_game_progress.tournament_bank, EXCLUDED.tournament_bank),
+            tournament_completed = player_game_progress.tournament_completed OR EXCLUDED.tournament_completed,
+            tournament_entry_active = player_game_progress.tournament_entry_active OR EXCLUDED.tournament_entry_active,
+            hundred_active = player_game_progress.hundred_active OR EXCLUDED.hundred_active,
+            hundred_stage = GREATEST(player_game_progress.hundred_stage, EXCLUDED.hundred_stage),
+            two_player_finish_count = LEAST(player_game_progress.two_player_finish_count + EXCLUDED.two_player_finish_count, 2000000000),
+            two_player_finish_total_ms = LEAST(player_game_progress.two_player_finish_total_ms + EXCLUDED.two_player_finish_total_ms, 9223372036854775807::bigint),
+            has_played = player_game_progress.has_played OR EXCLUDED.has_played,
+            updated_at = NOW()
+        $legacy_progress_sql$;
+      END IF;
+
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='player_progress' AND column_name='hundred_daily_base_used') THEN
+        EXECUTE 'UPDATE player_progress SET hundred_daily_base_used_count = GREATEST(hundred_daily_base_used_count, CASE WHEN hundred_daily_base_used THEN 1 ELSE 0 END)';
       END IF;
     END
-    $infinite_high_stage_v24$;
+    $lazy_progress_cleanup_v8$;
 
-    ALTER TABLE player_game_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
-    ALTER TABLE player_progress ALTER COLUMN infinite_run_score TYPE BIGINT USING infinite_run_score::bigint;
-    ALTER TABLE player_progress ALTER COLUMN tournament_bank TYPE BIGINT USING tournament_bank::bigint;
+    -- Eski 50 başlangıç puanıyla otomatik oluşturulmuş ve hiçbir gerçek ilerlemesi olmayan
+    -- satırlar artık tutulmaz. Oyun ilk gerektiğinde 20 puanla tek satır olarak oluşturulur.
+    UPDATE player_game_progress
+    SET has_played = TRUE, updated_at = NOW()
+    WHERE has_played = FALSE AND (
+      general_score NOT IN (20, 50) OR infinite_score > 0 OR infinite_run_score > 0 OR infinite_next_stage > 1 OR
+      tournament_stage > 1 OR tournament_bank > 0 OR tournament_completed OR tournament_entry_active OR
+      hundred_active OR hundred_stage > 0 OR two_player_finish_count > 0 OR two_player_score_count > 0 OR bot_timing_game_count > 0
+    );
+
+    DELETE FROM player_game_progress
+    WHERE has_played = FALSE
+      AND general_score IN (20, 50)
+      AND infinite_score = 0
+      AND infinite_run_score = 0
+      AND infinite_next_stage = 1
+      AND tournament_stage = 1
+      AND tournament_rights = 3
+      AND tournament_bank = 0
+      AND tournament_completed = FALSE
+      AND tournament_entry_active = FALSE
+      AND hundred_active = FALSE
+      AND hundred_stage = 0
+      AND two_player_finish_count = 0
+      AND two_player_finish_total_ms = 0
+      AND two_player_score_count = 0
+      AND two_player_score_total = 0
+      AND bot_timing_game_count = 0
+      AND monthly_infinite_score = 0
+      AND monthly_general_score IN (0, 20, 50);
+
+    -- Artık kullanılmayan global/tekrarlı şema kalıntılarını kaldır.
+    DROP TABLE IF EXISTS player_monthly_scores;
+    DROP TABLE IF EXISTS player_scores;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS infinite_run_score;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS infinite_next_stage;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS tournament_stage;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS tournament_rights;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS tournament_bank;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS tournament_completed;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS tournament_entry_active;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS hundred_active;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS hundred_stage;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS hundred_daily_base_used;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS home_two_player_wins;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS two_player_finish_count;
+    ALTER TABLE player_progress DROP COLUMN IF EXISTS two_player_finish_total_ms;
+    ALTER TABLE player_game_progress DROP COLUMN IF EXISTS monthly_updated_at;
+    ALTER TABLE player_game_progress DROP COLUMN IF EXISTS stats;
 
     CREATE INDEX IF NOT EXISTS idx_player_game_progress_game
       ON player_game_progress (game_key, player_id);
@@ -977,49 +784,6 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_player_game_progress_month_infinite_leaderboard
       ON player_game_progress (game_key, monthly_key, monthly_infinite_score DESC, player_id ASC)
       WHERE monthly_infinite_score > 0;
-
-    -- Eski tek/global puan yalnız bir kez Hedef Sayıyı Bul oyununa taşınır. Geçmişte hangi
-    -- puanın hangi oyundan geldiği bilinmediği için 20 oyuna çoğaltılmaz.
-    DO $per_game_score_v22$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM schema_migrations WHERE migration_id = 'per_game_score_v22_20260914'
-      ) THEN
-        UPDATE player_game_progress gp
-        SET general_score = GREATEST(gp.general_score, s.general_score),
-            monthly_key = CASE WHEN s.monthly_key <> '' THEN s.monthly_key ELSE gp.monthly_key END,
-            monthly_general_score = GREATEST(gp.monthly_general_score, s.monthly_general_score),
-            monthly_infinite_score = GREATEST(gp.monthly_infinite_score, s.monthly_infinite_score),
-            updated_at = NOW()
-        FROM player_scores s
-        WHERE gp.player_id = s.player_id
-          AND gp.game_key = 'target_number';
-
-        INSERT INTO schema_migrations (migration_id)
-        VALUES ('per_game_score_v22_20260914')
-        ON CONFLICT (migration_id) DO NOTHING;
-      END IF;
-    END
-    $per_game_score_v22$;
-
-    -- Eski tek oyun sürümündeki Hedef Sayıyı Bul ilerlemesini ilk geçişte koru.
-    INSERT INTO player_game_progress (
-      player_id, game_key, general_score, infinite_score,
-      monthly_key, monthly_general_score, monthly_infinite_score,
-      infinite_run_score, infinite_next_stage,
-      tournament_stage, tournament_rights, tournament_bank, tournament_completed,
-      tournament_entry_active, hundred_active, hundred_stage,
-      two_player_finish_count, two_player_finish_total_ms, updated_at
-    )
-    SELECT p.player_id, 'target_number', s.general_score, s.infinite_score,
-           s.monthly_key, s.monthly_general_score, s.monthly_infinite_score,
-           p.infinite_run_score, p.infinite_next_stage,
-           p.tournament_stage, p.tournament_rights, p.tournament_bank, p.tournament_completed,
-           p.tournament_entry_active, p.hundred_active, p.hundred_stage,
-           p.two_player_finish_count, p.two_player_finish_total_ms, NOW()
-    FROM player_progress p
-    JOIN player_scores s ON s.player_id = p.player_id
-    ON CONFLICT (player_id, game_key) DO NOTHING;
 
     CREATE TABLE IF NOT EXISTS secure_game_challenges (
       challenge_id TEXT PRIMARY KEY,
@@ -1111,75 +875,6 @@ function currentMonthKey() {
 }
 
 /**
- * Genel ve mevcut-ay skorlarını tek player_scores UPDATE'i ile değiştirir.
- * Ay değişmişse aylık sayaçlar önce sıfır kabul edilir; böylece ayrı aylık tablo
- * ve günlük eski-ay temizleme işi gerekmez.
- */
-async function applyLeaderboardScoreDeltaInTransaction(
-  client,
-  playerId,
-  generalDelta = 0,
-  infiniteDelta = 0
-) {
-  const monthKey = currentMonthKey();
-  return client.query(
-    `UPDATE player_scores
-     SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, general_score::numeric + $2::numeric))::bigint,
-         infinite_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, infinite_score::numeric + $3::numeric))::bigint,
-         monthly_general_score = CASE
-           WHEN monthly_key = $4 THEN
-             LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_general_score::numeric + $2::numeric))::bigint
-           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $2::numeric))::bigint
-         END,
-         monthly_infinite_score = CASE
-           WHEN monthly_key = $4 THEN
-             LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_infinite_score::numeric + $3::numeric))::bigint
-           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint
-         END,
-         monthly_key = $4,
-         monthly_updated_at = NOW(),
-         updated_at = NOW()
-     WHERE player_id = $1`,
-    [playerId, generalDelta, infiniteDelta, monthKey]
-  );
-}
-
-/**
- * Sonsuz modda toplam sonsuz skor bir yüksek-skor değeridir; artış değildir.
- * Genel puanı eklerken hem tüm-zamanlar hem mevcut-ay sonsuz yüksek skorunu
- * tek player_scores UPDATE'i içinde GREATEST ile korur.
- */
-async function applyLeaderboardGeneralDeltaAndInfiniteHighScoreInTransaction(
-  client,
-  playerId,
-  generalDelta,
-  infiniteHighScore
-) {
-  const monthKey = currentMonthKey();
-  return client.query(
-    `UPDATE player_scores
-     SET general_score = LEAST(9223372036854775807::numeric, GREATEST(0::numeric, general_score::numeric + $2::numeric))::bigint,
-         infinite_score = GREATEST(infinite_score, LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint),
-         monthly_general_score = CASE
-           WHEN monthly_key = $4 THEN
-             LEAST(9223372036854775807::numeric, GREATEST(0::numeric, monthly_general_score::numeric + $2::numeric))::bigint
-           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $2::numeric))::bigint
-         END,
-         monthly_infinite_score = CASE
-           WHEN monthly_key = $4 THEN
-             GREATEST(monthly_infinite_score, LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint)
-           ELSE LEAST(9223372036854775807::numeric, GREATEST(0::numeric, $3::numeric))::bigint
-         END,
-         monthly_key = $4,
-         monthly_updated_at = NOW(),
-         updated_at = NOW()
-     WHERE player_id = $1`,
-    [playerId, generalDelta, infiniteHighScore, monthKey]
-  );
-}
-
-
-/**
  * Yeni skor mimarisi: normal ve sonsuz skorlar oyuncu + oyun anahtarında tutulur.
  * Böylece 20 leaderboard tek player_game_progress tablosu ve game_key önekli indeksleri paylaşır.
  */
@@ -1215,7 +910,6 @@ async function applyGameGeneralScoreDeltaInTransaction(
            ELSE 0
          END,
          monthly_key = $4,
-         monthly_updated_at = NOW(),
          updated_at = NOW()
      WHERE player_id = $1 AND game_key = $2`,
     [playerId, baseGameKey, delta, monthKey]
@@ -1244,7 +938,6 @@ async function applyGameInfiniteHighScoreInTransaction(
            ELSE 0
          END,
          monthly_key = $4,
-         monthly_updated_at = NOW(),
          updated_at = NOW()
      WHERE player_id = $1 AND game_key = $2`,
     [playerId, baseGameKey, highScore, monthKey]
@@ -2136,16 +1829,8 @@ function sendLeaderboardError(
   });
 }
 
-async function ensurePlayerScoreRow(client, playerId) {
-  await client.query(
-    `INSERT INTO player_scores (player_id)
-     VALUES ($1)
-     ON CONFLICT (player_id) DO NOTHING`,
-    [playerId]
-  );
-}
-
 /**
+ * Kullanıcı adı yalnızca kullanıcı adı kaydetme/değiştirme sırasında sahiplenilir./**
  * Kullanıcı adı yalnızca kullanıcı adı kaydetme/değiştirme sırasında sahiplenilir.
  *
  * Güvenlik: kullanıcı adı hesap sahipliğinin kanıtı değildir. Bu nedenle eski local_ satırlar
@@ -2194,7 +1879,6 @@ async function claimOrCreatePlayer(
     [playerId, username, country]
   );
 
-  await ensurePlayerScoreRow(client, playerId);
 }
 
 /**
@@ -2230,7 +1914,6 @@ async function ensurePlayerForScore(
       [playerId, country]
     );
 
-    await ensurePlayerScoreRow(client, playerId);
     return;
   }
 
@@ -4355,7 +4038,7 @@ async function settleLevelMilestoneRewardsInTransaction(client, playerId) {
   };
 }
 
-const INITIAL_PER_GAME_SCORE = 50;
+const INITIAL_PER_GAME_SCORE = 20;
 
 async function ensurePlayerGameProgress(client, playerId, gameKey) {
   const baseGameKey = normalizeBaseGameKey(gameKey);
@@ -4380,20 +4063,6 @@ async function markGamePlayedInTransaction(client, playerId, gameKey) {
     [playerId, baseGameKey]
   );
   return baseGameKey;
-}
-
-async function ensureAllPlayerGameProgress(client, playerId) {
-  const gameKeys = Object.keys(GAME_DEFINITIONS);
-  const monthKey = currentMonthKey();
-  await client.query(
-    `INSERT INTO player_game_progress (
-       player_id, game_key, general_score, monthly_key, monthly_general_score
-     )
-     SELECT $1, game_key, $3, $4, $3
-     FROM UNNEST($2::text[]) AS game_key
-     ON CONFLICT (player_id, game_key) DO NOTHING`,
-    [playerId, gameKeys, INITIAL_PER_GAME_SCORE, monthKey]
-  );
 }
 
 async function readAllGameGeneralScores(client, playerId) {
@@ -4430,7 +4099,7 @@ async function normalizeHundredDailyAccessInTransaction(client, playerId, gameKe
   if (!playerAlreadyEnsured) await ensureAuthenticatedPlayer(client, playerId);
   const baseGameKey = await ensurePlayerGameProgress(client, playerId, gameKey);
   const result = await client.query(
-    `SELECT p.hundred_daily_key, p.hundred_daily_base_used, p.hundred_daily_base_used_count,
+    `SELECT p.hundred_daily_key, p.hundred_daily_base_used_count,
             p.hundred_daily_ad_used, p.hundred_rewarded_rights,
             gp.hundred_active, gp.hundred_stage
      FROM player_progress p
@@ -4443,7 +4112,7 @@ async function normalizeHundredDailyAccessInTransaction(client, playerId, gameKe
   const todayKey = currentUtcDayKey();
   let dailyKey = String(row.hundred_daily_key || "");
   let baseUsedCount = Math.max(0, Math.min(
-    Number(row.hundred_daily_base_used_count ?? (row.hundred_daily_base_used === true ? 1 : 0)),
+    Number(row.hundred_daily_base_used_count || 0),
     HUNDRED_DAILY_BASE_RIGHTS
   ));
   let adUsed = row.hundred_daily_ad_used === true;
@@ -4457,7 +4126,6 @@ async function normalizeHundredDailyAccessInTransaction(client, playerId, gameKe
     await client.query(
       `UPDATE player_progress SET
          hundred_daily_key = $2,
-         hundred_daily_base_used = FALSE,
          hundred_daily_base_used_count = 0,
          hundred_daily_ad_used = FALSE,
          hundred_rewarded_rights = 0,
@@ -4586,10 +4254,9 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
   await ensureAuthenticatedPlayer(client, playerId);
   const baseGameKey = await ensurePlayerGameProgress(client, playerId, gameKey);
   const result = await client.query(
-    `SELECT s.general_score AS legacy_general_score, s.infinite_score AS legacy_infinite_score,
-            p.total_xp, p.diamond_balance, p.home_two_player_wins, p.level_reward_claimed_through,
+    `SELECT p.total_xp, p.diamond_balance, p.level_reward_claimed_through,
             p.tournament_tickets, p.tournament_reward_day_key, p.tournament_rewarded_tickets_today,
-            p.hundred_daily_key, p.hundred_daily_base_used, p.hundred_daily_base_used_count,
+            p.hundred_daily_key, p.hundred_daily_base_used_count,
             p.hundred_daily_ad_used, p.hundred_rewarded_rights,
             p.game_rights, p.game_rights_refill_at,
             gp.general_score AS game_general_score,
@@ -4601,12 +4268,11 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
             pl.username, pl.country, pl.username_user_set,
             pl.username_change_count, pl.username_last_changed_at,
             pl.updated_at AS profile_updated_at
-     FROM player_scores s
-     JOIN player_progress p ON p.player_id = s.player_id
-     JOIN player_game_progress gp ON gp.player_id = s.player_id AND gp.game_key = $2
-     JOIN players pl ON pl.player_id = s.player_id
-     WHERE s.player_id = $1
-     FOR UPDATE OF s, p, gp`,
+     FROM player_progress p
+     JOIN player_game_progress gp ON gp.player_id = p.player_id AND gp.game_key = $2
+     JOIN players pl ON pl.player_id = p.player_id
+     WHERE p.player_id = $1
+     FOR UPDATE OF p, gp`,
     [playerId, baseGameKey]
   );
   const row = result.rows[0] || {};
@@ -4626,7 +4292,7 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
   const todayKey = currentUtcDayKey();
   const hundredResetNeeded = String(row.hundred_daily_key || "") !== todayKey;
   const hundredBaseUsedCount = hundredResetNeeded ? 0 : Math.max(0, Math.min(
-    Number(row.hundred_daily_base_used_count ?? (row.hundred_daily_base_used === true ? 1 : 0)),
+    Number(row.hundred_daily_base_used_count || 0),
     HUNDRED_DAILY_BASE_RIGHTS
   ));
   const hundredAdUsed = hundredResetNeeded ? false : row.hundred_daily_ad_used === true;
@@ -4651,12 +4317,11 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
          diamond_balance = LEAST(diamond_balance + $2, 2000000000),
          level_reward_claimed_through = $3,
          hundred_daily_key = $4,
-         hundred_daily_base_used = $5,
-         hundred_daily_base_used_count = $6,
-         hundred_daily_ad_used = $7,
-         hundred_rewarded_rights = $8,
-         game_rights = $9,
-         game_rights_refill_at = TO_TIMESTAMP($10 / 1000.0),
+         hundred_daily_base_used_count = $5,
+         hundred_daily_ad_used = $6,
+         hundred_rewarded_rights = $7,
+         game_rights = $8,
+         game_rights_refill_at = TO_TIMESTAMP($9 / 1000.0),
          updated_at = NOW()
        WHERE player_id = $1`,
       [
@@ -4664,7 +4329,6 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
         levelSettlementNeeded ? levelSettlement.diamondDelta : 0,
         levelSettlementNeeded ? levelSettlement.claimedThroughLevel : storedClaimedThrough,
         todayKey,
-        hundredBaseUsedCount > 0,
         hundredBaseUsedCount,
         hundredAdUsed,
         hundredRewardedRights,
@@ -4689,7 +4353,6 @@ async function readAuthoritativePlayerState(client, playerId, gameKey = "target_
     generalScore: gameGeneralScore,
     infiniteScore: safeScoreNumber(row.game_infinite_score),
     gameInfiniteScore: safeScoreNumber(row.game_infinite_score),
-    homeScore: safeScoreNumber(row.home_two_player_wins),
     totalXp,
     diamondBalance,
     levelRewardClaimedThrough: levelSettlementNeeded ? levelSettlement.claimedThroughLevel : storedClaimedThrough,
@@ -5171,13 +4834,6 @@ async function recordTwoPlayerScoreInTransaction(client, playerId, scoreValue, g
     `UPDATE player_game_progress
      SET two_player_score_count = LEAST(two_player_score_count + 1, 2000000000),
          two_player_score_total = LEAST(two_player_score_total + $2::bigint, 9223372036854775807::bigint),
-         stats = jsonb_set(
-           jsonb_set(
-             jsonb_set(COALESCE(stats, '{}'::jsonb), '{scoreGames}', to_jsonb(LEAST(COALESCE((stats->>'scoreGames')::bigint,0)+1,2000000000)), true),
-             '{totalGameScore}', to_jsonb(LEAST(COALESCE((stats->>'totalGameScore')::bigint,0)+$2::bigint,9223372036854775807::bigint)), true
-           ),
-           '{bestGameScore}', to_jsonb(GREATEST(COALESCE((stats->>'bestGameScore')::bigint,0),$2::bigint)), true
-         ),
          updated_at = NOW()
      WHERE player_id = $1 AND game_key = $3`,
     [playerId, score, normalizedGameKey]
@@ -5591,10 +5247,6 @@ async function applyTwoPlayerBotRewardsInTransaction(
     ]
   );
 
-  // Ana sayfadaki eski normal puan sayacı kaldırıldı; normal ikili galibiyetleri
-  // artık home_two_player_wins üretmez.
-  const homeWinDelta = 0;
-
   if (finishSampleMs !== null) {
     await ensurePlayerGameProgress(client, playerId, baseGameKey);
     await client.query(
@@ -5614,7 +5266,6 @@ async function applyTwoPlayerBotRewardsInTransaction(
     ...before,
     gameKey: baseGameKey,
     generalScore: safeScoreNumber(Number(before.generalScore || 0) + persistedGeneralDelta),
-    homeScore: safeScoreNumber(Number(before.homeScore || 0) + homeWinDelta),
     totalXp: totalXpAfter,
     diamondBalance: Math.max(0, Math.min(2_000_000_000,
       Number(before.diamondBalance || 0) + levelSettlement.diamondDelta)),
@@ -9345,22 +8996,16 @@ function challengeAnswerIsWinning(puzzle, numberSlotsRaw, operatorsRaw, answerRa
 }
 
 async function ensureAuthenticatedPlayer(client, playerId) {
-  // Normal kullanıcıda üç INSERT denemek yerine tek hafif SELECT ile satırların tam olduğunu doğrula.
+  // Oyun satırları artık önceden oluşturulmaz. Hesabın ortak satırları varsa kullanıcı hazırdır.
   const existing = await client.query(
     `SELECT 1
      FROM players pl
-     JOIN player_scores s ON s.player_id = pl.player_id
      JOIN player_progress p ON p.player_id = pl.player_id
      WHERE pl.player_id = $1
      LIMIT 1`,
     [playerId]
   );
-  if (existing.rowCount > 0) {
-    // Eski hesaplarda bazı oyun satırları v22/v23 geçişinden önce hiç oluşmamış olabilir.
-    // Her girişte tek UNNEST INSERT ile eksik oyunları 50 başlangıç puanıyla tamamla.
-    await ensureAllPlayerGameProgress(client, playerId);
-    return false;
-  }
+  if (existing.rowCount > 0) return false;
 
   const fallbackUsername = `Oyuncu_${String(playerId).slice(-8)}`;
   await client.query(
@@ -9370,20 +9015,11 @@ async function ensureAuthenticatedPlayer(client, playerId) {
     [playerId, fallbackUsername]
   );
   await client.query(
-    `INSERT INTO player_scores (player_id)
-     VALUES ($1)
-     ON CONFLICT (player_id) DO NOTHING`,
-    [playerId]
-  );
-  await client.query(
     `INSERT INTO player_progress (player_id, total_xp, updated_at)
      VALUES ($1, 0, NOW())
      ON CONFLICT (player_id) DO NOTHING`,
     [playerId]
   );
-  // Yeni hesapta 20 oyunun tamamı 50 normal puanla başlar. Tek UNNEST INSERT ile
-  // 20 ayrı sorgu göndermeden bütün oyun satırları ekonomik biçimde oluşturulur.
-  await ensureAllPlayerGameProgress(client, playerId);
   return true;
 }
 
@@ -9685,102 +9321,63 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
     [guestId, playGamesPlayerId]
   );
 
-  // Puan ve XP misafir hesabında da yalnızca sunucunun doğruladığı oyun sonuçlarıyla oluşur.
-  // Bu nedenle iki ayrık geçmişi toplamak güvenlidir; 64-bit skor alanında güvenle birleştirilir.
+  // Guest -> Play Games aktarımında yalnız ortak kaynaklar ve gerçekten var olan oyun satırları
+  // birleştirilir. Oynanmamış oyunlar için yeni player_game_progress satırı oluşturulmaz.
   const migrationMonthKey = currentMonthKey();
+  const todayKey = currentUtcDayKey();
   await client.query(
-    `UPDATE player_scores AS target
-     SET general_score = LEAST(target.general_score::numeric + guest.general_score::numeric, 9223372036854775807::numeric)::bigint,
-         infinite_score = LEAST(target.infinite_score::numeric + guest.infinite_score::numeric, 9223372036854775807::numeric)::bigint,
-         monthly_general_score = LEAST(
-           (CASE WHEN target.monthly_key = $3 THEN target.monthly_general_score ELSE 0 END)::numeric +
-           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_general_score ELSE 0 END)::numeric,
-           9223372036854775807::numeric
-         )::bigint,
-         monthly_infinite_score = LEAST(
-           (CASE WHEN target.monthly_key = $3 THEN target.monthly_infinite_score ELSE 0 END)::numeric +
-           (CASE WHEN guest.monthly_key = $3 THEN guest.monthly_infinite_score ELSE 0 END)::numeric,
-           9223372036854775807::numeric
-         )::bigint,
-         monthly_key = $3,
-         monthly_updated_at = NOW(),
+    `UPDATE player_progress
+     SET hundred_daily_key = $2,
+         hundred_daily_base_used_count = CASE WHEN hundred_daily_key = $2 THEN hundred_daily_base_used_count ELSE 0 END,
+         hundred_daily_ad_used = CASE WHEN hundred_daily_key = $2 THEN hundred_daily_ad_used ELSE FALSE END,
+         hundred_rewarded_rights = CASE WHEN hundred_daily_key = $2 THEN hundred_rewarded_rights ELSE 0 END,
          updated_at = NOW()
-     FROM player_scores AS guest
-     WHERE target.player_id = $2 AND guest.player_id = $1`,
-    [guestId, playGamesPlayerId, migrationMonthKey]
+     WHERE player_id = ANY($1::text[])`,
+    [[guestId, playGamesPlayerId], todayKey]
   );
-
-  // Günlük 100 kişilik hakları iki hesap için de bugüne normalize et; böylece eski günün
-  // reklam/ücretsiz hak bayrakları PGS hesabına yanlışlıkla taşınmaz.
-  await normalizeHundredDailyAccessInTransaction(client, guestId);
-  await normalizeHundredDailyAccessInTransaction(client, playGamesPlayerId);
 
   await client.query(
     `UPDATE player_progress AS target
      SET total_xp = LEAST(target.total_xp::bigint + guest.total_xp::bigint, 2000000000)::integer,
-         infinite_run_score = GREATEST(target.infinite_run_score, guest.infinite_run_score),
-         infinite_next_stage = GREATEST(target.infinite_next_stage, guest.infinite_next_stage),
-         tournament_stage = GREATEST(target.tournament_stage, guest.tournament_stage),
-         tournament_rights = GREATEST(target.tournament_rights, guest.tournament_rights),
-         tournament_bank = GREATEST(target.tournament_bank, guest.tournament_bank),
-         tournament_completed = target.tournament_completed OR guest.tournament_completed,
          tournament_tickets = LEAST(target.tournament_tickets::bigint + guest.tournament_tickets::bigint, 9999)::integer,
          tournament_reward_day_key = GREATEST(target.tournament_reward_day_key, guest.tournament_reward_day_key),
          tournament_rewarded_tickets_today = LEAST(target.tournament_rewarded_tickets_today + guest.tournament_rewarded_tickets_today, 15),
-         tournament_entry_active = target.tournament_entry_active OR guest.tournament_entry_active,
-         hundred_active = target.hundred_active OR guest.hundred_active,
-         hundred_stage = GREATEST(target.hundred_stage, guest.hundred_stage),
          hundred_daily_key = GREATEST(target.hundred_daily_key, guest.hundred_daily_key),
-         hundred_daily_base_used = target.hundred_daily_base_used OR guest.hundred_daily_base_used,
          hundred_daily_base_used_count = GREATEST(target.hundred_daily_base_used_count, guest.hundred_daily_base_used_count),
          hundred_daily_ad_used = target.hundred_daily_ad_used OR guest.hundred_daily_ad_used,
          hundred_rewarded_rights = GREATEST(target.hundred_rewarded_rights, guest.hundred_rewarded_rights),
          game_rights = GREATEST(target.game_rights, guest.game_rights),
          game_rights_refill_at = LEAST(target.game_rights_refill_at, guest.game_rights_refill_at),
          diamond_balance = LEAST(target.diamond_balance::bigint + guest.diamond_balance::bigint, 2000000000)::integer,
-         home_two_player_wins = LEAST(
-           target.home_two_player_wins::numeric + guest.home_two_player_wins::numeric,
-           9223372036854775807::numeric
-         )::bigint,
          level_reward_claimed_through = GREATEST(target.level_reward_claimed_through, guest.level_reward_claimed_through),
-         two_player_finish_count = LEAST(target.two_player_finish_count::bigint + guest.two_player_finish_count::bigint, 2000000000)::integer,
-         two_player_finish_total_ms = LEAST(target.two_player_finish_total_ms::numeric + guest.two_player_finish_total_ms::numeric, 9223372036854775807)::bigint,
          updated_at = NOW()
      FROM player_progress AS guest
      WHERE target.player_id = $2 AND guest.player_id = $1`,
     [guestId, playGamesPlayerId]
   );
 
-  // Oyun bazlı sonsuz/turnuva/100'lü ilerlemeleri game_key bazında birleştir.
-  // Aynı oyunda iki ayrı geçmiş varsa yüksek skor ve en ileri aşama korunur; ortak hak/biletler
-  // player_progress üzerinde kaldığı için burada çoğaltılmaz.
   await client.query(
     `INSERT INTO player_game_progress (
        player_id, game_key, general_score, infinite_score,
-       monthly_key, monthly_general_score, monthly_infinite_score, monthly_updated_at,
+       monthly_key, monthly_general_score, monthly_infinite_score,
        infinite_run_score, infinite_next_stage,
        tournament_stage, tournament_rights, tournament_bank, tournament_completed,
        tournament_entry_active, hundred_active, hundred_stage,
        two_player_finish_count, two_player_finish_total_ms,
-       two_player_score_count, two_player_score_total, bot_timing_game_count, stats, updated_at
+       two_player_score_count, two_player_score_total, bot_timing_game_count, has_played, updated_at
      )
      SELECT $2, game_key, general_score, infinite_score,
-            monthly_key, monthly_general_score, monthly_infinite_score, monthly_updated_at,
+            monthly_key, monthly_general_score, monthly_infinite_score,
             infinite_run_score, infinite_next_stage,
             tournament_stage, tournament_rights, tournament_bank, tournament_completed,
             tournament_entry_active, hundred_active, hundred_stage,
             two_player_finish_count, two_player_finish_total_ms,
-            two_player_score_count, two_player_score_total, bot_timing_game_count, stats, NOW()
+            two_player_score_count, two_player_score_total, bot_timing_game_count, has_played, NOW()
      FROM player_game_progress
      WHERE player_id = $1
      ON CONFLICT (player_id, game_key) DO UPDATE SET
-       -- Her hesap 50 başlangıç puanı aldığı için guest + Play Games birleşiminde
-       -- bu başlangıç hibesi iki kez sayılmaz. Net kazanım/kayıp geçmişleri yine birleşir.
        general_score = LEAST(
-         GREATEST(
-           0::numeric,
-           player_game_progress.general_score::numeric + EXCLUDED.general_score::numeric - $4::numeric
-         ),
+         GREATEST(0::numeric, player_game_progress.general_score::numeric + EXCLUDED.general_score::numeric - $4::numeric),
          9223372036854775807::numeric
        )::bigint,
        infinite_score = GREATEST(player_game_progress.infinite_score, EXCLUDED.infinite_score),
@@ -9798,7 +9395,6 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
          CASE WHEN EXCLUDED.monthly_key = $3 THEN EXCLUDED.monthly_infinite_score ELSE 0 END
        ),
        monthly_key = $3,
-       monthly_updated_at = NOW(),
        infinite_run_score = GREATEST(player_game_progress.infinite_run_score, EXCLUDED.infinite_run_score),
        infinite_next_stage = GREATEST(player_game_progress.infinite_next_stage, EXCLUDED.infinite_next_stage),
        tournament_stage = GREATEST(player_game_progress.tournament_stage, EXCLUDED.tournament_stage),
@@ -9808,36 +9404,15 @@ async function migrateGuestPlayerToPlayGames(client, guestIdRaw, guestSecretRaw,
        tournament_entry_active = player_game_progress.tournament_entry_active OR EXCLUDED.tournament_entry_active,
        hundred_active = player_game_progress.hundred_active OR EXCLUDED.hundred_active,
        hundred_stage = GREATEST(player_game_progress.hundred_stage, EXCLUDED.hundred_stage),
-       two_player_finish_count = LEAST(
-         player_game_progress.two_player_finish_count::bigint + EXCLUDED.two_player_finish_count::bigint,
-         2000000000
-       )::integer,
-       two_player_finish_total_ms = LEAST(
-         player_game_progress.two_player_finish_total_ms + EXCLUDED.two_player_finish_total_ms,
-         9223372036854775807::bigint
-       ),
-       two_player_score_count = LEAST(
-         player_game_progress.two_player_score_count::bigint + EXCLUDED.two_player_score_count::bigint,
-         2000000000
-       )::integer,
-       two_player_score_total = LEAST(
-         player_game_progress.two_player_score_total + EXCLUDED.two_player_score_total,
-         9223372036854775807::bigint
-       ),
-       bot_timing_game_count = LEAST(
-         player_game_progress.bot_timing_game_count::bigint + EXCLUDED.bot_timing_game_count::bigint,
-         2000000000
-       )::integer,
-       stats = CASE
-         WHEN EXCLUDED.updated_at > player_game_progress.updated_at THEN EXCLUDED.stats
-         ELSE player_game_progress.stats
-       END,
+       two_player_finish_count = LEAST(player_game_progress.two_player_finish_count::bigint + EXCLUDED.two_player_finish_count::bigint, 2000000000)::integer,
+       two_player_finish_total_ms = LEAST(player_game_progress.two_player_finish_total_ms + EXCLUDED.two_player_finish_total_ms, 9223372036854775807::bigint),
+       two_player_score_count = LEAST(player_game_progress.two_player_score_count::bigint + EXCLUDED.two_player_score_count::bigint, 2000000000)::integer,
+       two_player_score_total = LEAST(player_game_progress.two_player_score_total + EXCLUDED.two_player_score_total, 9223372036854775807::bigint),
+       bot_timing_game_count = LEAST(player_game_progress.bot_timing_game_count::bigint + EXCLUDED.bot_timing_game_count::bigint, 2000000000)::integer,
+       has_played = player_game_progress.has_played OR EXCLUDED.has_played,
        updated_at = NOW()`,
     [guestId, playGamesPlayerId, migrationMonthKey, INITIAL_PER_GAME_SCORE]
   );
-
-  // v22: Oyunların sonsuz skorları artık birbirine eklenmez. Her oyun kendi
-  // player_game_progress satırındaki yüksek skoru bağımsız taşır.
 
   // Tamamlanmamış güvenli challenge'lar ve görev geçmişleri de hedef hesaba bağlanır.
   await client.query(
@@ -9996,7 +9571,6 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
          END,
          monthly_infinite_score = CASE WHEN gp.monthly_key = $7 THEN gp.monthly_infinite_score ELSE 0 END,
          monthly_key = $7,
-         monthly_updated_at = NOW(),
          two_player_finish_count = LEAST(
            gp.two_player_finish_count + CASE WHEN c.finish_sample_ms IS NULL THEN 0 ELSE 1 END,
            2000000000
@@ -10564,7 +10138,6 @@ app.post("/game/hundred/start", requireAuth, challengeMutationRateLimit, require
         await client.query(
           `UPDATE player_progress SET
              hundred_daily_base_used_count = LEAST(hundred_daily_base_used_count + 1, $2),
-             hundred_daily_base_used = TRUE,
              updated_at = NOW()
            WHERE player_id = $1`,
           [req.auth.sub, HUNDRED_DAILY_BASE_RIGHTS]
@@ -16276,7 +15849,6 @@ async function cleanupStaleGuestAccounts() {
          SELECT gc.guest_id
          FROM guest_credentials gc
          JOIN players pl ON pl.player_id = gc.guest_id
-         JOIN player_scores ps ON ps.player_id = gc.guest_id
          JOIN player_progress pp ON pp.player_id = gc.guest_id
          LEFT JOIN player_task_state pts ON pts.player_id = gc.guest_id
          WHERE gc.linked_player_id IS NULL
@@ -16286,9 +15858,13 @@ async function cleanupStaleGuestAccounts() {
            AND GREATEST(
              gc.updated_at,
              pl.updated_at,
-             ps.updated_at,
              pp.updated_at,
              COALESCE(pts.updated_at, '1970-01-01'::timestamptz),
+             COALESCE((
+               SELECT MAX(gp.updated_at)
+               FROM player_game_progress gp
+               WHERE gp.player_id = gc.guest_id
+             ), '1970-01-01'::timestamptz),
              COALESCE((
                SELECT MAX(GREATEST(ch.created_at, COALESCE(ch.completed_at, ch.created_at)))
                FROM secure_game_challenges ch
