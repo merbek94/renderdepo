@@ -18,7 +18,7 @@ function safeScoreNumber(value, fallback = 0) {
   return Math.max(0, Math.min(MAX_SAFE_SCORE, Math.floor(candidate)));
 }
 
-const SERVER_BUILD_ID = "shared-game-flow-v35-20261003-reconnect-win-table-stake-cap";
+const SERVER_BUILD_ID = "shared-game-flow-v36-20261004-ui-network-level-diamond-cleanup";
 console.log(`SERVER_BUILD_ID=${SERVER_BUILD_ID}`);
 
 // Render reverse proxy arkasında gerçek istemci IP'sini req.ip üzerinden alabilmek için tek proxy hop'una güven.
@@ -1290,20 +1290,6 @@ function digitAttackReachedWave(challenge, evaluation) {
     : 0;
   return Math.max(0, Math.min(rawReached, encodedWaveCount));
 }
-
-async function incrementHomeTwoPlayerWinInTransaction(client, playerId) {
-  await client.query(
-    `UPDATE player_progress
-     SET home_two_player_wins = LEAST(
-           home_two_player_wins::numeric + 1,
-           9223372036854775807::numeric
-         )::bigint,
-         updated_at = NOW()
-     WHERE player_id = $1`,
-    [playerId]
-  );
-}
-
 
 const TASK_DEFINITIONS = [
   { code: "login", title: "Oyuna giriş yap", baseTarget: 1, baseReward: 10 },
@@ -4288,9 +4274,8 @@ function playerLevelForTotalXp(totalXpValue) {
 function levelMilestoneReward(levelValue) {
   const level = Number(levelValue || 0);
   if (level < 10 || level > 1000 || level % 10 !== 0) return null;
-  if (level % 20 === 10) {
-    return { level, generalScore: level, diamonds: 0 };
-  }
+  // Seviye ödülleri artık oyun puanı üretmez. Her 10 seviyede doğrudan
+  // level/10 elmas verilir: 30 -> 3, 70 -> 7, 130 -> 13 ...
   return { level, generalScore: 0, diamonds: Math.floor(level / 10) };
 }
 
@@ -5606,12 +5591,9 @@ async function applyTwoPlayerBotRewardsInTransaction(
     ]
   );
 
-  // Ana sayfa puanı yalnız normal ikili galibiyet sayısıdır. Botlu normal ikili de normal
-  // ikili sayılır; kayıp, turnuva, 100'lü, arkadaş ve sonsuz bu sayacı değiştirmez.
-  const homeWinDelta = gameGeneralDelta > 0 ? 1 : 0;
-  if (homeWinDelta > 0) {
-    await incrementHomeTwoPlayerWinInTransaction(client, playerId);
-  }
+  // Ana sayfadaki eski normal puan sayacı kaldırıldı; normal ikili galibiyetleri
+  // artık home_two_player_wins üretmez.
+  const homeWinDelta = 0;
 
   if (finishSampleMs !== null) {
     await ensurePlayerGameProgress(client, playerId, baseGameKey);
@@ -9966,7 +9948,7 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
       playerId: realWinner.playerId,
       generalDelta: reward,
       xpDelta: winnerXp,
-      homeWinDelta: 1,
+      homeWinDelta: 0,
       finishSampleMs: isRealtimeScoreBasedGameKey(room.gameKey) ||
         (["shortest_path", "digit_attack"].includes(baseGameKey) &&
           realWinner.wonRoundBecauseOpponentWrongAnswer === true)
@@ -10040,23 +10022,18 @@ async function applyNormalRealtimeRewardsBatchInTransaction(client, room, realWi
   await client.query(
     `WITH changes AS (
        SELECT * FROM UNNEST(
-         $1::text[], $2::integer[], $3::integer[]
-       ) AS c(player_id, xp_delta, home_win_delta)
+         $1::text[], $2::integer[]
+       ) AS c(player_id, xp_delta)
      )
      UPDATE player_progress AS p
      SET total_xp = LEAST(p.total_xp + c.xp_delta, 2000000000),
-         home_two_player_wins = LEAST(
-           p.home_two_player_wins::numeric + c.home_win_delta::numeric,
-           9223372036854775807::numeric
-         )::bigint,
          updated_at = NOW()
      FROM changes c
      WHERE p.player_id = c.player_id
-       AND (c.xp_delta <> 0 OR c.home_win_delta <> 0)`,
+       AND c.xp_delta <> 0`,
     [
       entries.map((item) => item.playerId),
       entries.map((item) => item.xpDelta),
-      entries.map((item) => item.homeWinDelta),
     ]
   );
 
