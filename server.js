@@ -10016,15 +10016,30 @@ const DIAMOND_SCORE_EXCHANGE_OPTIONS = new Map([
 
 app.post("/game/diamonds/score", requireAuth, challengeMutationRateLimit, async (req, res) => {
   if (!requireDatabase(res)) return;
+  // İstemcinin fiyat veya puan bilgisine ASLA güvenme: sadece sunucunun
+  // bilinen paket tabanı ve seçilen tam kat sayısı üzerinden ödülü hesapla.
+  // Eski istemciler yalnız diamondAmount gönderir: bu durumda miktarın
+  // kendisi paket tabanıdır ve eski beş seçenek aynen çalışır.
   const gameKey = normalizeBaseGameKey(req.body.gameKey);
-  const diamondAmount = Math.floor(Number(req.body.diamondAmount ?? 1));
-  const pointsToAdd = DIAMOND_SCORE_EXCHANGE_OPTIONS.get(diamondAmount);
-  if (!pointsToAdd) {
+  const diamondAmount = Number(req.body.diamondAmount ?? 1);
+  const packageDiamondAmount = Number(req.body.packageDiamondAmount ?? diamondAmount);
+  const packPoints = DIAMOND_SCORE_EXCHANGE_OPTIONS.get(packageDiamondAmount);
+  const validExchange =
+    Number.isSafeInteger(diamondAmount) && diamondAmount > 0 && diamondAmount <= 2_000_000_000 &&
+    Number.isSafeInteger(packageDiamondAmount) && !!packPoints &&
+    diamondAmount >= packageDiamondAmount && diamondAmount % packageDiamondAmount === 0;
+  if (!validExchange) {
     res.status(400).json({
       ok: false,
       code: "INVALID_DIAMOND_EXCHANGE",
-      message: "Geçersiz elmas-puan dönüştürme seçeneği.",
+      message: "Elmas miktarı seçilen paketin pozitif tam katı olmalıdır.",
     });
+    return;
+  }
+  const packageUnits = diamondAmount / packageDiamondAmount;
+  const pointsToAdd = packageUnits * packPoints;
+  if (!Number.isSafeInteger(pointsToAdd) || pointsToAdd <= 0) {
+    res.status(400).json({ ok: false, code: "INVALID_POINT_REWARD", message: "Puan miktarı geçersiz." });
     return;
   }
   const client = await pool.connect();
@@ -10052,7 +10067,12 @@ app.post("/game/diamonds/score", requireAuth, challengeMutationRateLimit, async 
     await applyGameGeneralScoreDeltaInTransaction(client, req.auth.sub, gameKey, pointsToAdd);
     const state = await readAuthoritativePlayerState(client, req.auth.sub, gameKey);
     await client.query("COMMIT");
-    res.json({ ok: true, ...state, diamondSpent: diamondAmount, pointsAdded: pointsToAdd });
+    res.json({
+      ok: true, ...state,
+      diamondSpent: diamondAmount,
+      packageDiamondAmount, packageUnits,
+      pointsAdded: pointsToAdd,
+    });
   } catch (error) {
     await client.query("ROLLBACK");
     sendLeaderboardError(res, error, "Elmas puana çevrilemedi.", "diamond score exchange error:");
